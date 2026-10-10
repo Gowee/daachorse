@@ -1,12 +1,13 @@
 //! Iterators for [`CharwiseDoubleArrayAhoCorasick`].
 
+use alloc::vec::Vec;
 use core::iter::Enumerate;
 use core::num::NonZeroU32;
 
 use crate::charwise::CharwiseDoubleArrayAhoCorasick;
 use crate::prefilter::{Prefilter, PrefilterGate};
 use crate::utils::FromU32;
-use crate::{Match, ROOT_STATE_IDX};
+use crate::{Emit, Match, ROOT_STATE_IDX};
 
 /// Decodes the character starting at byte position `pos`.
 ///
@@ -684,6 +685,204 @@ where
         } else {
             self.next_plain()
         }
+    }
+}
+
+/// Dedicated iterator created by [`CharwiseDoubleArrayAhoCorasick::leftmost_longest_find_iter()`].
+///
+/// This iterator executes non-overlapping leftmost-longest pattern matching using a
+/// prefix-committed semi-DFA with gap chaining. It performs purely forward, single-pass streaming
+/// matching in guaranteed linear time $O(N)$ over the input text, completely eliminating the
+/// worst-case $O(N \times L)$ text rewind / backtracking behavior present in classic Aho-Corasick
+/// leftmost matching.
+pub struct LeftmostLongestFindIterator<'a, P, V> {
+    pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
+    pub(crate) haystack: P,
+    pub(crate) pos: usize,
+    pub(crate) state_id: u32,
+    pub(crate) buf: Vec<Match<V>>,
+}
+
+/// Reconstructs match spans from a reverse-linked chain of [`Emit`] nodes.
+///
+/// # Architecture and Invariants
+///
+/// During automaton construction, any prefix string $W$ that matches patterns
+/// decomposes into a sequence of non-overlapping committed matches:
+/// $M_1 \text{ (earliest)} \to M_2 \to \dots \to M_k \text{ (latest)}$.
+///
+/// In the emit pool, these matches are stored in reverse chronological order:
+/// `head` is $M_k$, which links via `pred` to $M_{k-1}$, and eventually to $M_1$ (`pred == None`).
+///
+/// # Gap Delta-Encoding
+///
+/// - For $M_k$: `gap` is the distance between $M_k$'s end byte and the current scan position `pos`.
+///   $end(M_k) = pos - M_k.gap$, $start(M_k) = end(M_k) - M_k.length$.
+/// - For predecessor $M_i$ ($i < k$): `gap` is the distance between $M_i$'s end byte and
+///   $M_{i+1}$'s start byte:
+///   $end(M_i) = start(M_{i+1}) - M_i.gap$, $start(M_i) = end(M_i) - M_i.length$.
+///
+/// # Stack Output Order
+///
+/// The matches must be yielded to the caller in forward chronological order ($M_1, M_2, \dots, M_k$).
+/// As we walk $M_k \to M_{k-1} \to \dots \to M_1$:
+/// - $M_k, M_{k-1}, \dots, M_2$ are pushed onto `buf` (which acts as a LIFO stack).
+/// - The earliest match $M_1$ is directly returned as the result of the current `next()` call.
+/// - Subsequent calls to `next()` simply `pop()` from `buf`, yielding $M_2, M_3, \dots, M_k$
+///   in exact chronological sequence in $O(1)$ time per match with 0 heap re-allocations!
+#[inline(always)]
+fn extract_emits<V: Copy>(
+    emits: &[Emit<V>],
+    head_pos: u32,
+    pos: usize,
+    buf: &mut Vec<Match<V>>,
+) -> Match<V> {
+    let first_emit = unsafe { emits.get_unchecked(head_pos as usize - 1) };
+    let end = pos - first_emit.gap as usize;
+    let start = end - first_emit.length as usize;
+    let first_match = first_emit.to_match(end);
+
+    let Some(pred) = first_emit.pred else {
+        return first_match;
+    };
+
+    buf.push(first_match);
+    let mut last_start = start;
+    let mut curr_ep = pred;
+    loop {
+        let em = unsafe { emits.get_unchecked(curr_ep.get() as usize - 1) };
+        let end = last_start - em.gap as usize;
+        let start = end - em.length as usize;
+        let m = em.to_match(end);
+        if let Some(next_pred) = em.pred {
+            buf.push(m);
+            last_start = start;
+            curr_ep = next_pred;
+        } else {
+            return m;
+        }
+    }
+}
+
+/// Helper to transition from ROOT on character `c`.
+#[inline(always)]
+fn step_root(
+    mapped_c: Option<u32>,
+    root_base: Option<core::num::NonZeroU32>,
+    states: &[crate::charwise::State],
+) -> u32 {
+    if let (Some(code), Some(base)) = (mapped_c, root_base) {
+        let child_idx = (base.get() ^ code) as usize;
+        if child_idx < states.len()
+            && unsafe { states.get_unchecked(child_idx).check() } == ROOT_STATE_IDX
+        {
+            return child_idx as u32;
+        }
+    }
+    ROOT_STATE_IDX
+}
+
+/// Advances the zero-rewind leftmost-longest match iterator by one match.
+///
+/// Guaranteed $O(N)$ execution over the input string length without text rewinding.
+#[inline(always)]
+pub(crate) fn next_leftmost_longest_match<V: Copy>(
+    pma: &CharwiseDoubleArrayAhoCorasick<V>,
+    haystack: &str,
+    pos: &mut usize,
+    state_id: &mut u32,
+    buf: &mut Vec<Match<V>>,
+) -> Option<Match<V>> {
+    // Yield pending matches from the stack in chronological order
+    if let Some(m) = buf.pop() {
+        return Some(m);
+    }
+
+    let bytes = haystack.as_bytes();
+    let text_len = bytes.len();
+    let states = pma.states.as_slice();
+    let states_len = states.len();
+    let root_base = unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
+
+    while *pos < text_len {
+        let (c, char_len) = unsafe { decode_char_unchecked(bytes, *pos) };
+        let mapped_c = pma.mapper.get(c);
+
+        // Fast Root Path: Scanning while at ROOT
+        if *state_id == ROOT_STATE_IDX {
+            *state_id = step_root(mapped_c, root_base, states);
+            *pos += char_len;
+            continue;
+        }
+
+        // In-flight Path: Traversing the automaton
+        'step: loop {
+            if let Some(code) = mapped_c {
+                if let Some(base) = unsafe { states.get_unchecked(*state_id as usize).base() } {
+                    let child_idx = (base.get() ^ code) as usize;
+                    if child_idx < states_len
+                        && unsafe { states.get_unchecked(child_idx).check() } == *state_id
+                    {
+                        *state_id = child_idx as u32;
+                        *pos += char_len;
+                        break 'step;
+                    }
+                }
+            }
+
+            // Mismatch: Follow failure transition and commit prefix matches if any
+            let emit_pos = unsafe { states.get_unchecked(*state_id as usize).output_pos() };
+            let target_state = unsafe { states.get_unchecked(*state_id as usize).fail() };
+            *state_id = target_state;
+
+            if let Some(ep) = emit_pos {
+                let first_match = extract_emits(&pma.emits, ep.get(), *pos, buf);
+                // If fallback reached root, attempt to consume the current character from root
+                if *state_id == ROOT_STATE_IDX {
+                    *state_id = step_root(mapped_c, root_base, states);
+                    *pos += char_len;
+                }
+                return Some(first_match);
+            }
+
+            if *state_id == ROOT_STATE_IDX {
+                *state_id = step_root(mapped_c, root_base, states);
+                *pos += char_len;
+                break 'step;
+            }
+        }
+    }
+
+    // EOF handling: Flush any pending committed matches in the suffix chain
+    while *state_id != ROOT_STATE_IDX {
+        let emit_pos = unsafe { states.get_unchecked(*state_id as usize).output_pos() };
+        let target_state = unsafe { states.get_unchecked(*state_id as usize).fail() };
+        *state_id = target_state;
+        if let Some(ep) = emit_pos {
+            let first_match = extract_emits(&pma.emits, ep.get(), *pos, buf);
+            return Some(first_match);
+        }
+    }
+
+    None
+}
+
+impl<P, V> Iterator for LeftmostLongestFindIterator<'_, P, V>
+where
+    P: AsRef<str>,
+    V: Copy,
+{
+    type Item = Match<V>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        next_leftmost_longest_match(
+            self.pma,
+            self.haystack.as_ref(),
+            &mut self.pos,
+            &mut self.state_id,
+            &mut self.buf,
+        )
     }
 }
 
