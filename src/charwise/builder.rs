@@ -5,10 +5,10 @@ use crate::build_helper::{BuildHelper, Profile};
 use crate::charwise::{CharwiseDoubleArrayAhoCorasick, CodeMapper, MatchKind, State};
 use crate::errors::{DaachorseError, Result};
 use crate::nfa_builder::NfaBuilder;
-use crate::nfa_builder::DEAD_STATE_ID;
+use crate::nfa_builder::{DEAD_STATE_ID, ROOT_STATE_ID};
 use crate::prefilter::{Prefilter, PrefilterBuilder};
 use crate::utils::FromU32;
-use crate::DEAD_STATE_IDX;
+use crate::{DEAD_STATE_IDX, ROOT_STATE_IDX};
 
 // Specialized [`NfaBuilder`] handling labels of `char`.
 type CharwiseNfaBuilder<V> = NfaBuilder<char, V>;
@@ -267,6 +267,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
             states: self.states,
             mapper: self.mapper,
             outputs: nfa.outputs,
+            emits: nfa.emits,
             match_kind: self.match_kind,
             num_states,
             prefilter,
@@ -309,9 +310,12 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
 
         let q = match self.match_kind {
             MatchKind::Standard => nfa.build_fails(),
-            MatchKind::LeftmostLongest | MatchKind::LeftmostFirst => nfa.build_fails_leftmost(),
+            MatchKind::LeftmostFirst | MatchKind::LeftmostLongest => nfa.build_fails_leftmost(),
+            MatchKind::LeftmostLongestExperimental => nfa.build_fails_leftmost_longest(),
         };
-        nfa.build_outputs(&q);
+        if self.match_kind != MatchKind::LeftmostLongestExperimental {
+            nfa.build_outputs(&q);
+        }
         Ok((nfa, prefilter_builder.and_then(PrefilterBuilder::build)))
     }
 
@@ -365,7 +369,10 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
         Ok(())
     }
 
-    fn set_fails_and_outputs<V>(&mut self, nfa: &CharwiseNfaBuilder<V>, state_id_map: &[u32]) {
+    fn set_fails_and_outputs<V>(&mut self, nfa: &CharwiseNfaBuilder<V>, state_id_map: &[u32])
+    where
+        V: Copy,
+    {
         for (i, s) in nfa.states.iter().enumerate() {
             if i == usize::from_u32(DEAD_STATE_ID) {
                 continue;
@@ -379,6 +386,8 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
             let fail_id = s.fail.get();
             if fail_id == DEAD_STATE_ID {
                 self.states[idx].set_fail(DEAD_STATE_IDX);
+            } else if fail_id == ROOT_STATE_ID {
+                self.states[idx].set_fail(ROOT_STATE_IDX);
             } else {
                 let fail_idx = state_id_map[usize::from_u32(fail_id)];
                 debug_assert_ne!(fail_idx, DEAD_STATE_IDX);

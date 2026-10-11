@@ -257,7 +257,10 @@ use core::num::NonZeroU32;
 use alloc::vec::Vec;
 
 pub use crate::bytewise::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
-pub use crate::charwise::{CharwiseDoubleArrayAhoCorasick, CharwiseDoubleArrayAhoCorasickBuilder};
+pub use crate::charwise::{
+    CharwiseDoubleArrayAhoCorasick, CharwiseDoubleArrayAhoCorasickBuilder,
+    LeftmostLongestFindIterator,
+};
 use crate::errors::DaachorseError;
 pub use crate::errors::Result;
 pub use crate::serializer::Serializable;
@@ -344,6 +347,86 @@ where
     }
 }
 
+/// An output node used in leftmost-longest matching with gap chaining.
+///
+/// In prefix-committed semi-DFA execution, each state commits a sequence of non-overlapping
+/// matches `[M_1, M_2, ..., M_k]`. These matches are linked in reverse chronological order
+/// (`M_k -> M_{k-1} -> ... -> M_1`) via `pred`.
+///
+/// # Field Semantics
+///
+/// - `value`: The payload / value associated with this matched pattern.
+/// - `length`: The matched pattern's length in bytes.
+/// - `gap`: The byte distance from this match to the next reference point:
+///   - For the latest match `M_k` (the head of the chain):
+///     `gap = total_prefix_bytes - end_byte(M_k)`
+///   - For any predecessor match `M_i` (where `i < k`):
+///     `gap = start_byte(M_{i+1}) - end_byte(M_i)`
+/// - `pred`: Pointer (1-based index) to the preceding non-overlapping match `M_{i-1}`
+///   in this prefix, or `None` if this is the earliest match `M_1`.
+///
+/// This relative delta-encoding allows computing exact match offsets in O(1) time
+/// during single-pass streaming without retaining past text buffers.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct Emit<V> {
+    pub(crate) value: V,
+    pub(crate) length: u32,
+    pub(crate) gap: u32,
+    pub(crate) pred: Option<NonZeroU32>,
+}
+
+impl<V> Emit<V>
+where
+    V: Copy,
+{
+    #[inline(always)]
+    pub(crate) fn to_match(self, end: usize) -> Match<V> {
+        Match {
+            length: usize::from_u32(self.length),
+            end,
+            value: self.value,
+        }
+    }
+}
+
+impl<V> Serializable for Emit<V>
+where
+    V: Serializable,
+{
+    #[inline(always)]
+    fn serialize_to_vec(&self, dst: &mut Vec<u8>) {
+        self.value.serialize_to_vec(dst);
+        self.length.serialize_to_vec(dst);
+        self.gap.serialize_to_vec(dst);
+        self.pred.serialize_to_vec(dst);
+    }
+
+    #[inline(always)]
+    fn deserialize_from_slice(src: &[u8]) -> Result<(Self, &[u8])> {
+        let (value, src) = V::deserialize_from_slice(src)?;
+        let (length, src) = u32::deserialize_from_slice(src)?;
+        let (gap, src) = u32::deserialize_from_slice(src)?;
+        let (pred, src) = Option::<NonZeroU32>::deserialize_from_slice(src)?;
+        Ok((
+            Self {
+                value,
+                length,
+                gap,
+                pred,
+            },
+            src,
+        ))
+    }
+
+    #[inline(always)]
+    fn serialized_bytes() -> usize {
+        V::serialized_bytes()
+            + u32::serialized_bytes()
+            + u32::serialized_bytes()
+            + Option::<NonZeroU32>::serialized_bytes()
+    }
+}
+
 /// Match result.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Match<V> {
@@ -405,6 +488,13 @@ pub enum MatchKind {
     /// will be reported. For example, when matching patterns `ab|a|abcd` over `abcd`, `ab` will be
     /// reported.
     LeftmostFirst = 2,
+
+    /// Experimental leftmost-longest match semantics using prefix-committed semi-DFA with gap chaining.
+    ///
+    /// This enables [`leftmost_longest_find_iter()`](CharwiseDoubleArrayAhoCorasick::leftmost_longest_find_iter()),
+    /// executing single-pass forward streaming matching in guaranteed $O(N)$ worst-case time without
+    /// text rewinding or backtracking. Note that empty patterns `""` are not supported.
+    LeftmostLongestExperimental = 3,
 }
 
 impl MatchKind {
@@ -413,7 +503,9 @@ impl MatchKind {
     }
 
     fn is_leftmost(self) -> bool {
-        self == Self::LeftmostFirst || self == Self::LeftmostLongest
+        self == Self::LeftmostFirst
+            || self == Self::LeftmostLongest
+            || self == Self::LeftmostLongestExperimental
     }
 
     pub(crate) fn is_leftmost_first(self) -> bool {
@@ -426,6 +518,7 @@ impl From<u8> for MatchKind {
         match src {
             1 => Self::LeftmostLongest,
             2 => Self::LeftmostFirst,
+            3 => Self::LeftmostLongestExperimental,
             _ => Self::Standard,
         }
     }
@@ -437,6 +530,7 @@ impl From<MatchKind> for u8 {
             MatchKind::Standard => 0,
             MatchKind::LeftmostLongest => 1,
             MatchKind::LeftmostFirst => 2,
+            MatchKind::LeftmostLongestExperimental => 3,
         }
     }
 }
