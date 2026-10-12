@@ -818,7 +818,10 @@ pub(crate) fn next_leftmost_longest_match<V: Copy>(
 
             if let Some(ep) = emit_pos {
                 extract_emits(&pma.emits, ep.get(), *pos, buf);
-                // If fallback reached root, attempt to consume the current character from root
+                // Note: We cannot increment `*pos` before `extract_emits` because `*pos`
+                // represents the exact text coordinate corresponding to the end of the state's path.
+                // Incrementing `*pos` beforehand would shift all extracted match spans forward by `char_len`.
+                // If fallback reached root, attempt to consume the current character from root.
                 if *state_id == ROOT_STATE_IDX {
                     *state_id = step_root(mapped_c, root_base, states);
                     *pos += char_len;
