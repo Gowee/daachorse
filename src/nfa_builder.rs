@@ -210,79 +210,99 @@ where
     L: EdgeLabel,
     V: Copy,
 {
-    /// Builds failure transitions and emits for leftmost-longest matching using
-    /// a zero-rewind automaton with pre-committed match chains.
+    /// Builds failure transitions and match emit chains for zero-rewind leftmost-longest matching.
     ///
-    /// # Background & The Problem with Existing AC Leftmost Matching
+    /// # Overview & Motivation
     ///
-    /// Classic Aho-Corasick (1975) is strictly an overlapping all-occurrences algorithm.
-    /// Existing Aho-Corasick-based libraries supporting leftmost matching (such as `aho-corasick`
-    /// and `daachorse`) simulate leftmost semantics via a heuristic restart trick:
-    /// 1. In `build_fails_leftmost()`, failure transitions of matching states are truncated to `DEAD`.
-    /// 2. During search, execution advances forward until mismatch, falls back to `ROOT`, and
-    ///    **rewinds the text cursor backward** to the end of the last recorded match.
+    /// Standard Aho-Corasick finds all overlapping pattern occurrences. When adapted for leftmost-longest
+    /// matching, conventional engines (like the legacy daachorse search) simulate greedy behavior by:
+    /// 1. Advancing forward in the trie until a mismatch occurs.
+    /// 2. Recording the longest match encountered along the way.
+    /// 3. Resetting state to ROOT and **rewinding the input text position backward** to the end of that match.
     ///
-    /// This backtracking causes worst-case $O(N \times L)$ execution time and prevents true
-    /// single-pass streaming on forward-only inputs.
+    /// On adversarial inputs (e.g. repeated overlapping candidates), rewinding causes worst-case $O(N \times L)$
+    /// scanning overhead.
     ///
-    /// # Theoretical Foundation: Why Zero-Rewind is Optimal and Sound
+    /// This builder constructs an automaton that achieves strictly $O(N)$ matching with **zero text rewinding**:
+    /// the text cursor always moves forward monotonically.
     ///
-    /// ## Foundational Observations
+    /// # Core Mechanism: Active Suffix and Pre-Committed Match Chain
     ///
-    /// ### Observation 1: Optimal Failure Target $S_{\text{suffix}}$ and Commitment Boundary
-    /// At any trie state $S_W$ representing path string $W \in \Sigma^*$ from `ROOT`, consider the
-    /// event where the next input character mismatches:
-    /// 1. **Optimal Failure Target**: If future characters can still match any dictionary pattern,
-    ///    that match must begin with some suffix of $W$. Therefore, the automaton must transition
-    ///    to a state representing a proper suffix of $W$ that possesses outgoing branches capable
-    ///    of continuing into the future. To avoid missing any earlier match, the optimal target is
-    ///    the **longest such extendable suffix**, denoted $w_{\text{suffix}}$ (with state
-    ///    $S_{\text{suffix}} = \delta^*(\text{ROOT}, w_{\text{suffix}})$).
-    /// 2. **Commitment Boundary**: Within the prefix text $W_{\text{prefix}}$ preceding $w_{\text{suffix}}$,
-    ///    no forward extension across $w_{\text{suffix}}$ is possible along this branch. Under
-    ///    leftmost-longest semantics, all greedy matches within $W_{\text{prefix}}$ are permanently
-    ///    closed and finalized. Future characters can never alter, invalidate, or merge with them
-    ///    without violating the definition of $w_{\text{suffix}}$ as the longest extendable suffix.
-    /// 3. **Sound Atomic Emission**: Therefore, strictly upon mismatch, all leftmost-longest matches in
-    ///    $W_{\text{prefix}}$ are committed and emitted ($\text{Emit}_W$), while the automaton
-    ///    transitions directly to $S_{\text{suffix}}$. The text scanner advances monotonically with
-    ///    **zero backtracking**.
+    /// For any trie state representing a path string from `ROOT`, the consumed prefix is partitioned into
+    /// two distinct regions:
     ///
-    /// ### Observation 2: Inductive Chaining, Reverse DAG Sharing, and $O(1)$ Coordinate Recovery
-    /// 1. **Suffix Exclusion**:
-    ///    $$\text{Emit}_W = \text{Emit}_{W \setminus w_{\text{suffix}}}$$
-    ///    The active suffix $w_{\text{suffix}}$ is reserved for future exploration and produces no emits.
-    /// 2. **Backward Inductive Recurrence**:
-    ///    Within $W_{\text{prefix}}$, the non-overlapping leftmost-longest matches form a finite sequence
-    ///    $[M_1, \dots, M_k]$. The chain exhibits an exact inductive recurrence:
-    ///    $$\text{Chain}_W = \text{Cons}(M_k, \text{Chain}_{<k})$$
-    ///    where $M_k$ is the last closed match in $W_{\text{prefix}}$, and $\text{Chain}_{<k}$ is the
-    ///    immutable predecessor chain for all matches prior to $M_k$.
-    /// 3. **Why Reverse Chaining? (Avoiding Quadratic $O(L^2)$ Copying)**:
-    ///    Forward chaining ($M_1 \to M_2 \dots$) would require deep-copying predecessor chains whenever
-    ///    trie branches fork and append distinct matches, incurring quadratic $O(L^2)$ space/time
-    ///    construction costs.
-    ///    By storing chains in **reverse order** ($M_k \to M_{k-1} \dots \to M_1$), appending a match
-    ///    is an $O(1)$ functional prepend (`Cons`). Because internal match gaps
-    ///    ($\text{start}(M_i) - \text{end}(M_{i-1})$) are strictly local and invariant, predecessor
-    ///    sub-chains are 100% structurally shared across trie states as a persistent Directed Acyclic
-    ///    Graph (DAG) in `self.emits`, ensuring optimal $O(|V|)$ construction.
-    /// 4. **$O(1)$ Zero-Allocation Coordinate Recovery**:
-    ///    Using the absolute mismatch scan offset $P$ as the base anchor, match boundaries are reconstructed
-    ///    in $O(1)$ arithmetic operations by walking backwards along the reverse delta-encoded chain:
-    ///    - $\text{end}(M_k) = P - M_k.\text{gap}, \quad \text{start}(M_k) = \text{end}(M_k) - M_k.\text{length}$
-    ///    - $\text{anchor}_{i-1} = \text{start}(M_i)$
-    ///    - $\text{end}(M_{i-1}) = \text{anchor}_{i-1} - M_{i-1}.\text{gap}, \quad \text{start}(M_{i-1}) = \text{end}(M_{i-1}) - M_{i-1}.\text{length}$
+    /// ```text
+    ///                 Prefix string of state `sid`
+    ///   ┌──────────────────────────────────────────────┬──────────────────┐
+    ///   │  Finalized matches in prefix (output_pos)    │ Active suffix    │
+    ///   ├──────────────────────────────────────────────┼──────────────────┤
+    ///   │  [Match 1] ... [Match k] (locked in)         │ fail state       │
+    ///   └──────────────────────────────────────────────┴──────────────────┘
+    /// ```
     ///
-    ///    A small LIFO stack unpacks $M_k \dots M_2$ to yield $M_1$ first, streaming matches in true
-    ///    chronological order without heap allocation.
+    /// 1. **Active Suffix (`fail`)**:
+    ///    The longest proper suffix of the current prefix that corresponds to a valid trie state with
+    ///    outgoing edges.
+    ///    - *Why longest?* Under Leftmost Priority, an earlier starting position in the text always takes
+    ///      precedence over a later starting position. A longer suffix starts earlier in the text than a
+    ///      shorter suffix (e.g. offset `pos - len_long` is earlier than `pos - len_short`).
+    ///      Transitioning to the longest extendable suffix guarantees that the automaton will not bypass
+    ///      or miss the earliest potential pattern match. If this longer suffix subsequently fails on future
+    ///      characters, its own fail link will fall back to shorter suffixes in chronological order.
+    ///    - When the next input character mismatches, the automaton transitions directly to this state
+    ///      to continue searching into future characters without rewinding.
     ///
-    /// ### Observation 3: Zero Runtime Struct Overhead
-    /// DoubleArray `State` fields are directly reused without any size expansion:
-    /// - `fail`: Reused to store the target state ID of $S_{\text{suffix}}$.
-    /// - `output_pos`: Reused to store the 1-based index of the head emit node $M_k$.
+    /// 2. **Committed Match Chain (`output_pos`)**:
+    ///    All leftmost-longest matches occurring *before* the active suffix. Because branches starting
+    ///    before the active suffix have already terminated, these matches are permanently finalized:
+    ///    future characters can never alter, invalidate, or merge with them.
     ///
-    /// The 16-byte footprint of `State` is preserved with no extra fields and zero branching overhead.
+    /// # Reverse Delta-Encoded Match Chains
+    ///
+    /// Matches are stored as a reverse singly-linked list in `self.emits`:
+    /// ```text
+    ///   Head (Match k) ──(gap)──> Predecessor (Match k-1) ──(gap)──> ... ──> Match 1 ──> None
+    /// ```
+    /// Each `Emit` node contains:
+    /// - `value`: Pattern value/ID.
+    /// - `length`: Byte length of the pattern.
+    /// - `gap`: Byte distance. For the head node (`Match k`), it is the distance from the end of the
+    ///   state's path to the end of `Match k`. For predecessor nodes (`Match i`), it is the unmatched
+    ///   byte distance from the end of `Match i` to the start of the subsequent match `Match i+1`
+    ///   (`start(Match i+1) - end(Match i)`).
+    /// - `pred`: 1-based index pointing to the preceding match node.
+    ///
+    /// ### Why Reverse Linking?
+    /// Because internal gaps between matches depend only on the text between them, the entire predecessor
+    /// chain `Match k-1 -> ... -> Match 1` is completely invariant and structurally shared across all
+    /// descendant trie branches. When trie branches fork, states share the same predecessor nodes in
+    /// `self.emits` with zero copying.
+    ///
+    /// ### Runtime Match Extraction (O(1) Per Match, Zero Allocations)
+    /// When a mismatch occurs at text cursor `pos`:
+    /// - `end(Match k) = pos - head.gap`, `start(Match k) = end - head.length`.
+    /// - `end(Match k-1) = start(Match k) - em.gap`, `start(Match k-1) = end - em.length`.
+    ///
+    /// Nodes are pushed onto a thread-local LIFO buffer and popped in chronological order `Match 1 .. Match k`.
+    ///
+    /// # Construction Algorithm (BFS Traversal)
+    ///
+    /// States are processed in breadth-first search order. For each state `sid` with parent `p` and edge `c`:
+    ///
+    /// - **Tier 1 (Full-Path Pattern, O(1))**:
+    ///   If a pattern covers the full path from root to `sid`, no trailing suffix remains.
+    ///   `fail` is set to `ROOT`, and `output_pos` points to this single match (`gap = 0`).
+    ///
+    /// - **Tier 2 (Suffix Continuation, O(1))**:
+    ///   Let `p_target = parent.fail` be the parent's active suffix state. If `p_target` can transition
+    ///   on `c` to a child `pc` that has outgoing edges, the active suffix continues advancing.
+    ///   Matches finalized before the suffix are identical to the parent's. The child directly inherits
+    ///   the parent's match chain, only updating the head node's gap (`new_gap = p_head.gap + c.num_bytes()`).
+    ///
+    /// - **Tier 3 (Suffix Fallback / Backtrace)**:
+    ///   If `p_target` cannot transition on `c` or reaches a leaf state, the active suffix has ended.
+    ///   The uncommitted slice between the last committed match and the current position is walked
+    ///   from ROOT to finalize any newly completed matches and discover the new longest extendable suffix.
     pub(crate) fn build_fails_leftmost_longest(&mut self) -> Vec<u32> {
         assert!(
             self.states[usize::from_u32(ROOT_STATE_ID)]
@@ -297,9 +317,20 @@ where
         let mut edge_label: Vec<Option<L>> = vec![None; num_states];
         let mut depth = vec![0u32; num_states];
         let mut byte_len = vec![0usize; num_states];
-
         let mut deepest_output = vec![None; num_states];
 
+        // Stage 1: BFS Traversal to Establish Topological Order, Metrics, and Longest Prefix Matches.
+        //
+        // This traversal computes:
+        // 1. `q`: Topological BFS ordering ensuring ancestor states are processed before descendants.
+        // 2. `parent` and `edge_label`: Structural links for backtracing and DP transitions.
+        // 3. `depth` and `byte_len`: Exact character and UTF-8 byte depths from ROOT for O(1) coordinate math.
+        // 4. `deepest_output[u]`: The deepest ancestor state (including `u`) that is a complete pattern.
+        //    In leftmost matching, matches starting at ROOT (index 0) possess supreme priority; precomputing
+        //    the longest pattern on the path from ROOT allows O(1) resolution of the first match.
+        //
+        // Initialize depth-1 children directly outgoing from ROOT:
+        // FIXME: Code duplicated. Might not best practice. this can be eliminated by put ROOT_STATE_ID into the queue and handle it in the loop below? Some specil handling needed?
         for &(c, child_id) in self.states[usize::from_u32(ROOT_STATE_ID)].edges.iter() {
             let cid = usize::from_u32(child_id);
             edge_label[cid] = Some(c);
@@ -311,6 +342,7 @@ where
             q.push(child_id);
         }
 
+        // Expand BFS queue to process all remaining levels:
         let mut qi = 0;
         while qi < q.len() {
             let state_id = q[qi];
@@ -327,6 +359,8 @@ where
                 edge_label[cid] = Some(c);
                 depth[cid] = s_depth + 1;
                 byte_len[cid] = s_byte_len + c.num_bytes();
+                // If child is itself a complete pattern, it is strictly longer than any ancestor pattern;
+                // otherwise, it inherits the deepest pattern found on its parent path.
                 if !self.states[cid].output.is_empty() {
                     deepest_output[cid] = Some(child_id);
                 } else {
@@ -341,17 +375,23 @@ where
         let mut byte_offsets = Vec::new();
         let mut temp_matches = Vec::new();
 
+        // Stage 2: Resolving Active Suffix Fail Transitions and Pre-Committed Match Chains.
+        //
+        // In BFS order, for each state `sid` we determine:
+        // - `fail`: The longest active proper suffix state (with outgoing edges).
+        // - `output_pos`: The pre-committed match chain occurring prior to the active suffix.
+        //
+        // Because parents are visited before children, parent fail states and emit chains are already finalized.
         for &state_id in &q {
             let sid = usize::from_u32(state_id);
             let s_depth = depth[sid] as usize;
             let total_bytes = byte_len[sid];
 
-            // O(1) Fast Path: When the deepest output matches the full path of sid,
-            // the match starts at 0 and covers the entire path. It leaves no residual suffix.
+            // Fast path: if a pattern covers the entire path from root to `sid`, no suffix remains.
             if let Some(pat_st) = deepest_output[sid] {
                 let pat_sid = usize::from_u32(pat_st);
                 if depth[pat_sid] as usize == s_depth {
-                    let (val, pat_bytes) = self.states[pat_sid].output[0];
+                    let (val, pat_bytes) = self.states[pat_sid].output[0]; // TODO: multiple outputs? same pattern? 
                     let emit_node = Emit {
                         value: val,
                         length: pat_bytes,
@@ -371,6 +411,47 @@ where
                 }
             }
 
+            // Fast path: if the parent's active suffix state can step on `c` to a state with
+            // outgoing edges, the suffix continues advancing without triggering any new matches.
+            // Matches committed before the suffix are identical to the parent's, so the child reuses
+            // the exact same predecessor chain and only increments the head node's gap by `c.num_bytes()`.
+            if s_depth > 1 {
+                let p = parent[sid];
+                let c = edge_label[sid].unwrap();
+                let p_target = self.states[usize::from_u32(p)].fail.get();
+                if let Some(pc) = self.child_id(p_target, c) {
+                    if !self.states[usize::from_u32(pc)].edges.is_empty() {
+                        let p_output_pos = self.states[usize::from_u32(p)].output_pos.get();
+                        let head_pos = if let Some(p_pos) = p_output_pos {
+                            let p_idx = p_pos.get() as usize - 1;
+                            let p_key = emit_dedup.keys[p_idx];
+                            let p_emit = self.emits[p_idx];
+                            let new_gap = p_emit.gap + c.num_bytes() as u32;
+                            let head_node = Emit {
+                                value: p_emit.value,
+                                length: p_emit.length,
+                                gap: new_gap,
+                                pred: p_emit.pred,
+                            };
+                            let key = DedupKey {
+                                pat_state: p_key.pat_state,
+                                gap: new_gap,
+                                pred: p_emit.pred,
+                            };
+                            Some(emit_dedup.insert_or_get(key, head_node, &mut self.emits))
+                        } else {
+                            None
+                        };
+
+                        self.states[sid].output_pos.set(head_pos);
+                        self.states[sid].fail.set(pc);
+                        continue;
+                    }
+                }
+            }
+
+            // Fallback path: the active suffix could not continue or reached a leaf.
+            // Walk the trailing unmatched slice to finalize newly closed matches and find the next valid suffix.
             let mut idx = 0;
             temp_matches.clear();
             let mut target_state = ROOT_STATE_ID;
