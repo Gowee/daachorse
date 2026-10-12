@@ -439,6 +439,37 @@ where
             }
 
             // 1. Failure Path Walk & Broken Candidate Harvesting:
+            //
+            // When an in-flight suffix candidate `curr = fail(p)` cannot transition on `c`,
+            // its active pattern pursuit has failed and broken. Any pre-committed non-overlapping
+            // matches locked in along `curr`'s prefix must now be harvested and transferred onto `sid`.
+            //
+            // ## Path Copying & Topological Splicing Rationale:
+            // Why must we unroll `curr.output_pos` along `pred` and re-cons in reverse chronological order?
+            // 1. Coordinate Frame Shift:
+            //    `curr`'s prefix is a proper suffix of `sid` starting at `curr_base`. All match byte offsets
+            //    in `curr` must be translated into `sid`'s global coordinate frame.
+            // 2. Topological Re-linking:
+            //    The earliest match M_0 in `curr` previously had `M_0.pred == None`. When transferring
+            //    to `sid`, `M_0` must now link to `p`'s prior matches (`head_emit_pos`). Because existing
+            //    `Emit` nodes are immutable and structurally shared by other branches in the Trie,
+            //    functional path copying (re-consing the suffix chain) is mathematically necessary.
+            //
+            // ## Space Complexity & Bounds Analysis (Ω(|P|) ~ O(|V|)):
+            // One might wonder whether path copying could cause quadratic O(L^2) node explosion.
+            // In fact, the total number of unique `Emit` nodes is tightly bounded to Ω(|P|) ~ O(|V|):
+            // 1. Path Length Invariant (Non-Overlapping):
+            //    In leftmost-longest semantics, all matches along any path are strictly non-overlapping
+            //    and have length >= 1. Thus, the match chain length at any state S is strictly bounded by
+            //    its string depth: k_S <= depth(S) <= max_{p ∈ P} |p|.
+            // 2. Suffix-Localized Splicing:
+            //    `curr` is a strict proper suffix of `p` (depth(curr) < depth(p)). Only the matches within
+            //    this local suffix slice are copied. All preceding ancestor matches (S_before_suffix)
+            //    remain 100% structurally shared without copying: M_0' directly links to `head_emit_pos` in O(1).
+            // 3. DAG Hash-Consing (EmitDedup):
+            //    Identical (pat_state, gap, pred) triples across branches are collapsed into a canonical DAG.
+            // Hence, the total number of unique `Emit` nodes across the entire automaton is Ω(|P|) ~ O(|V|),
+            // where |P| is the pattern count and |V| is the number of Trie states (|V| <= ∑ |p| + 1).
             while curr != ROOT_STATE_ID && self.child_id(curr, c).is_none() {
                 let curr_sid = usize::from_u32(curr);
                 if let Some(curr_head) = self.states[curr_sid].output_pos.get() {
