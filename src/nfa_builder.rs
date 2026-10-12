@@ -378,7 +378,9 @@ where
             let s_char_depth = char_depths[sid];
             let s_byte_depth = byte_depths[sid];
 
-            // Fast Path 1: if a pattern covers the entire path from root to `sid`, no suffix remains.
+            // Fast Path: Root-Covered Pattern (Barrier Reset).
+            // If a pattern covers the entire path from ROOT to `sid`, under leftmost-longest priority
+            // it supersedes any proper suffix. `fail` is reset to ROOT and `gap` is 0.
             if let Some(pat_state) = deepest_outputs[sid] {
                 let pat_sid = usize::from_u32(pat_state);
                 if char_depths[pat_sid] == s_char_depth {
@@ -409,22 +411,21 @@ where
                 s_byte_depth,
                 c.num_bytes(),
             );
-            let mut has_new_match = false;
 
-            // 1. Failure Path Walk & Broken Candidate Harvesting:
+            // 1. Failure Path Walk & Broken Candidate Splicing:
             //
             // When an in-flight suffix candidate `curr = fail(parent_id)` cannot transition on `c`,
             // its active pattern pursuit has failed and broken. Any pre-committed non-overlapping
             // matches locked in along `curr`'s prefix must now be harvested and transferred onto `sid`.
             //
             // ## Path Copying & Topological Splicing Rationale:
-            // Why must we unroll `curr.output_pos` along `pred` and re-cons in reverse chronological order?
+            // Why must we copy and append `curr.output_pos` onto `chain` in forward chronological order?
             // 1. Coordinate Frame Shift:
             //    `curr`'s prefix is a proper suffix of `sid` starting at `curr_base`. All match byte offsets
             //    in `curr` must be translated into `sid`'s global coordinate frame.
             // 2. Topological Re-linking:
             //    The earliest match M_0 in `curr` previously had `M_0.pred == None`. When transferring
-            //    to `sid`, `M_0` must now link to `parent_id`'s prior matches (`head_emit_pos`). Because existing
+            //    to `sid`, `M_0` must now link to `parent_id`'s prior matches (`parent_head`). Because existing
             //    `Emit` nodes are immutable and structurally shared by other branches in the Trie,
             //    functional path copying (re-consing the suffix chain) is mathematically necessary.
             //
@@ -438,7 +439,7 @@ where
             // 2. Suffix-Localized Splicing:
             //    `curr` is a strict proper suffix of `parent_id` (depth(curr) < depth(parent_id)). Only the matches within
             //    this local suffix slice are copied. All preceding ancestor matches (S_before_suffix)
-            //    remain 100% structurally shared without copying: M_0' directly links to `head_emit_pos` in O(1).
+            //    remain 100% structurally shared without copying: M_0' directly links to `parent_head` in O(1).
             // 3. DAG Hash-Consing (EmitDedup):
             //    Identical (pat_state, gap, pred) triples across branches are collapsed into a canonical DAG.
             // Hence, the total number of unique `Emit` nodes across the entire automaton is Ω(|P|) ~ O(|V|),
@@ -450,7 +451,6 @@ where
                 if let Some(curr_head) = self.states[curr_sid].output_pos.get() {
                     let curr_base = (s_byte_depth - c.num_bytes()) - byte_depths[curr_sid];
                     chain.append_suffix(curr_head, byte_depths[curr_sid], curr_base);
-                    has_new_match = true;
                 }
                 curr = self.states[curr_sid].fail.get();
             }
@@ -474,17 +474,11 @@ where
                             s_byte_depth,
                         );
                         fail_state = ROOT_STATE_ID;
-                        has_new_match = true;
                     }
                 }
             }
 
-            // 3. If no new match was cons'd, simply expand parent's head gap by |c|:
-            if !has_new_match {
-                chain.expand_head_gap(c.num_bytes());
-            }
-
-            self.states[sid].output_pos.set(chain.head);
+            self.states[sid].output_pos.set(chain.finish(c.num_bytes()));
             self.states[sid].fail.set(fail_state);
         }
 
@@ -657,6 +651,7 @@ struct EmitChainBuilder<'a, V> {
     head: Option<NonZeroU32>,
     last_end: usize,
     s_byte_depth: usize,
+    has_new_match: bool,
 }
 
 impl<'a, V: Copy> EmitChainBuilder<'a, V> {
@@ -680,6 +675,7 @@ impl<'a, V: Copy> EmitChainBuilder<'a, V> {
             head,
             last_end,
             s_byte_depth,
+            has_new_match: false,
         }
     }
 
@@ -690,6 +686,8 @@ impl<'a, V: Copy> EmitChainBuilder<'a, V> {
     /// 3. Collapses identical nodes into a canonical DAG via `self.dedup`.
     #[inline(always)]
     fn cons(&mut self, pat_state: u32, val: V, len: u32, start_byte: usize, end_byte: usize) {
+        debug_assert!(start_byte >= self.last_end);
+        debug_assert!(self.s_byte_depth >= end_byte);
         if let Some(prev) = self.head {
             let p_idx = prev.get() as usize - 1;
             let p_key = self.dedup.keys[p_idx];
@@ -704,6 +702,7 @@ impl<'a, V: Copy> EmitChainBuilder<'a, V> {
         let k = DedupKey::new(pat_state, gap, self.head);
         self.head = Some(self.dedup.insert_or_get(k, node, self.emits));
         self.last_end = end_byte;
+        self.has_new_match = true;
     }
 
     /// Functional copy-and-append of a suffix state's match chain (Scheme `append`).
@@ -730,18 +729,21 @@ impl<'a, V: Copy> EmitChainBuilder<'a, V> {
         );
     }
 
-    /// If no new matches were cons'd, expands the existing head's gap by |c|.
+    /// Finalizes the chain: if no new matches were cons'd, expands the existing head's gap by |c|.
     #[inline(always)]
-    fn expand_head_gap(&mut self, c_num_bytes: usize) {
-        if let Some(p_pos) = self.head {
-            let p_idx = p_pos.get() as usize - 1;
-            let p_key = self.dedup.keys[p_idx];
-            let p_emit = self.emits[p_idx];
-            let new_gap = p_emit.gap + c_num_bytes as u32;
-            let node = Emit::new(p_emit.value, p_emit.length, new_gap, p_emit.pred);
-            let k = DedupKey::new(p_key.pat_state, new_gap, p_emit.pred);
-            self.head = Some(self.dedup.insert_or_get(k, node, self.emits));
+    fn finish(mut self, c_num_bytes: usize) -> Option<NonZeroU32> {
+        if !self.has_new_match {
+            if let Some(p_pos) = self.head {
+                let p_idx = p_pos.get() as usize - 1;
+                let p_key = self.dedup.keys[p_idx];
+                let p_emit = self.emits[p_idx];
+                let new_gap = p_emit.gap + c_num_bytes as u32;
+                let node = Emit::new(p_emit.value, p_emit.length, new_gap, p_emit.pred);
+                let k = DedupKey::new(p_key.pat_state, new_gap, p_emit.pred);
+                self.head = Some(self.dedup.insert_or_get(k, node, self.emits));
+            }
         }
+        self.head
     }
 }
 
