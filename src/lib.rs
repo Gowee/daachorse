@@ -367,6 +367,17 @@ where
 ///
 /// This relative delta-encoding allows computing exact match offsets in O(1) time
 /// during single-pass streaming without retaining past text buffers.
+///
+/// # Structural Sharing & Space Complexity
+///
+/// While states inherit and extend match chains via functional `cons`, the total number of
+/// unique `Emit` nodes across the entire automaton is bounded to `Ω(|P|) ~ O(|V|)`
+/// (where `|P|` is the number of patterns and `|V|` is the number of Trie states).
+/// This is guaranteed because:
+/// 1. Non-overlapping matches along any path of depth `D` cannot exceed `D`.
+/// 2. Suffix harvesting only copies the localized suffix candidate slice, while ancestor
+///    matches are 100% structurally shared without copying.
+/// 3. Identical `(pat_state, gap, pred)` nodes are collapsed into a canonical DAG via hash deduplication.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Emit<V> {
     pub(crate) value: V,

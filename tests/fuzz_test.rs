@@ -128,6 +128,19 @@ fn test_repro_round_28() {
 }
 
 #[test]
+fn test_parent_and_candidate_matches() {
+    let patterns = vec![
+        "xy".to_string(),
+        "b".to_string(),
+        "a".to_string(),
+        "bacd".to_string(),
+        "xybace".to_string(),
+    ];
+    let haystack = "xybacf";
+    differential_fuzz_round(&patterns, haystack, 1);
+}
+
+#[test]
 fn test_fuzz_binary_alphabet() {
     let mut rng = Rng::new(0x12345678);
     let alphabet = ['a', 'b'];
