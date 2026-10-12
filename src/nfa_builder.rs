@@ -289,20 +289,30 @@ where
     ///
     /// States are processed in breadth-first search order. For each state `sid` with parent `p` and edge `c`:
     ///
-    /// - **Tier 1 (Full-Path Pattern, O(1))**:
+    /// - **Fast Path 1 (Full-Path Pattern, O(1))**:
     ///   If a pattern covers the full path from root to `sid`, no trailing suffix remains.
     ///   `fail` is set to `ROOT`, and `output_pos` points to this single match (`gap = 0`).
     ///
-    /// - **Tier 2 (Suffix Continuation, O(1))**:
-    ///   Let `p_target = parent.fail` be the parent's active suffix state. If `p_target` can transition
-    ///   on `c` to a child `pc` that has outgoing edges, the active suffix continues advancing.
-    ///   Matches finalized before the suffix are identical to the parent's. The child directly inherits
-    ///   the parent's match chain, only updating the head node's gap (`new_gap = p_head.gap + c.num_bytes()`).
+    /// - **Fast Path 0 (Depth-1 Child of ROOT, O(1))**:
+    ///   If `sid` has depth 1 and is not a pattern, its only proper suffix is empty (`ROOT`).
+    ///   `fail` is set to `ROOT`, and `output_pos` is `None`.
     ///
-    /// - **Tier 3 (Suffix Fallback / Backtrace)**:
-    ///   If `p_target` cannot transition on `c` or reaches a leaf state, the active suffix has ended.
-    ///   The uncommitted slice between the last committed match and the current position is walked
-    ///   from ROOT to finalize any newly completed matches and discover the new longest extendable suffix.
+    /// - **Fast Path 2 (Transition from Parent's Active Suffix, O(1))**:
+    ///   Let `p_fail = parent.fail` be the parent's active suffix state.
+    ///   - **2A (Active Suffix Continuation)**: If `p_fail` steps on `c` to a non-leaf state `pc`,
+    ///     the active suffix continues advancing in-flight (`fail = pc`). Matches committed before
+    ///     the suffix are identical to the parent's (`new_gap = p_head.gap + c.num_bytes()`).
+    ///   - **2C (Leaf Pattern Completion)**: If `p_fail` steps on `c` to a leaf state `pc`, the active
+    ///     suffix completes pattern `pc` at the end of the state. Because `pc` has no outgoing edges,
+    ///     it cannot extend further and commits immediately with `gap = 0` (`fail = ROOT`), linked to
+    ///     the parent's match chain.
+    ///   - **2B (Root Non-Advancement Theorem)**: If `p_fail == ROOT` and ROOT has no transition on `c`,
+    ///     no proper suffix of `sid` exists in the Trie (`fail = ROOT`). Matches are identical to the parent's.
+    ///
+    /// - **Fallback Path (In-Flight Candidate Discontinuity, Rare)**:
+    ///   Entered strictly when `p_fail != ROOT` and `p_fail` has no transition on `c`.
+    ///   The in-flight candidate broke; the trailing uncommitted slice is evaluated online to commit
+    ///   any shadowed leftmost pattern and establish the new longest extendable proper suffix.
     pub(crate) fn build_fails_leftmost_longest(&mut self) -> Vec<u32> {
         assert!(
             self.states[usize::from_u32(ROOT_STATE_ID)]
@@ -313,96 +323,73 @@ where
 
         let num_states = self.states.len();
         let mut q = Vec::with_capacity(num_states);
-        let mut parent = vec![ROOT_STATE_ID; num_states];
-        let mut edge_label: Vec<Option<L>> = vec![None; num_states];
-        let mut depth = vec![0u32; num_states];
-        let mut byte_len = vec![0usize; num_states];
-        let mut deepest_output = vec![None; num_states];
+        let mut parents = vec![ROOT_STATE_ID; num_states];
+        let mut edge_labels: Vec<Option<L>> = vec![None; num_states];
+        let mut char_depths = vec![0u32; num_states];
+        let mut byte_depths = vec![0usize; num_states];
+        let mut deepest_outputs = vec![None; num_states];
 
         // Stage 1: BFS Traversal to Establish Topological Order, Metrics, and Longest Prefix Matches.
         //
         // This traversal computes:
         // 1. `q`: Topological BFS ordering ensuring ancestor states are processed before descendants.
-        // 2. `parent` and `edge_label`: Structural links for backtracing and DP transitions.
-        // 3. `depth` and `byte_len`: Exact character and UTF-8 byte depths from ROOT for O(1) coordinate math.
-        // 4. `deepest_output[u]`: The deepest ancestor state (including `u`) that is a complete pattern.
+        // 2. `parents` and `edge_labels`: Structural links for backtracing and DP transitions.
+        // 3. `char_depths` and `byte_depths`: Exact character and UTF-8 byte depths from ROOT for O(1) coordinate math.
+        // 4. `deepest_outputs[u]`: The deepest ancestor state (including `u`) that is a complete pattern.
         //    In leftmost matching, matches starting at ROOT (index 0) possess supreme priority; precomputing
         //    the longest pattern on the path from ROOT allows O(1) resolution of the first match.
         //
-        // Initialize depth-1 children directly outgoing from ROOT:
-        // FIXME: Code duplicated. Might not best practice. this can be eliminated by put ROOT_STATE_ID into the queue and handle it in the loop below? Some specil handling needed?
-        for &(c, child_id) in self.states[usize::from_u32(ROOT_STATE_ID)].edges.iter() {
-            let cid = usize::from_u32(child_id);
-            edge_label[cid] = Some(c);
-            depth[cid] = 1;
-            byte_len[cid] = c.num_bytes();
-            if !self.states[cid].output.is_empty() {
-                deepest_output[cid] = Some(child_id);
-            }
-            q.push(child_id);
-        }
-
-        // Expand BFS queue to process all remaining levels:
+        // Initialize BFS queue starting with ROOT_STATE_ID:
+        q.push(ROOT_STATE_ID);
         let mut qi = 0;
         while qi < q.len() {
             let state_id = q[qi];
             qi += 1;
 
             let s = &self.states[usize::from_u32(state_id)];
-            let s_depth = depth[usize::from_u32(state_id)];
-            let s_byte_len = byte_len[usize::from_u32(state_id)];
-            let s_deepest = deepest_output[usize::from_u32(state_id)];
+            let s_char_depth = char_depths[usize::from_u32(state_id)];
+            let s_byte_depth = byte_depths[usize::from_u32(state_id)];
+            let s_deepest = deepest_outputs[usize::from_u32(state_id)];
 
             for &(c, child_id) in s.edges.iter() {
                 let cid = usize::from_u32(child_id);
-                parent[cid] = state_id;
-                edge_label[cid] = Some(c);
-                depth[cid] = s_depth + 1;
-                byte_len[cid] = s_byte_len + c.num_bytes();
+                parents[cid] = state_id;
+                edge_labels[cid] = Some(c);
+                char_depths[cid] = s_char_depth + 1;
+                byte_depths[cid] = s_byte_depth + c.num_bytes();
                 // If child is itself a complete pattern, it is strictly longer than any ancestor pattern;
                 // otherwise, it inherits the deepest pattern found on its parent path.
-                if !self.states[cid].output.is_empty() {
-                    deepest_output[cid] = Some(child_id);
+                deepest_outputs[cid] = if !self.states[cid].output.is_empty() {
+                    Some(child_id)
                 } else {
-                    deepest_output[cid] = s_deepest;
-                }
+                    s_deepest
+                };
                 q.push(child_id);
             }
         }
 
+        // Deduplication hash table for `Emit` nodes across all states.
         let mut emit_dedup = EmitDedup::with_capacity(q.len());
-        let mut w = Vec::new();
-        let mut byte_offsets = Vec::new();
-        let mut temp_matches = Vec::new();
 
         // Stage 2: Resolving Active Suffix Fail Transitions and Pre-Committed Match Chains.
         //
-        // In BFS order, for each state `sid` we determine:
+        // In BFS order (skipping ROOT), for each state `curr_id` (index `sid`) we determine:
         // - `fail`: The longest active proper suffix state (with outgoing edges).
         // - `output_pos`: The pre-committed match chain occurring prior to the active suffix.
         //
         // Because parents are visited before children, parent fail states and emit chains are already finalized.
-        for &state_id in &q {
-            let sid = usize::from_u32(state_id);
-            let s_depth = depth[sid] as usize;
-            let total_bytes = byte_len[sid];
+        for &curr_id in &q[1..] {
+            let sid = usize::from_u32(curr_id);
+            let s_char_depth = char_depths[sid] as usize;
+            let s_byte_depth = byte_depths[sid];
 
-            // Fast path: if a pattern covers the entire path from root to `sid`, no suffix remains.
-            if let Some(pat_st) = deepest_output[sid] {
+            // Fast Path 1: if a pattern covers the entire path from root to `sid`, no suffix remains.
+            if let Some(pat_st) = deepest_outputs[sid] {
                 let pat_sid = usize::from_u32(pat_st);
-                if depth[pat_sid] as usize == s_depth {
-                    let (val, pat_bytes) = self.states[pat_sid].output[0]; // TODO: multiple outputs? same pattern? 
-                    let emit_node = Emit {
-                        value: val,
-                        length: pat_bytes,
-                        gap: 0,
-                        pred: None,
-                    };
-                    let key = DedupKey {
-                        pat_state: pat_st,
-                        gap: 0,
-                        pred: None,
-                    };
+                if char_depths[pat_sid] as usize == s_char_depth {
+                    let (val, pat_bytes) = self.states[pat_sid].output[0];
+                    let emit_node = Emit::new(val, pat_bytes, 0, None);
+                    let key = DedupKey::new(pat_st, 0, None);
                     let head_emit_pos =
                         Some(emit_dedup.insert_or_get(key, emit_node, &mut self.emits));
                     self.states[sid].output_pos.set(head_emit_pos);
@@ -411,148 +398,203 @@ where
                 }
             }
 
-            // Fast path: if the parent's active suffix state can step on `c` to a state with
-            // outgoing edges, the suffix continues advancing without triggering any new matches.
-            // Matches committed before the suffix are identical to the parent's, so the child reuses
-            // the exact same predecessor chain and only increments the head node's gap by `c.num_bytes()`.
-            if s_depth > 1 {
-                let p = parent[sid];
-                let c = edge_label[sid].unwrap();
-                let p_target = self.states[usize::from_u32(p)].fail.get();
-                if let Some(pc) = self.child_id(p_target, c) {
-                    if !self.states[usize::from_u32(pc)].edges.is_empty() {
-                        let p_output_pos = self.states[usize::from_u32(p)].output_pos.get();
-                        let head_pos = if let Some(p_pos) = p_output_pos {
-                            let p_idx = p_pos.get() as usize - 1;
-                            let p_key = emit_dedup.keys[p_idx];
-                            let p_emit = self.emits[p_idx];
-                            let new_gap = p_emit.gap + c.num_bytes() as u32;
-                            let head_node = Emit {
-                                value: p_emit.value,
-                                length: p_emit.length,
-                                gap: new_gap,
-                                pred: p_emit.pred,
-                            };
-                            let key = DedupKey {
-                                pat_state: p_key.pat_state,
-                                gap: new_gap,
-                                pred: p_emit.pred,
-                            };
-                            Some(emit_dedup.insert_or_get(key, head_node, &mut self.emits))
-                        } else {
-                            None
-                        };
+            // Fast Path 0: direct child of ROOT that is not a complete pattern.
+            // Its only proper suffix is the empty string (ROOT), and it has no committed matches.
+            if s_char_depth == 1 {
+                self.states[sid].output_pos.set(None);
+                self.states[sid].fail.set(ROOT_STATE_ID);
+                continue;
+            }
 
-                        self.states[sid].output_pos.set(head_pos);
-                        self.states[sid].fail.set(pc);
-                        continue;
+            // Fast Path 2: Smooth inheritance from parent.
+            // Condition A (Active Suffix Continuation):
+            //   If the parent's active suffix `p_fail` can step on `c` to a state `pc` with outgoing edges,
+            //   the active suffix continues advancing without completing any new match.
+            // Condition B (Root Non-Advancement Theorem):
+            //   If `p_fail == ROOT` and `c` has no transition from ROOT, then NO proper suffix of `sid`
+            //   can exist in the Trie (neither can any existing suffix extend, nor can any pattern start on `c`).
+            //
+            // In both conditions, no new match is completed at `sid`. The committed match chain
+            // is 100% identical to the parent's, with the head node's gap incremented by `c.num_bytes()`.
+            let p = parents[sid];
+            let c = edge_labels[sid].unwrap();
+            let p_fail = self.states[usize::from_u32(p)].fail.get();
+
+            if let Some(pc) = self.child_id(p_fail, c) {
+                let pc_sid = usize::from_u32(pc);
+                if !self.states[pc_sid].edges.is_empty() {
+                    // Fast Path 2A (Active Suffix Continuation):
+                    // Active suffix continues advancing without completing any new match.
+                    let p_output_pos = self.states[usize::from_u32(p)].output_pos.get();
+                    let head_pos = if let Some(p_pos) = p_output_pos {
+                        let p_idx = p_pos.get() as usize - 1;
+                        let p_key = emit_dedup.keys[p_idx];
+                        let p_emit = self.emits[p_idx];
+                        let new_gap = p_emit.gap + c.num_bytes() as u32;
+                        let head_node =
+                            Emit::new(p_emit.value, p_emit.length, new_gap, p_emit.pred);
+                        let key = DedupKey::new(p_key.pat_state, new_gap, p_emit.pred);
+                        Some(emit_dedup.insert_or_get(key, head_node, &mut self.emits))
+                    } else {
+                        None
+                    };
+
+                    self.states[sid].output_pos.set(head_pos);
+                    self.states[sid].fail.set(pc);
+                    continue;
+                } else {
+                    // Fast Path 2C (Leaf Pattern Completion):
+                    // Active suffix stepped on `c` to a leaf state `pc`.
+                    // A leaf has no outgoing edges, so pattern `pc` cannot extend further and MUST commit!
+                    // Because `pc` ends at the very end of `sid`, remaining uncommitted characters = 0,
+                    // so the new active suffix is strictly ROOT.
+                    let (val, pat_bytes_len) = self.states[pc_sid].output[0];
+                    let pat_bytes = byte_depths[pc_sid];
+                    let p_output_pos = self.states[usize::from_u32(p)].output_pos.get();
+                    let pred_pos = if let Some(p_pos) = p_output_pos {
+                        let p_idx = p_pos.get() as usize - 1;
+                        let p_key = emit_dedup.keys[p_idx];
+                        let p_emit = self.emits[p_idx];
+                        let inter_gap = (p_emit.gap + c.num_bytes() as u32) - pat_bytes as u32;
+                        let head_node =
+                            Emit::new(p_emit.value, p_emit.length, inter_gap, p_emit.pred);
+                        let key = DedupKey::new(p_key.pat_state, inter_gap, p_emit.pred);
+                        Some(emit_dedup.insert_or_get(key, head_node, &mut self.emits))
+                    } else {
+                        None
+                    };
+
+                    let leaf_emit = Emit::new(val, pat_bytes_len, 0, pred_pos);
+                    let leaf_key = DedupKey::new(pc, 0, pred_pos);
+                    let head_pos =
+                        Some(emit_dedup.insert_or_get(leaf_key, leaf_emit, &mut self.emits));
+
+                    self.states[sid].output_pos.set(head_pos);
+                    self.states[sid].fail.set(ROOT_STATE_ID);
+                    continue;
+                }
+            } else if p_fail == ROOT_STATE_ID {
+                // Fast Path 2B (Root Non-Advancement Theorem):
+                // If p_fail == ROOT and c has no transition from ROOT, then NO proper suffix of sid
+                // can exist in the Trie. Matches are identical to parent with gap incremented.
+                let p_output_pos = self.states[usize::from_u32(p)].output_pos.get();
+                let head_pos = if let Some(p_pos) = p_output_pos {
+                    let p_idx = p_pos.get() as usize - 1;
+                    let p_key = emit_dedup.keys[p_idx];
+                    let p_emit = self.emits[p_idx];
+                    let new_gap = p_emit.gap + c.num_bytes() as u32;
+                    let head_node = Emit::new(p_emit.value, p_emit.length, new_gap, p_emit.pred);
+                    let key = DedupKey::new(p_key.pat_state, new_gap, p_emit.pred);
+                    Some(emit_dedup.insert_or_get(key, head_node, &mut self.emits))
+                } else {
+                    None
+                };
+
+                self.states[sid].output_pos.set(head_pos);
+                self.states[sid].fail.set(ROOT_STATE_ID);
+                continue;
+            }
+
+            // Fallback Path: In-flight candidate `p_fail` cannot step on `c` (Discontinuity / Mismatch).
+            // Entered strictly when `p_fail != ROOT` and `self.child_id(p_fail, c).is_none()`.
+            // The candidate suffix broke; follow the failure chain of states upwards from `p_fail`,
+            // inheriting any committed matches from broken candidates and discovering the next valid active suffix.
+            let mut curr = p_fail;
+            let mut collected_matches: Vec<(u32, V, usize, usize, usize)> = Vec::new();
+
+            while curr != ROOT_STATE_ID && self.child_id(curr, c).is_none() {
+                let curr_sid = usize::from_u32(curr);
+                if let Some(curr_head) = self.states[curr_sid].output_pos.get() {
+                    let curr_base = (s_byte_depth - c.num_bytes()) - byte_depths[curr_sid];
+                    let mut ep = Some(curr_head);
+                    let mut last_end = byte_depths[curr_sid];
+                    let mut state_matches = Vec::new();
+                    while let Some(pos) = ep {
+                        let em = self.emits[pos.get() as usize - 1];
+                        let key = emit_dedup.keys[pos.get() as usize - 1];
+                        let end_in_curr = last_end - em.gap as usize;
+                        let start_in_curr = end_in_curr - em.length as usize;
+                        state_matches.push((
+                            key.pat_state,
+                            em.value,
+                            curr_base + start_in_curr,
+                            curr_base + end_in_curr,
+                            em.length as usize,
+                        ));
+                        last_end = start_in_curr;
+                        ep = em.pred;
                     }
+                    state_matches.reverse();
+                    collected_matches.extend(state_matches);
+                }
+                curr = self.states[curr_sid].fail.get();
+            }
+
+            // Step to next valid active suffix from `curr` (which either transitions on `c` or reached ROOT).
+            let mut fail_state = ROOT_STATE_ID;
+            if let Some(pc) = self.child_id(curr, c) {
+                let pc_sid = usize::from_u32(pc);
+                if !self.states[pc_sid].edges.is_empty() {
+                    fail_state = pc;
+                } else {
+                    // `pc` is a leaf pattern completing at the very end of `sid`.
+                    let (val, pat_bytes_len) = self.states[pc_sid].output[0];
+                    let pat_bytes = byte_depths[pc_sid];
+                    collected_matches.push((
+                        pc,
+                        val,
+                        s_byte_depth - pat_bytes,
+                        s_byte_depth,
+                        pat_bytes_len as usize,
+                    ));
+                    fail_state = ROOT_STATE_ID;
                 }
             }
 
-            // Fallback path: the active suffix could not continue or reached a leaf.
-            // Walk the trailing unmatched slice to finalize newly closed matches and find the next valid suffix.
-            let mut idx = 0;
-            temp_matches.clear();
-            let mut target_state = ROOT_STATE_ID;
-
-            let start_idx = if let Some(pat_st) = deepest_output[sid] {
-                let pat_sid = usize::from_u32(pat_st);
-                let pat_d = depth[pat_sid] as usize;
-                let pat_b = byte_len[pat_sid];
-                let (val, pat_bytes) = self.states[pat_sid].output[0];
-                temp_matches.push((pat_st, val, 0, pat_b, pat_bytes as usize));
-                pat_d
+            let p_output_pos = self.states[usize::from_u32(p)].output_pos.get();
+            let mut head_emit_pos = if let Some(p_pos) = p_output_pos {
+                if collected_matches.is_empty() {
+                    let p_idx = p_pos.get() as usize - 1;
+                    let p_key = emit_dedup.keys[p_idx];
+                    let p_emit = self.emits[p_idx];
+                    let new_gap = p_emit.gap + c.num_bytes() as u32;
+                    let head_node = Emit::new(p_emit.value, p_emit.length, new_gap, p_emit.pred);
+                    let key = DedupKey::new(p_key.pat_state, new_gap, p_emit.pred);
+                    Some(emit_dedup.insert_or_get(key, head_node, &mut self.emits))
+                } else {
+                    let p_idx = p_pos.get() as usize - 1;
+                    let p_key = emit_dedup.keys[p_idx];
+                    let p_emit = self.emits[p_idx];
+                    let p_last_end = (s_byte_depth - c.num_bytes()) - p_emit.gap as usize;
+                    let inter_gap = (collected_matches[0].2 - p_last_end) as u32;
+                    let head_node = Emit::new(p_emit.value, p_emit.length, inter_gap, p_emit.pred);
+                    let key = DedupKey::new(p_key.pat_state, inter_gap, p_emit.pred);
+                    Some(emit_dedup.insert_or_get(key, head_node, &mut self.emits))
+                }
             } else {
-                1
+                None
             };
 
-            let rem_len = s_depth - start_idx;
-
-            if rem_len > 0 {
-                w.clear();
-                w.reserve(rem_len);
-                let mut curr = state_id;
-                for _ in 0..rem_len {
-                    w.push(edge_label[usize::from_u32(curr)].unwrap());
-                    curr = parent[usize::from_u32(curr)];
-                }
-                w.reverse();
-
-                byte_offsets.clear();
-                byte_offsets.reserve(rem_len + 1);
-                let mut b = 0;
-                for &c in &w {
-                    byte_offsets.push(b);
-                    b += c.num_bytes();
-                }
-                byte_offsets.push(b);
-                let base_byte = total_bytes - b;
-
-                while idx < rem_len {
-                    let mut st = ROOT_STATE_ID;
-                    let mut walked_all = true;
-                    for &c in &w[idx..] {
-                        if let Some(nxt) = self.child_id(st, c) {
-                            st = nxt;
-                        } else {
-                            walked_all = false;
-                            break;
-                        }
-                    }
-
-                    if walked_all && !self.states[usize::from_u32(st)].edges.is_empty() {
-                        target_state = st;
-                        break;
-                    }
-
-                    if let Some(pat_st) = deepest_output[usize::from_u32(st)] {
-                        let pat_sid = usize::from_u32(pat_st);
-                        let (val, pat_bytes) = self.states[pat_sid].output[0];
-                        let end_j = idx + depth[pat_sid] as usize;
-                        let start_byte = base_byte + byte_offsets[idx];
-                        let end_byte = base_byte + byte_offsets[end_j];
-                        temp_matches.push((pat_st, val, start_byte, end_byte, pat_bytes as usize));
-                        idx = end_j;
-                    } else {
-                        idx += 1;
-                    }
-                }
-            }
-
-            let mut head_emit_pos = None;
-            let k = temp_matches.len();
+            let k = collected_matches.len();
             if k > 0 {
                 for i in 0..k {
-                    let (pat_st, val, _start_b, end_b, len_b) = temp_matches[i];
+                    let (pat_st, val, _start_b, end_b, len_b) = collected_matches[i];
                     let gap = if i == k - 1 {
-                        (total_bytes - end_b) as u32
+                        (s_byte_depth - end_b) as u32
                     } else {
-                        let next_start = temp_matches[i + 1].2;
-                        (next_start - end_b) as u32
+                        (collected_matches[i + 1].2 - end_b) as u32
                     };
-
-                    let emit_node = Emit {
-                        value: val,
-                        length: len_b as u32,
-                        gap,
-                        pred: head_emit_pos,
-                    };
-
-                    let key = DedupKey {
-                        pat_state: pat_st,
-                        gap,
-                        pred: head_emit_pos,
-                    };
-
+                    let emit_node = Emit::new(val, len_b as u32, gap, head_emit_pos);
+                    let key = DedupKey::new(pat_st, gap, head_emit_pos);
                     head_emit_pos = Some(emit_dedup.insert_or_get(key, emit_node, &mut self.emits));
                 }
             }
 
             self.states[sid].output_pos.set(head_emit_pos);
-            self.states[sid].fail.set(target_state);
+            self.states[sid].fail.set(fail_state);
         }
 
+        q.remove(0);
         q
     }
 }
@@ -714,6 +756,17 @@ struct DedupKey {
     pat_state: u32,
     gap: u32,
     pred: Option<NonZeroU32>,
+}
+
+impl DedupKey {
+    #[inline(always)]
+    const fn new(pat_state: u32, gap: u32, pred: Option<NonZeroU32>) -> Self {
+        Self {
+            pat_state,
+            gap,
+            pred,
+        }
+    }
 }
 
 /// A compact, open-addressing deduplication table for [`Emit`] nodes in `no_std`.

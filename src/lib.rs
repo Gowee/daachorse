@@ -380,6 +380,16 @@ where
     V: Copy,
 {
     #[inline(always)]
+    pub(crate) const fn new(value: V, length: u32, gap: u32, pred: Option<NonZeroU32>) -> Self {
+        Self {
+            value,
+            length,
+            gap,
+            pred,
+        }
+    }
+
+    #[inline(always)]
     pub(crate) fn to_match(self, end: usize) -> Match<V> {
         Match {
             length: usize::from_u32(self.length),
