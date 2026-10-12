@@ -129,14 +129,18 @@ fn test_repro_round_28() {
 
 #[test]
 fn test_parent_and_candidate_matches() {
+    // Verifies that when an intermediate state on a long pattern branch (e.g. "xybacelong")
+    // experiences candidate failure on transition 'e' (where suffix candidate "bac" breaks),
+    // both ancestor matches ("xy") and broken candidate matches ("b", "a") are correctly
+    // spliced and preserved when matching text that diverges (e.g. "xybacex").
     let patterns = vec![
         "xy".to_string(),
         "b".to_string(),
         "a".to_string(),
         "bacd".to_string(),
-        "xybace".to_string(),
+        "xybacelong".to_string(),
     ];
-    let haystack = "xybacf";
+    let haystack = "xybacex";
     differential_fuzz_round(&patterns, haystack, 1);
 }
 
