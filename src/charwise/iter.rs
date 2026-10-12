@@ -737,14 +737,14 @@ fn extract_emits<V: Copy>(emits: &[Emit<V>], head_pos: u32, pos: usize, buf: &mu
     buf.push(first_emit.to_match(end));
 
     let mut last_start = start;
-    let mut curr_ep = first_emit.pred;
-    while let Some(pred) = curr_ep {
+    let mut curr_pos = first_emit.pred;
+    while let Some(pred) = curr_pos {
         let em = unsafe { emits.get_unchecked(pred.get() as usize - 1) };
         let end = last_start - em.gap as usize;
         let start = end - em.length as usize;
         buf.push(em.to_match(end));
         last_start = start;
-        curr_ep = em.pred;
+        curr_pos = em.pred;
     }
 }
 
