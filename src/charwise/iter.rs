@@ -690,11 +690,10 @@ where
 
 /// Dedicated iterator created by [`CharwiseDoubleArrayAhoCorasick::leftmost_longest_find_iter()`].
 ///
-/// This iterator executes non-overlapping leftmost-longest pattern matching using a
-/// prefix-committed semi-DFA with gap chaining. It performs purely forward, single-pass streaming
-/// matching in guaranteed linear time $O(N)$ over the input text, completely eliminating the
-/// worst-case $O(N \times L)$ text rewind / backtracking behavior present in classic Aho-Corasick
-/// leftmost matching.
+/// This iterator executes non-overlapping leftmost-longest pattern matching using pre-committed
+/// match chains. It performs purely forward, single-pass streaming matching in guaranteed linear
+/// time `O(N)` over the input text, completely eliminating the worst-case `O(N * L)` text rewind
+/// behavior present in classic Aho-Corasick leftmost matching.
 pub struct LeftmostLongestFindIterator<'a, P, V> {
     pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
     pub(crate) haystack: P,
@@ -723,45 +722,26 @@ pub struct LeftmostLongestFindIterator<'a, P, V> {
 /// - **Inductive step for $M_{i-1}$**: $\text{anchor}_{i-1} = \text{start}(M_i)$
 /// - **Predecessor match $M_{i-1}$**: $\text{end}(M_{i-1}) = \text{anchor}_{i-1} - M_{i-1}.\text{gap}$, $\text{start}(M_{i-1}) = \text{end}(M_{i-1}) - M_{i-1}.\text{length}$
 ///
-/// # Stack Output Order
+/// Unpacks match spans from a reverse-linked chain of [`Emit`] nodes onto `buf`.
 ///
-/// The matches must be yielded to the caller in forward chronological order ($M_1, M_2, \dots, M_k$).
-/// As we walk $M_k \to M_{k-1} \to \dots \to M_1$:
-/// - $M_k, M_{k-1}, \dots, M_2$ are pushed onto `buf` (which acts as a LIFO stack).
-/// - The earliest match $M_1$ is directly returned as the result of the current `next()` call.
-/// - Subsequent calls to `next()` simply `pop()` from `buf`, yielding $M_2, M_3, \dots, M_k$
-///   in exact chronological sequence in $O(1)$ time per match with 0 heap re-allocations!
+/// Matches are pushed in reverse chronological order ($M_k, M_{k-1}, \dots, M_1$),
+/// so the earliest match $M_1$ sits at the top of the LIFO stack in `buf` and is popped first.
 #[inline(always)]
-fn extract_emits<V: Copy>(
-    emits: &[Emit<V>],
-    head_pos: u32,
-    pos: usize,
-    buf: &mut Vec<Match<V>>,
-) -> Match<V> {
+fn extract_emits<V: Copy>(emits: &[Emit<V>], head_pos: u32, pos: usize, buf: &mut Vec<Match<V>>) {
     let first_emit = unsafe { emits.get_unchecked(head_pos as usize - 1) };
     let end = pos - first_emit.gap as usize;
     let start = end - first_emit.length as usize;
-    let first_match = first_emit.to_match(end);
+    buf.push(first_emit.to_match(end));
 
-    let Some(pred) = first_emit.pred else {
-        return first_match;
-    };
-
-    buf.push(first_match);
     let mut last_start = start;
-    let mut curr_ep = pred;
-    loop {
-        let em = unsafe { emits.get_unchecked(curr_ep.get() as usize - 1) };
+    let mut curr_ep = first_emit.pred;
+    while let Some(pred) = curr_ep {
+        let em = unsafe { emits.get_unchecked(pred.get() as usize - 1) };
         let end = last_start - em.gap as usize;
         let start = end - em.length as usize;
-        let m = em.to_match(end);
-        if let Some(next_pred) = em.pred {
-            buf.push(m);
-            last_start = start;
-            curr_ep = next_pred;
-        } else {
-            return m;
-        }
+        buf.push(em.to_match(end));
+        last_start = start;
+        curr_ep = em.pred;
     }
 }
 
@@ -837,13 +817,13 @@ pub(crate) fn next_leftmost_longest_match<V: Copy>(
             *state_id = target_state;
 
             if let Some(ep) = emit_pos {
-                let first_match = extract_emits(&pma.emits, ep.get(), *pos, buf);
+                extract_emits(&pma.emits, ep.get(), *pos, buf);
                 // If fallback reached root, attempt to consume the current character from root
                 if *state_id == ROOT_STATE_IDX {
                     *state_id = step_root(mapped_c, root_base, states);
                     *pos += char_len;
                 }
-                return Some(first_match);
+                return buf.pop();
             }
 
             if *state_id == ROOT_STATE_IDX {
@@ -860,8 +840,8 @@ pub(crate) fn next_leftmost_longest_match<V: Copy>(
         let target_state = unsafe { states.get_unchecked(*state_id as usize).fail() };
         *state_id = target_state;
         if let Some(ep) = emit_pos {
-            let first_match = extract_emits(&pma.emits, ep.get(), *pos, buf);
-            return Some(first_match);
+            extract_emits(&pma.emits, ep.get(), *pos, buf);
+            return buf.pop();
         }
     }
 
