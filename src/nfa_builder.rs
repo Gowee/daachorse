@@ -373,6 +373,8 @@ where
 
         // Stage 2: Resolving Active Suffix Fail Transitions and Pre-Committed Match Chains.
         //
+        let mut harvest_stack: Vec<(u32, V, u32, usize, usize)> = Vec::new();
+
         // In BFS order (skipping ROOT), for each state `curr_id` (index `sid`) we determine:
         // - `fail`: The longest active proper suffix state (with outgoing edges).
         // - `output_pos`: The pre-committed match chain occurring prior to the active suffix.
@@ -440,18 +442,28 @@ where
             while curr != ROOT_STATE_ID && self.child_id(curr, c).is_none() {
                 let curr_sid = usize::from_u32(curr);
                 if let Some(curr_head) = self.states[curr_sid].output_pos.get() {
-                    let em = self.emits[curr_head.get() as usize - 1];
-                    let key = emit_dedup.keys[curr_head.get() as usize - 1];
                     let curr_base = (s_byte_depth - c.num_bytes()) - byte_depths[curr_sid];
-                    let end_in_curr = byte_depths[curr_sid] - em.gap as usize;
-                    let start_in_curr = end_in_curr - em.length as usize;
-                    cons_emit!(
-                        key.pat_state,
-                        em.value,
-                        em.length,
-                        curr_base + start_in_curr,
-                        curr_base + end_in_curr
-                    );
+                    let mut ep = Some(curr_head);
+                    let mut last_e = byte_depths[curr_sid];
+                    harvest_stack.clear();
+                    while let Some(pos) = ep {
+                        let em = self.emits[pos.get() as usize - 1];
+                        let key = emit_dedup.keys[pos.get() as usize - 1];
+                        let end_in_curr = last_e - em.gap as usize;
+                        let start_in_curr = end_in_curr - em.length as usize;
+                        harvest_stack.push((
+                            key.pat_state,
+                            em.value,
+                            em.length,
+                            curr_base + start_in_curr,
+                            curr_base + end_in_curr,
+                        ));
+                        last_e = start_in_curr;
+                        ep = em.pred;
+                    }
+                    for &m in harvest_stack.iter().rev() {
+                        cons_emit!(m.0, m.1, m.2, m.3, m.4);
+                    }
                 }
                 curr = self.states[curr_sid].fail.get();
             }
@@ -480,6 +492,7 @@ where
             }
 
             // 3. If no new match was cons'd, simply expand parent's head gap by |c|:
+            let _ = last_end;
             if !has_new_match {
                 if let Some(p_pos) = head_emit_pos {
                     let p_idx = p_pos.get() as usize - 1;
