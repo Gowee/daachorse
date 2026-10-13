@@ -327,7 +327,7 @@ where
                 .is_empty(),
             "Error: empty pattern is not supported for MatchKind::LeftmostLongestExperimental"
         );
-
+        // TODO: choose an universal set of glossry to describe our implementation consistently, say pending suffix? committed prefix? Better ones?
         let num_states = self.states.len();
         let mut q = Vec::with_capacity(num_states);
         let mut parents = vec![ROOT_STATE_ID; num_states];
@@ -349,16 +349,11 @@ where
             let state_id = q[qi];
             qi += 1;
 
-            let s = &self.states[usize::from_u32(state_id)];
-            let s_char_depth = char_depths[usize::from_u32(state_id)];
-            let s_byte_depth = byte_depths[usize::from_u32(state_id)];
-
-            for &(c, child_id) in s.edges.iter() {
-                let cid = usize::from_u32(child_id);
-                parents[cid] = state_id;
-                edge_labels[cid] = Some(c);
-                char_depths[cid] = s_char_depth + 1;
-                byte_depths[cid] = s_byte_depth + c.num_bytes();
+            for &(ch, child_id) in self.states[state_id as usize].edges.iter() {
+                parents[child_id as usize] = state_id;
+                edge_labels[child_id as usize] = Some(ch);
+                char_depths[child_id as usize] = char_depths[state_id as usize] + 1;
+                byte_depths[child_id as usize] = byte_depths[state_id as usize] + ch.num_bytes();
                 q.push(child_id);
             }
         }
@@ -368,25 +363,23 @@ where
 
         // Stage 2: Resolving Active Suffix Fail Transitions and Pre-Committed Match Chains.
         //
-        // In BFS order (skipping ROOT), for each state `curr_id` (index `sid`) we determine:
+        // In BFS order (skipping ROOT), for each state (index `state_id`) we determine:
         // - `fail`: The longest active proper suffix state (with outgoing edges).
         // - `output_pos`: The pre-committed match chain occurring prior to the active suffix.
         //
         // Because parents are visited before children, parent fail states and emit chains are already finalized.
-        for &curr_id in &q[1..] {
-            let sid = usize::from_u32(curr_id);
-            let s_char_depth = char_depths[sid];
-            let s_byte_depth = byte_depths[sid];
+        for &state_id in &q[1..] {
+            let state_byte_depth = byte_depths[state_id as usize];
 
             // Fast Path: Root-Covered Pattern (Barrier Reset).
             // If `sid` itself is a complete pattern from ROOT, under leftmost-longest priority
             // it supersedes any proper suffix. `fail` is reset to ROOT and `gap` is 0.
-            if let Some(&(val, pat_bytes)) = self.states[sid].output.first() {
-                let emit_node = Emit::new(val, pat_bytes, 0, None);
-                let key = DedupKey::new(curr_id, 0, None);
+            if let Some(&(val, match_len)) = self.states[state_id as usize].output.first() {
+                let emit_node = Emit::new(val, match_len, 0, None);
+                let key = DedupKey::new(state_id, 0, None);
                 let head_emit_pos = Some(emit_dedup.insert_or_get(key, emit_node, &mut self.emits));
-                self.states[sid].output_pos.set(head_emit_pos);
-                self.states[sid].fail.set(ROOT_STATE_ID);
+                self.states[state_id as usize].output_pos.set(head_emit_pos);
+                self.states[state_id as usize].fail.set(ROOT_STATE_ID);
                 continue;
             }
 
@@ -397,17 +390,18 @@ where
             // - Broken candidate suffixes are appended via functional path copying in O(k) time
             //   (where k <= depth(curr) is the candidate chain length), while all ancestor matches
             //   preceding the suffix remain 100% structurally shared.
-            let parent_id = parents[sid];
-            let c = edge_labels[sid].unwrap();
-            let mut curr = self.states[usize::from_u32(parent_id)].fail.get();
+            let parent_id = parents[state_id as usize];
+            let ch = edge_labels[state_id as usize].unwrap();
+            let mut curr = self.states[parent_id as usize].fail.get();
 
-            let parent_head = self.states[usize::from_u32(parent_id)].output_pos.get();
+            // the ouput_pos of the parent state is the head of the pre-committed match chain.
+            let parent_head = self.states[parent_id as usize].output_pos.get();
             let mut chain = EmitChainBuilder::new(
                 &mut self.emits,
                 &mut emit_dedup,
                 parent_head,
-                s_byte_depth,
-                c.num_bytes(),
+                state_byte_depth,
+                ch.num_bytes(),
             );
 
             // 1. Failure Path Walk & Broken Candidate Splicing:
@@ -444,41 +438,41 @@ where
             // Hence, the total number of unique `Emit` nodes across the entire automaton is Ω(|P|) ~ O(|V|),
             // where |P| is the pattern count and |V| is the number of Trie states (|V| <= ∑ |p| + 1).
             while curr != ROOT_STATE_ID
-                && Self::child_id_from_states(&self.states, curr, c).is_none()
+                && Self::child_id_from_states(&self.states, curr, ch).is_none()
             {
-                let curr_sid = usize::from_u32(curr);
-                if let Some(curr_head) = self.states[curr_sid].output_pos.get() {
-                    let curr_base = (s_byte_depth - c.num_bytes()) - byte_depths[curr_sid];
-                    chain.append_suffix(curr_head, byte_depths[curr_sid], curr_base);
+                if let Some(curr_head) = self.states[curr as usize].output_pos.get() {
+                    let curr_base =
+                        (state_byte_depth - ch.num_bytes()) - byte_depths[curr as usize];
+                    chain.append_suffix(curr_head, byte_depths[curr as usize], curr_base);
                 }
-                curr = self.states[curr_sid].fail.get();
+                curr = self.states[curr as usize].fail.get();
             }
 
             // 2. Transition & Active Suffix Decision:
             let mut fail_state = ROOT_STATE_ID;
-            if s_char_depth > 1 {
-                if let Some(child_state) = Self::child_id_from_states(&self.states, curr, c) {
-                    let child_sid = usize::from_u32(child_state);
-                    if !self.states[child_sid].edges.is_empty() {
-                        fail_state = child_state;
+            if char_depths[state_id as usize] > 1 {
+                if let Some(child_id) = Self::child_id_from_states(&self.states, curr, ch) {
+                    if !self.states[child_id as usize].edges.is_empty() {
+                        fail_state = child_id;
                     } else {
                         // Leaf pattern completed at the very end of `sid`:
-                        let (val, pat_bytes_len) = self.states[child_sid].output[0];
-                        let pat_bytes = byte_depths[child_sid];
+                        let (val, match_len) = self.states[child_id as usize].output[0]; // TODO: multiple outputs? What if repeated patterns? allowed?
                         chain.cons(
-                            child_state,
+                            child_id,
                             val,
-                            pat_bytes_len,
-                            s_byte_depth - pat_bytes,
-                            s_byte_depth,
+                            match_len,
+                            state_byte_depth - byte_depths[child_id as usize],
+                            state_byte_depth,
                         );
                         fail_state = ROOT_STATE_ID;
                     }
                 }
             }
 
-            self.states[sid].output_pos.set(chain.finish(c.num_bytes()));
-            self.states[sid].fail.set(fail_state);
+            self.states[state_id as usize]
+                .output_pos
+                .set(chain.finish(ch.num_bytes()));
+            self.states[state_id as usize].fail.set(fail_state);
         }
 
         q.remove(0);
