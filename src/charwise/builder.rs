@@ -196,7 +196,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
     where
         I: IntoIterator<Item = P>,
         P: AsRef<str>,
-        V: Copy + TryFrom<usize>,
+        V: Copy + TryFrom<usize> + Eq + core::hash::Hash,
     {
         // The following code implicitly replaces large indices with 0,
         // but build_with_values() returns an error variant for such iterators.
@@ -248,7 +248,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
     where
         I: IntoIterator<Item = (P, V)>,
         P: AsRef<str>,
-        V: Copy,
+        V: Copy + Eq + core::hash::Hash,
     {
         let (nfa, prefilter) = self.build_original_nfa_and_mapper(patvals)?;
 
@@ -282,7 +282,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
     where
         I: IntoIterator<Item = (P, V)>,
         P: AsRef<str>,
-        V: Copy,
+        V: Copy + Eq + core::hash::Hash,
     {
         let mut nfa = CharwiseNfaBuilder::new(self.match_kind);
         let mut prefilter_builder = self.use_prefilter.then(PrefilterBuilder::new);

@@ -141,8 +141,8 @@ fn main() {
         );
     }
 
-    // Case 3: Real Chinese Pathological Prefix Mismatch (中文长句假匹配对抗)
-    // Patterns have short base words ("中", "中华人民共和国") and long official titles of 30+ chars.
+    // Case 3: Real Chinese Pathological Prefix Mismatch
+    // Patterns have short base words and long official titles of 30+ chars.
     // Haystack repeats the long title minus the final 2 characters repeatedly.
     // Legacy repeatedly traverses 30 chars, fails, rewinds back to the 1st char.
     {
@@ -158,14 +158,14 @@ fn main() {
         let haystack = repeat_unit.repeat(500);
 
         bench_case(
-            "Case 3: Real Chinese Long-Prefix Near-Miss (中文长词近匹配反复回溯)",
+            "Case 3: Real Chinese Long-Prefix Near-Miss (Repeated Backtracking)",
             &patterns,
             &haystack,
             20,
         );
     }
 
-    // Case 4: Multi-Tier Overlapping Cascades (多层阶梯嵌套词表回退)
+    // Case 4: Multi-Tier Overlapping Cascades
     // Multiple overlapping patterns of powers-of-two lengths that cascade.
     {
         let mut patterns = Vec::new();
@@ -176,7 +176,7 @@ fn main() {
         }
         let patterns_str: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
 
-        // Haystack consists of alternating blocks of "甲"s that trigger all lengths
+        // Haystack consists of alternating blocks that trigger all lengths
         let mut haystack = String::new();
         for _ in 0..500 {
             haystack.push_str(&"甲".repeat(4096));
@@ -184,14 +184,14 @@ fn main() {
         }
 
         bench_case(
-            "Case 4: Multi-Tier Cascading Powers-of-Two Overlaps (多阶梯级联对抗)",
+            "Case 4: Multi-Tier Cascading Powers-of-Two Overlaps",
             &patterns_str,
             &haystack,
             10,
         );
     }
 
-    // Case 5: Pathological Highly-Dense Repetitive Match (高密度极短词回溯与重试)
+    // Case 5: Pathological Highly-Dense Repetitive Match
     // Fibonacci-like repeating sequences "ababab..." with prefixes
     {
         let patterns = vec![
@@ -205,7 +205,7 @@ fn main() {
         ];
         let haystack = "abababababab".repeat(10_000);
         bench_case(
-            "Case 5: Dense Cyclic Pattern Disambiguation (高密周期前缀冲突)",
+            "Case 5: Dense Cyclic Pattern Disambiguation",
             &patterns,
             &haystack,
             20,
