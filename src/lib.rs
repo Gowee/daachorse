@@ -401,6 +401,16 @@ where
     }
 
     #[inline(always)]
+    pub(crate) const fn from_pat(pat: (V, u32), gap: u32, pred: Option<NonZeroU32>) -> Self {
+        Self::new(pat.0, pat.1, gap, pred)
+    }
+
+    #[inline(always)]
+    pub(crate) const fn pat(&self) -> (V, u32) {
+        (self.value, self.length)
+    }
+
+    #[inline(always)]
     pub(crate) fn to_match(self, end: usize) -> Match<V> {
         Match {
             length: usize::from_u32(self.length),
