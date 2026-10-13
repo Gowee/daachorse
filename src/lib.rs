@@ -401,7 +401,7 @@ where
     }
 
     #[inline(always)]
-    pub(crate) const fn from_pat(pat: (V, u32), gap: u32, pred: Option<NonZeroU32>) -> Self {
+    pub(crate) const fn from_output(pat: (V, u32), gap: u32, pred: Option<NonZeroU32>) -> Self {
         Self::new(pat.0, pat.1, gap, pred)
     }
 
@@ -411,25 +411,19 @@ where
         Self { gap, ..self }
     }
 
-    /// Returns a copy of this emit with its gap incremented by `delta`.
+    /// Returns a copy of this emit with an updated predecessor link.
     #[inline(always)]
-    pub(crate) fn with_incremented_gap(self, delta: usize) -> Self {
+    pub(crate) const fn with_pred(self, pred: Option<NonZeroU32>) -> Self {
+        Self { pred, ..self }
+    }
+
+    /// Returns a copy of this emit with its gap incremented by `inc` bytes.
+    #[inline(always)]
+    pub(crate) fn with_incremented_gap(self, inc: usize) -> Self {
         Self {
-            gap: self.gap + u32::try_from(delta).unwrap(),
+            gap: self.gap + u32::try_from(inc).unwrap(),
             ..self
         }
-    }
-
-    /// Computes the end byte offset of this match relative to an anchor position.
-    #[inline(always)]
-    pub(crate) fn match_end(&self, anchor: usize) -> usize {
-        anchor - usize::from_u32(self.gap)
-    }
-
-    /// Computes the start byte offset of this match relative to an anchor position.
-    #[inline(always)]
-    pub(crate) fn match_start(&self, anchor: usize) -> usize {
-        self.match_end(anchor) - usize::from_u32(self.length)
     }
 
     #[inline(always)]
