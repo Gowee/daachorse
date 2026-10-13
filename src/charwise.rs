@@ -102,7 +102,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     where
         I: IntoIterator<Item = P>,
         P: AsRef<str>,
-        V: Copy + TryFrom<usize>,
+        V: Copy + TryFrom<usize> + Eq + core::hash::Hash,
     {
         CharwiseDoubleArrayAhoCorasickBuilder::new().build(patterns)
     }
@@ -141,7 +141,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     where
         I: IntoIterator<Item = (P, V)>,
         P: AsRef<str>,
-        V: Copy,
+        V: Copy + Eq + core::hash::Hash,
     {
         CharwiseDoubleArrayAhoCorasickBuilder::new().build_with_values(patvals)
     }
