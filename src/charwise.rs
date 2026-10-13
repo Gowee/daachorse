@@ -1406,6 +1406,13 @@ struct State {
     base: Option<NonZeroU32>,
     check: u32,
     fail: u32,
+    /// 1-based index pointing to the head of the output/emit chain.
+    ///
+    /// This field has dual semantics depending on `MatchKind` to keep `State` at exactly 16 bytes:
+    /// - **Standard / LeftmostFirst**: 1-based index into `outputs: Vec<Output<V>>`
+    ///   (dictionary suffix link chain, traversed via `Output::parent()`).
+    /// - **LeftmostLongestExperimental**: 1-based index into `emits: Vec<Emit<V>>`
+    ///   (reverse delta-encoded pre-committed match chain, traversed via `Emit::pred()`).
     output_pos: Option<NonZeroU32>,
 }
 
