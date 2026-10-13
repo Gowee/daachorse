@@ -36,7 +36,19 @@ impl EdgeLabel for char {
 pub struct NfaBuilderState<L, V> {
     pub(crate) edges: EdgeMap<L>,
     pub(crate) fail: Cell<u32>,
+    /// Patterns terminating at this state: `(value, pattern_length)`.
+    ///
+    /// For standard Aho-Corasick, multiple patterns may terminate at the same state.
+    /// In `LeftmostLongestExperimental`, only the longest pattern terminating here (at most one)
+    /// is kept and inspected.
     pub(crate) output: Vec<(V, u32)>,
+    /// 1-based index pointing to the head of the output/emit chain.
+    ///
+    /// This field has dual semantics depending on `MatchKind`:
+    /// - **Standard / LeftmostFirst**: 1-based index into `outputs: Vec<Output<V>>`,
+    ///   forming a dictionary suffix link chain (traversed via `Output::parent()`).
+    /// - **LeftmostLongestExperimental**: 1-based index into `emits: Vec<Emit<V>>`,
+    ///   forming a reverse delta-encoded pre-committed match chain (traversed via `Emit::pred()`).
     pub(crate) output_pos: Cell<Option<NonZeroU32>>,
 }
 
@@ -322,17 +334,13 @@ where
         let mut edge_labels: Vec<Option<L>> = vec![None; num_states];
         let mut char_depths = vec![0u32; num_states];
         let mut byte_depths = vec![0usize; num_states];
-        let mut deepest_outputs = vec![None; num_states];
 
-        // Stage 1: BFS Traversal to Establish Topological Order, Metrics, and Longest Prefix Matches.
+        // Stage 1: BFS Traversal to Establish Topological Order, Metrics, and Parent Links.
         //
         // This traversal computes:
         // 1. `q`: Topological BFS ordering ensuring ancestor states are processed before descendants.
-        // 2. `parents` and `edge_labels`: Structural links for backtracing and DP transitions.
+        // 2. `parents` and `edge_labels`: Structural links for parent lookup and DP transitions.
         // 3. `char_depths` and `byte_depths`: Exact character and UTF-8 byte depths from ROOT for O(1) coordinate math.
-        // 4. `deepest_outputs[u]`: The deepest ancestor state (including `u`) that is a complete pattern.
-        //    In leftmost matching, matches starting at ROOT (index 0) possess supreme priority; precomputing
-        //    the longest pattern on the path from ROOT allows O(1) resolution of the first match.
         //
         // Initialize BFS queue starting with ROOT_STATE_ID:
         q.push(ROOT_STATE_ID);
@@ -344,7 +352,6 @@ where
             let s = &self.states[usize::from_u32(state_id)];
             let s_char_depth = char_depths[usize::from_u32(state_id)];
             let s_byte_depth = byte_depths[usize::from_u32(state_id)];
-            let s_deepest = deepest_outputs[usize::from_u32(state_id)];
 
             for &(c, child_id) in s.edges.iter() {
                 let cid = usize::from_u32(child_id);
@@ -352,13 +359,6 @@ where
                 edge_labels[cid] = Some(c);
                 char_depths[cid] = s_char_depth + 1;
                 byte_depths[cid] = s_byte_depth + c.num_bytes();
-                // If child is itself a complete pattern, it is strictly longer than any ancestor pattern;
-                // otherwise, it inherits the deepest pattern found on its parent path.
-                deepest_outputs[cid] = if !self.states[cid].output.is_empty() {
-                    Some(child_id)
-                } else {
-                    s_deepest
-                };
                 q.push(child_id);
             }
         }
@@ -379,26 +379,24 @@ where
             let s_byte_depth = byte_depths[sid];
 
             // Fast Path: Root-Covered Pattern (Barrier Reset).
-            // If a pattern covers the entire path from ROOT to `sid`, under leftmost-longest priority
+            // If `sid` itself is a complete pattern from ROOT, under leftmost-longest priority
             // it supersedes any proper suffix. `fail` is reset to ROOT and `gap` is 0.
-            if let Some(pat_state) = deepest_outputs[sid] {
-                let pat_sid = usize::from_u32(pat_state);
-                if char_depths[pat_sid] == s_char_depth {
-                    let (val, pat_bytes) = self.states[pat_sid].output[0];
-                    let emit_node = Emit::new(val, pat_bytes, 0, None);
-                    let key = DedupKey::new(pat_state, 0, None);
-                    let head_emit_pos =
-                        Some(emit_dedup.insert_or_get(key, emit_node, &mut self.emits));
-                    self.states[sid].output_pos.set(head_emit_pos);
-                    self.states[sid].fail.set(ROOT_STATE_ID);
-                    continue;
-                }
+            if let Some(&(val, pat_bytes)) = self.states[sid].output.first() {
+                let emit_node = Emit::new(val, pat_bytes, 0, None);
+                let key = DedupKey::new(curr_id, 0, None);
+                let head_emit_pos = Some(emit_dedup.insert_or_get(key, emit_node, &mut self.emits));
+                self.states[sid].output_pos.set(head_emit_pos);
+                self.states[sid].fail.set(ROOT_STATE_ID);
+                continue;
             }
 
             // Universal Recurrence System (Pure Cons List):
             // S = P · c inherits P's immutable match chain directly.
-            // Any newly committed match (from broken candidates or leaf completion) is cons'd
-            // directly onto the chain in O(1) time without intermediate arrays.
+            // Newly committed matches are spliced onto the chain:
+            // - Leaf pattern completions are cons'd directly onto the head in O(1) time.
+            // - Broken candidate suffixes are appended via functional path copying in O(k) time
+            //   (where k <= depth(curr) is the candidate chain length), while all ancestor matches
+            //   preceding the suffix remain 100% structurally shared.
             let parent_id = parents[sid];
             let c = edge_labels[sid].unwrap();
             let mut curr = self.states[usize::from_u32(parent_id)].fail.get();
@@ -441,7 +439,8 @@ where
             //    this local suffix slice are copied. All preceding ancestor matches (S_before_suffix)
             //    remain 100% structurally shared without copying: M_0' directly links to `parent_head` in O(1).
             // 3. DAG Hash-Consing (EmitDedup):
-            //    Identical (pat_state, gap, pred) triples across branches are collapsed into a canonical DAG.
+            //    Identical (pat_state, gap, pred) triples across divergent branches are collapsed into
+            //    a canonical DAG, preventing duplicate node allocations across the entire automaton.
             // Hence, the total number of unique `Emit` nodes across the entire automaton is Ω(|P|) ~ O(|V|),
             // where |P| is the pattern count and |V| is the number of Trie states (|V| <= ∑ |p| + 1).
             while curr != ROOT_STATE_ID
