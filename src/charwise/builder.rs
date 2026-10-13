@@ -308,14 +308,13 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
         }
         self.mapper = CodeMapper::new(&freqs);
 
-        let q = match self.match_kind {
-            MatchKind::Standard => nfa.build_fails(),
-            MatchKind::LeftmostFirst | MatchKind::LeftmostLongest => nfa.build_fails_leftmost(),
-            MatchKind::LeftmostLongestExperimental => nfa.build_fails_leftmost_longest(),
+        match self.match_kind {
+            MatchKind::Standard => nfa.build_outputs(&nfa.build_fails()),
+            MatchKind::LeftmostFirst | MatchKind::LeftmostLongest => {
+                nfa.build_outputs(&nfa.build_fails_leftmost())
+            }
+            MatchKind::LeftmostLongestExperimental => nfa.build_fails_and_emits_leftmost_longest(),
         };
-        if self.match_kind != MatchKind::LeftmostLongestExperimental {
-            nfa.build_outputs(&q);
-        }
         Ok((nfa, prefilter_builder.and_then(PrefilterBuilder::build)))
     }
 
