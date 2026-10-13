@@ -373,11 +373,11 @@ where
             let state_byte_depth = byte_depths[state_id as usize];
 
             // Fast Path: Root-Covered Pattern (Barrier Reset).
-            // If `sid` itself is a complete pattern from ROOT, under leftmost-longest priority
+            // If `state_id` itself is a complete pattern from ROOT, under leftmost-longest priority
             // it supersedes any proper suffix. `fail` is reset to ROOT and `gap` is 0.
             if let Some(&pat) = self.states[state_id as usize].output.first() {
                 let emit_node = Emit::from_pat(pat, 0, None);
-                let head_emit_pos = Some(emit_dedup.insert(emit_node, &mut self.emits));
+                let head_emit_pos = Some(insert_emit(&mut self.emits, &mut emit_dedup, emit_node));
                 self.states[state_id as usize].output_pos.set(head_emit_pos);
                 self.states[state_id as usize].fail.set(ROOT_STATE_ID);
                 continue;
@@ -386,60 +386,38 @@ where
             // Universal Recurrence System (Pure Cons List):
             // S = P · c inherits P's immutable match chain directly.
             // Newly committed matches are spliced onto the chain:
+            // - Broken candidate suffixes are appended via functional path copying in O(k) time.
             // - Leaf pattern completions are cons'd directly onto the head in O(1) time.
-            // - Broken candidate suffixes are appended via functional path copying in O(k) time
-            //   (where k <= depth(curr) is the candidate chain length), while all ancestor matches
-            //   preceding the suffix remain 100% structurally shared.
             let parent_id = parents[state_id as usize];
             let ch = edge_labels[state_id as usize].unwrap();
-            let mut curr = self.states[parent_id as usize].fail.get();
-
+            let parent_byte_depth = byte_depths[parent_id as usize];
             let parent_head = self.states[parent_id as usize].output_pos.get();
-            let mut chain = EmitChainBuilder::new(
-                &mut self.emits,
-                &mut emit_dedup,
+
+            let mut chain = EmitChain::inherit(
                 parent_head,
+                parent_byte_depth,
                 state_byte_depth,
-                ch.num_bytes(),
+                &self.emits,
             );
 
             // 1. Failure Path Walk & Broken Candidate Splicing:
             //
-            // When an in-flight suffix candidate `curr = fail(parent_id)` cannot transition on `c`,
+            // When an in-flight suffix candidate `curr = fail(parent_id)` cannot transition on `ch`,
             // its active pattern pursuit has failed and broken. Any pre-committed non-overlapping
-            // matches locked in along `curr`'s prefix must now be harvested and transferred onto `sid`.
-            //
-            // ## Path Copying & Topological Splicing Rationale:
-            // Why must we copy and append `curr.output_pos` onto `chain` in forward chronological order?
-            // 1. Coordinate Frame Shift:
-            //    `curr`'s prefix is a proper suffix of `sid` starting at `curr_base`. All match byte offsets
-            //    in `curr` must be translated into `sid`'s global coordinate frame.
-            // 2. Topological Re-linking:
-            //    The earliest match M_0 in `curr` previously had `M_0.pred == None`. When transferring
-            //    to `sid`, `M_0` must now link to `parent_id`'s prior matches (`parent_head`). Because existing
-            //    `Emit` nodes are immutable and structurally shared by other branches in the Trie,
-            //    functional path copying (re-consing the suffix chain) is mathematically necessary.
-            //
-            // ## Space Complexity & Bounds Analysis (Ω(|P|) ~ O(|V|)):
-            // One might wonder whether path copying could cause quadratic O(L^2) node explosion.
-            // In fact, the total number of unique `Emit` nodes is tightly bounded to Ω(|P|) ~ O(|V|):
-            // 1. Path Length Invariant (Non-Overlapping):
-            //    In leftmost-longest semantics, all matches along any path are strictly non-overlapping
-            //    and have length >= 1. Thus, the match chain length at any state S is strictly bounded by
-            //    its string depth: k_S <= depth(S) <= max_{p ∈ P} |p|.
-            // 2. Suffix-Localized Splicing:
-            //    `curr` is a strict proper suffix of `parent_id` (depth(curr) < depth(parent_id)). Only the matches within
-            //    this local suffix slice are copied. All preceding ancestor matches (S_before_suffix)
-            //    remain 100% structurally shared without copying: M_0' directly links to `parent_head` in O(1).
-            // 3. DAG Hash-Consing (EmitDedup):
-            //    Identical `Emit` value nodes across divergent branches are collapsed into
-            //    a canonical DAG, preventing duplicate node allocations across the entire automaton.
-            // Hence, the total number of unique `Emit` nodes across the entire automaton is Ω(|P|) ~ O(|V|),
-            // where |P| is the pattern count and |V| is the number of Trie states (|V| <= ∑ |p| + 1).
+            // matches locked in along `curr`'s prefix are harvested and spliced onto `chain`.
+            let mut curr = self.states[parent_id as usize].fail.get();
             let mut next_child = Self::child_id_from_states(&self.states, curr, ch);
             while curr != ROOT_STATE_ID && next_child.is_none() {
                 if let Some(curr_head) = self.states[curr as usize].output_pos.get() {
-                    chain.append_broken_suffix(curr_head, byte_depths[curr as usize]);
+                    let curr_byte_depth = byte_depths[curr as usize];
+                    let curr_base = parent_byte_depth - curr_byte_depth;
+                    chain.splice_suffix(
+                        curr_head,
+                        curr_byte_depth,
+                        curr_base,
+                        &mut self.emits,
+                        &mut emit_dedup,
+                    );
                 }
                 curr = self.states[curr as usize].fail.get();
                 next_child = Self::child_id_from_states(&self.states, curr, ch);
@@ -450,20 +428,21 @@ where
             if char_depths[state_id as usize] > 1 {
                 if let Some(child_id) = next_child {
                     if !self.states[child_id as usize].edges.is_empty() {
-                        // found a pending suffix by extending parent's pending suffix
+                        // Found an active suffix by extending parent's suffix.
                         fail_state = child_id;
                     } else {
-                        // suffix consitutes a leaf pattern, which is completed at the very end of `state_id`.
-                        let pat = self.states[child_id as usize].output[0]; // TODO: multiple outputs? What if repeated patterns? allowed?
-                        chain.commit_leaf(pat);
+                        // Suffix completes a leaf pattern at the very end of `state_id`.
+                        let pat = self.states[child_id as usize].output[0];
+                        chain.push_leaf(pat, &mut self.emits, &mut emit_dedup);
                         fail_state = ROOT_STATE_ID;
                     }
                 }
             }
 
-            self.states[state_id as usize]
-                .output_pos
-                .set(chain.finish());
+            // 3. Finalize match chain:
+            let head = chain.finish(ch.num_bytes(), &mut self.emits, &mut emit_dedup);
+
+            self.states[state_id as usize].output_pos.set(head);
             self.states[state_id as usize].fail.set(fail_state);
         }
 
@@ -625,131 +604,152 @@ where
     }
 }
 
-/// Helper to construct and splice delta-encoded reverse match chains with DAG hash-consing.
+/// An active match chain builder for a state in the leftmost-longest automaton.
 ///
-/// In leftmost-longest matching, each automaton state tracks a chain of pre-committed,
-/// non-overlapping matches $[M_1, M_2, \dots, M_k]$.
-///
-/// # Gap Encoding Invariant
-/// Matches are stored in reverse order ($M_k \to M_{k-1} \to \dots \to M_1$):
-/// - **Internal node** ($M_i$ where $i < k$): `gap` is the distance between $M_i$'s end and
-///   the start of the subsequent match $M_{i+1}$ (`M_{i+1}.start - M_i.end`).
-/// - **Head node** ($M_k$): `gap` is the trailing distance between $M_k$'s end and the
-///   current state's end (`state_byte_depth - M_k.end`).
-///
-/// When transitioning $P \xrightarrow{ch} S$:
-/// - If no new match is added, the head's trailing gap increases by $|ch|$ (`finish`).
-/// - When a new match is added, the previous head becomes an internal node, so its gap
-///   must be rekeyed from a trailing gap to the inter-match gap, and the new match becomes
-///   the new head.
-struct EmitChainBuilder<'a, V> {
-    emits: &'a mut Vec<Emit<V>>,
-    dedup: &'a mut EmitDedup,
+/// In leftmost-longest matching, each state $S$ maintains an immutable linked list of
+/// non-overlapping matches committed along its string prefix. When advancing from parent
+/// $P$ to child $S = P \cdot c$, the child inherits $P$'s match chain, splices matches from
+/// broken candidate suffixes, optionally appends a newly completed leaf pattern, and
+/// finalizes the trailing gap to the end of $S$.
+#[derive(Clone, Copy, Debug)]
+struct EmitChain {
     head: Option<NonZeroU32>,
     last_end: usize,
     state_byte_depth: usize,
-    ch_num_bytes: usize,
     has_new_match: bool,
 }
 
-impl<'a, V: Copy + Eq + Hash> EmitChainBuilder<'a, V> {
+impl EmitChain {
+    /// Initializes an active match chain by inheriting from the parent state.
     #[inline(always)]
-    fn new(
-        emits: &'a mut Vec<Emit<V>>,
-        dedup: &'a mut EmitDedup,
-        head: Option<NonZeroU32>,
+    fn inherit<V: Copy>(
+        parent_head: Option<NonZeroU32>,
+        parent_byte_depth: usize,
         state_byte_depth: usize,
-        ch_num_bytes: usize,
+        emits: &[Emit<V>],
     ) -> Self {
-        let last_end = if let Some(p_pos) = head {
-            let p_emit = emits[usize::from_u32(p_pos.get() - 1)];
-            (state_byte_depth - ch_num_bytes) - usize::from_u32(p_emit.gap)
+        let last_end = if let Some(p_pos) = parent_head {
+            emits[usize::from_u32(p_pos.get() - 1)].match_end(parent_byte_depth)
         } else {
             0
         };
         Self {
-            emits,
-            dedup,
-            head,
+            head: parent_head,
             last_end,
             state_byte_depth,
-            ch_num_bytes,
             has_new_match: false,
         }
     }
 
-    /// Appends the committed match chain of a broken candidate suffix.
-    ///
-    /// When candidate suffix `curr` cannot transition on `ch`, its matches are transferred
-    /// onto the current state $S$ in forward chronological order via functional path copying.
-    fn append_broken_suffix(&mut self, curr_head: NonZeroU32, curr_byte_depth: usize) {
-        let parent_byte_depth = self.state_byte_depth - self.ch_num_bytes;
-        let curr_base = parent_byte_depth - curr_byte_depth;
-        self.append_suffix_recursive(curr_head, curr_byte_depth, curr_base);
-    }
-
-    fn append_suffix_recursive(
+    /// Recursively unwinds a broken candidate suffix along its predecessor links
+    /// and splices the matches onto this chain in forward chronological order.
+    fn splice_suffix<V: Copy + Eq + Hash>(
         &mut self,
         curr_pos: NonZeroU32,
         anchor_end: usize,
         curr_base: usize,
+        emits: &mut Vec<Emit<V>>,
+        dedup: &mut EmitDedup<V>,
     ) {
         let curr_idx = usize::from_u32(curr_pos.get() - 1);
-        let em = self.emits[curr_idx];
-        let end_in_curr = anchor_end - usize::from_u32(em.gap);
-        let start_in_curr = end_in_curr - usize::from_u32(em.length);
+        let em = emits[curr_idx];
+        let end_in_curr = em.match_end(anchor_end);
+        let start_in_curr = em.match_start(anchor_end);
 
         if let Some(pred) = em.pred {
-            self.append_suffix_recursive(pred, start_in_curr, curr_base);
+            self.splice_suffix(pred, start_in_curr, curr_base, emits, dedup);
         }
 
-        self.push_match(em.pat(), curr_base + start_in_curr, curr_base + end_in_curr);
+        self.push_match(
+            (em.value, em.length),
+            curr_base + start_in_curr,
+            curr_base + end_in_curr,
+            emits,
+            dedup,
+        );
     }
 
-    /// Commits a newly completed leaf pattern that ends at the current state.
+    /// Appends a newly completed leaf pattern ending at the current state.
     #[inline(always)]
-    fn commit_leaf(&mut self, pat: (V, u32)) {
-        let end_byte = self.state_byte_depth;
+    fn push_leaf<V: Copy + Eq + Hash>(
+        &mut self,
+        pat: (V, u32),
+        emits: &mut Vec<Emit<V>>,
+        dedup: &mut EmitDedup<V>,
+    ) {
         let start_byte = self.state_byte_depth - usize::from_u32(pat.1);
-        self.push_match(pat, start_byte, end_byte);
+        self.push_match(pat, start_byte, self.state_byte_depth, emits, dedup);
     }
 
-    /// Core functional push: attaches a match to the head of the chain.
-    fn push_match(&mut self, pat: (V, u32), start_byte: usize, end_byte: usize) {
+    /// Pushes a match spanning `[start_byte, end_byte)` onto the chain.
+    ///
+    /// 1. Transitions the previous head to an internal node by rekeying its gap
+    ///    to the inter-match distance (`start_byte - last_end`).
+    /// 2. Inserts the new match as the head with a trailing gap to `state_byte_depth`.
+    fn push_match<V: Copy + Eq + Hash>(
+        &mut self,
+        pat: (V, u32),
+        start_byte: usize,
+        end_byte: usize,
+        emits: &mut Vec<Emit<V>>,
+        dedup: &mut EmitDedup<V>,
+    ) {
         debug_assert!(start_byte >= self.last_end);
         debug_assert!(self.state_byte_depth >= end_byte);
 
         // 1. Transition previous head to internal node: rekey its gap to inter-match distance.
         if let Some(prev) = self.head {
             let p_idx = usize::from_u32(prev.get() - 1);
-            let p_emit = self.emits[p_idx];
             let inter_gap = u32::try_from(start_byte - self.last_end).unwrap();
-            let rekeyed = Emit::from_pat(p_emit.pat(), inter_gap, p_emit.pred);
-            self.head = Some(self.dedup.insert(rekeyed, self.emits));
+            let rekeyed = emits[p_idx].with_gap(inter_gap);
+            self.head = Some(insert_emit(emits, dedup, rekeyed));
         }
 
         // 2. Insert new head with trailing gap to current state end.
         let trailing_gap = u32::try_from(self.state_byte_depth - end_byte).unwrap();
-        let node = Emit::from_pat(pat, trailing_gap, self.head);
-        self.head = Some(self.dedup.insert(node, self.emits));
+        let node = Emit::new(pat.0, pat.1, trailing_gap, self.head);
+        self.head = Some(insert_emit(emits, dedup, node));
 
         self.last_end = end_byte;
         self.has_new_match = true;
     }
 
-    /// Finalizes the chain: if no new match was added, advances the existing head's gap by |ch|.
+    /// Finalizes the chain. If no new match was added to the inherited chain,
+    /// advances the previous head's trailing gap by `ch_num_bytes`.
     #[inline(always)]
-    fn finish(mut self) -> Option<NonZeroU32> {
+    fn finish<V: Copy + Eq + Hash>(
+        mut self,
+        ch_num_bytes: usize,
+        emits: &mut Vec<Emit<V>>,
+        dedup: &mut EmitDedup<V>,
+    ) -> Option<NonZeroU32> {
         if !self.has_new_match {
-            if let Some(p_pos) = self.head {
-                let p_idx = usize::from_u32(p_pos.get() - 1);
-                let p_emit = self.emits[p_idx];
-                let new_gap = p_emit.gap + u32::try_from(self.ch_num_bytes).unwrap();
-                let node = Emit::new(p_emit.value, p_emit.length, new_gap, p_emit.pred);
-                self.head = Some(self.dedup.insert(node, self.emits));
+            if let Some(pos) = self.head {
+                let emit = emits[usize::from_u32(pos.get() - 1)].with_incremented_gap(ch_num_bytes);
+                self.head = Some(insert_emit(emits, dedup, emit));
             }
         }
         self.head
+    }
+}
+
+/// Centralized hash-consing helper for inserting [`Emit`] nodes.
+///
+/// Queries `dedup` to reuse an identical canonical node index if present,
+/// otherwise pushes `emit` to `emits` and records the new index in `dedup`.
+#[inline(always)]
+fn insert_emit<V: Copy + Eq + Hash>(
+    emits: &mut Vec<Emit<V>>,
+    dedup: &mut EmitDedup<V>,
+    emit: Emit<V>,
+) -> NonZeroU32 {
+    if let Some(pos) = dedup.get(&emit) {
+        pos
+    } else {
+        emits.push(emit);
+        let pos = NonZeroU32::new(u32::try_from(emits.len()).unwrap()).unwrap();
+        dedup.insert(emit, pos);
+        pos
     }
 }
 
@@ -758,10 +758,10 @@ impl<'a, V: Copy + Eq + Hash> EmitChainBuilder<'a, V> {
 /// In leftmost-longest matching, multiple states across divergent branches frequently produce
 /// identical [`Emit`] configurations. This deduplication table provides hash-consing directly
 /// over the value type `Emit<V>`, unifying identical `(value, length, gap, pred)` tuples into
-/// a single canonical index directly in `emits`, saving ~35% node allocations.
+/// a single canonical index, saving ~35% node allocations.
 ///
-/// Because `emits` itself serves as the key storage, no secondary key buffer (such as
-/// `Vec<DedupKey>`) is needed during construction.
+/// Deduplication is cleanly separated from emit list storage: [`EmitDedup`] acts as a lookup
+/// cache mapping `Emit<V> -> NonZeroU32`, while [`NfaBuilder::emits`] owns the underlying storage.
 ///
 /// # Where Do Duplicates Arise? (Concrete Examples)
 ///
@@ -803,66 +803,76 @@ impl<'a, V: Copy + Eq + Hash> EmitChainBuilder<'a, V> {
 /// - **Suffix copying with divergent ancestor histories**: When two branches have different prior committed
 ///   matches ($P_A \neq P_B$), path copying forces the earliest copied match to link to $P_A$ and $P_B$
 ///   respectively. All downstream matches inherit this divergent `pred`, preventing node reuse.
-struct EmitDedup {
-    entries: Vec<u32>, // 0 represents empty; >= 1 is 1-based index into `emits`
+struct EmitDedup<V> {
+    entries: Vec<Option<(Emit<V>, NonZeroU32)>>,
     mask: usize,
     count: usize,
 }
 
-impl EmitDedup {
+impl<V: Copy + Eq + Hash> EmitDedup<V> {
     fn with_capacity(cap: usize) -> Self {
         let size = cap.next_power_of_two().max(1024);
         Self {
-            entries: vec![0; size],
+            entries: vec![None; size],
             mask: size - 1,
             count: 0,
         }
     }
 
-    fn grow<V: Copy + Eq + core::hash::Hash>(&mut self, emits: &[Emit<V>]) {
-        let new_size = self.entries.len() * 2;
-        let new_mask = new_size - 1;
-        let mut new_entries = vec![0; new_size];
-        for &existing in &self.entries {
-            if existing != 0 {
-                let emit = emits[existing as usize - 1];
-                let h = hash_emit(&emit);
-                let mut idx = h & new_mask;
-                while new_entries[idx] != 0 {
-                    idx = (idx + 1) & new_mask;
+    #[inline(always)]
+    fn get(&self, emit: &Emit<V>) -> Option<NonZeroU32> {
+        let h = hash_emit(emit);
+        let mut idx = h & self.mask;
+        loop {
+            match self.entries[idx] {
+                None => return None,
+                Some((existing, pos)) => {
+                    if existing == *emit {
+                        return Some(pos);
+                    }
                 }
-                new_entries[idx] = existing;
             }
+            idx = (idx + 1) & self.mask;
         }
-        self.entries = new_entries;
-        self.mask = new_mask;
     }
 
-    #[inline(always)]
-    fn insert<V: Copy + Eq + core::hash::Hash>(
-        &mut self,
-        emit: Emit<V>,
-        emits: &mut Vec<Emit<V>>,
-    ) -> NonZeroU32 {
+    fn insert(&mut self, emit: Emit<V>, pos: NonZeroU32) {
         if self.count * 2 >= self.entries.len() {
-            self.grow(emits);
+            self.grow();
         }
         let h = hash_emit(&emit);
         let mut idx = h & self.mask;
         loop {
-            let existing = self.entries[idx];
-            if existing == 0 {
-                emits.push(emit);
-                let pos = NonZeroU32::new(u32::try_from(emits.len()).unwrap()).unwrap();
-                self.entries[idx] = pos.get();
-                self.count += 1;
-                return pos;
-            }
-            if emits[existing as usize - 1] == emit {
-                return NonZeroU32::new(existing).unwrap();
+            match self.entries[idx] {
+                None => {
+                    self.entries[idx] = Some((emit, pos));
+                    self.count += 1;
+                    return;
+                }
+                Some((existing, _)) => {
+                    if existing == emit {
+                        return;
+                    }
+                }
             }
             idx = (idx + 1) & self.mask;
         }
+    }
+
+    fn grow(&mut self) {
+        let new_size = self.entries.len() * 2;
+        let new_mask = new_size - 1;
+        let mut new_entries = vec![None; new_size];
+        for (emit, pos) in self.entries.drain(..).flatten() {
+            let h = hash_emit(&emit);
+            let mut idx = h & new_mask;
+            while new_entries[idx].is_some() {
+                idx = (idx + 1) & new_mask;
+            }
+            new_entries[idx] = Some((emit, pos));
+        }
+        self.entries = new_entries;
+        self.mask = new_mask;
     }
 }
 
