@@ -22,7 +22,7 @@ use crate::errors::{DaachorseError, Result};
 use crate::prefilter::{Prefilter, PrefilterGate};
 use crate::serializer::{Serializable, SerializableVec};
 use crate::utils::FromU32;
-use crate::{Emit, MatchKind, Output, DEAD_STATE_IDX, ROOT_STATE_IDX};
+use crate::{Emit, Match, MatchKind, Output, DEAD_STATE_IDX, ROOT_STATE_IDX};
 
 /// A fast multiple pattern match automaton implemented with the Aho-Corasick algorithm and
 /// character-wise double-array data structure.
@@ -1321,6 +1321,49 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         unsafe {
             self.output_pos_unchecked(ROOT_STATE_IDX)
                 .map(|output_pos| self.output_at(output_pos).value())
+        }
+    }
+
+    /// Helper to transition from ROOT on a pre-mapped character label.
+    #[inline(always)]
+    pub(crate) fn step_root(&self, mapped_c: Option<u32>) -> u32 {
+        if let Some(code) = mapped_c {
+            if let Some(base) = unsafe {
+                self.states
+                    .get_unchecked(usize::from_u32(ROOT_STATE_IDX))
+                    .base()
+            } {
+                let child_idx = (base.get() ^ code) as usize;
+                if child_idx < self.states.len()
+                    && unsafe { self.states.get_unchecked(child_idx).check() } == ROOT_STATE_IDX
+                {
+                    return child_idx as u32;
+                }
+            }
+        }
+        ROOT_STATE_IDX
+    }
+
+    /// Reconstructs match spans from a reverse-linked chain of [`Emit`] nodes onto `buf`.
+    #[inline(always)]
+    pub(crate) fn extract_emits(&self, head_pos: u32, pos: usize, buf: &mut Vec<Match<V>>)
+    where
+        V: Copy,
+    {
+        let first_emit = unsafe { self.emits.get_unchecked(head_pos as usize - 1) };
+        let end = pos - first_emit.gap as usize;
+        let start = end - first_emit.length as usize;
+        buf.push(first_emit.to_match(end));
+
+        let mut last_start = start;
+        let mut curr_pos = first_emit.pred;
+        while let Some(pred) = curr_pos {
+            let em = unsafe { self.emits.get_unchecked(pred.get() as usize - 1) };
+            let end = last_start - em.gap as usize;
+            let start = end - em.length as usize;
+            buf.push(em.to_match(end));
+            last_start = start;
+            curr_pos = em.pred;
         }
     }
 
