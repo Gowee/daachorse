@@ -143,19 +143,25 @@ fn test_leftmost_find_iter_with_leftmost_first_experimental() {
 }
 
 #[test]
-#[should_panic]
 fn test_leftmost_longest_experimental_with_empty_pattern() {
-    let _pma: CharwiseDoubleArrayAhoCorasick<usize> = CharwiseDoubleArrayAhoCorasickBuilder::new()
+    let pma: CharwiseDoubleArrayAhoCorasick<usize> = CharwiseDoubleArrayAhoCorasickBuilder::new()
         .match_kind(MatchKind::LeftmostLongestExperimental)
         .build(["", "pattern"])
         .unwrap();
+    let matches: Vec<_> = pma.leftmost_find_iter_experimental("pattern").collect();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(
+        (matches[0].start(), matches[0].end(), matches[0].value()),
+        (0, 7, 1)
+    );
 }
 
 #[test]
-#[should_panic]
 fn test_leftmost_first_experimental_with_empty_pattern() {
-    let _pma: CharwiseDoubleArrayAhoCorasick<usize> = CharwiseDoubleArrayAhoCorasickBuilder::new()
+    let pma: CharwiseDoubleArrayAhoCorasick<usize> = CharwiseDoubleArrayAhoCorasickBuilder::new()
         .match_kind(MatchKind::LeftmostFirstExperimental)
         .build(["", "pattern"])
         .unwrap();
+    let matches: Vec<_> = pma.leftmost_find_iter_experimental("pattern").collect();
+    assert!(!matches.is_empty());
 }

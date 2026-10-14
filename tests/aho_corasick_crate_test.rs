@@ -639,9 +639,6 @@ testconfig!(
 fn search_leftmost_longest_experimental_charwise() {
     for &collection in AC_LEFTMOST_LONGEST {
         for test in collection {
-            if test.patterns.iter().any(|p| p.is_empty()) {
-                continue;
-            }
             let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
                 .match_kind(MatchKind::LeftmostLongestExperimental)
                 .build(test.patterns)
@@ -664,9 +661,6 @@ fn search_leftmost_longest_experimental_charwise() {
 fn search_leftmost_first_experimental_charwise() {
     for &collection in AC_LEFTMOST_FIRST {
         for test in collection {
-            if test.patterns.iter().any(|p| p.is_empty()) {
-                continue;
-            }
             let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
                 .match_kind(MatchKind::LeftmostFirstExperimental)
                 .build(test.patterns)

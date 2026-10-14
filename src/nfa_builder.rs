@@ -322,12 +322,6 @@ where
     ///   3. **Head Gap Expansion**:
     ///      If no new matches were cons'd, the parent's head match gap simply expands by `|c|` bytes.
     pub(crate) fn build_fails_and_emits_leftmost_experimental(&mut self) {
-        assert!(
-            self.states[usize::from_u32(ROOT_STATE_ID)]
-                .output
-                .is_empty(),
-            "Error: empty pattern is not supported for experimental leftmost matching"
-        );
         let num_states = self.states.len();
         let mut q = Vec::with_capacity(num_states);
         let mut parents = vec![ROOT_STATE_ID; num_states];
@@ -356,6 +350,14 @@ where
         // Construction-time store for deduplicating and indexing emit nodes.
         let mut store = EmitStore::with_capacity(q.len());
 
+        // If ROOT has an output (empty pattern ""), register its emit node.
+        if let Some(&pat) = self.states[usize::from_u32(ROOT_STATE_ID)].output.first() {
+            let emit = Emit::from_output(pat, 0, None);
+            self.states[usize::from_u32(ROOT_STATE_ID)]
+                .output_pos
+                .set(Some(store.insert(emit)));
+        }
+
         // Reusable scratch buffer for harvesting matches during failure fallback walks.
         let mut scratch_buffer = Vec::new();
 
@@ -379,10 +381,14 @@ where
             // Advancing from P to S via `ch` increments the trailing gap by |c| bytes.
             let parent_id = parents[state_id as usize];
             let ch = edge_labels[state_id as usize].unwrap();
-            let initial_head = self.states[parent_id as usize]
-                .output_pos
-                .get()
-                .map(|pos| store.get(pos).with_incremented_gap(ch.num_bytes()));
+            let initial_head = if parent_id == ROOT_STATE_ID {
+                None
+            } else {
+                self.states[parent_id as usize]
+                    .output_pos
+                    .get()
+                    .map(|pos| store.get(pos).with_incremented_gap(ch.num_bytes()))
+            };
 
             let mut chain = EmitChain::new(initial_head);
 
