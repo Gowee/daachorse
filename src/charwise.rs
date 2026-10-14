@@ -16,9 +16,7 @@ use crate::charwise::iter::{
     FindOverlappingSliceIterator, FindOverlappingStepper, FindSliceIterator, FindStepper,
     PatternIterator,
 };
-pub use crate::charwise::iter::{
-    LeftmostFindIterator, LeftmostFindIteratorExperimental, LeftmostLongestFindIterator,
-};
+pub use crate::charwise::iter::{LeftmostFindIterator, LeftmostFindIteratorExperimental};
 use crate::charwise::mapper::CodeMapper;
 use crate::errors::{DaachorseError, Result};
 use crate::prefilter::{Prefilter, PrefilterGate};
@@ -648,19 +646,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             state_id: ROOT_STATE_IDX,
             buf: Vec::new(),
         }
-    }
-
-    /// Deprecated alias for [`CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()`].
-    #[deprecated(note = "use `leftmost_find_iter_experimental()` instead")]
-    #[inline(always)]
-    pub fn leftmost_longest_find_iter<P>(
-        &self,
-        haystack: P,
-    ) -> LeftmostFindIteratorExperimental<'_, P, V>
-    where
-        P: AsRef<str>,
-    {
-        self.leftmost_find_iter_experimental(haystack)
     }
 
     /// Returns a stepper of non-overlapping matches that consumes characters one by one.

@@ -259,7 +259,7 @@ use alloc::vec::Vec;
 pub use crate::bytewise::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
 pub use crate::charwise::{
     CharwiseDoubleArrayAhoCorasick, CharwiseDoubleArrayAhoCorasickBuilder, LeftmostFindIterator,
-    LeftmostFindIteratorExperimental, LeftmostLongestFindIterator,
+    LeftmostFindIteratorExperimental,
 };
 use crate::errors::DaachorseError;
 pub use crate::errors::Result;
