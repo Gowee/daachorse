@@ -796,7 +796,7 @@ pub(crate) fn next_leftmost_longest_match<V: Copy>(
             continue;
         }
 
-        // In-flight Path: Traversing the automaton
+        // State Traversal & Failure Path Resolution
         'step: loop {
             if let Some(code) = mapped_c {
                 if let Some(base) = unsafe { states.get_unchecked(*state_id as usize).base() } {
