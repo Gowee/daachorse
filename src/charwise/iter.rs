@@ -798,7 +798,7 @@ pub(crate) fn next_leftmost_match_experimental<V: Copy>(
         }
 
         // State Traversal & Failure Path Resolution
-        'step: loop {
+        loop {
             if let Some(code) = mapped_c {
                 if let Some(base) = unsafe { states.get_unchecked(*state_id as usize).base() } {
                     let child_idx = (base.get() ^ code) as usize;
@@ -807,7 +807,7 @@ pub(crate) fn next_leftmost_match_experimental<V: Copy>(
                     {
                         *state_id = child_idx as u32;
                         *pos += char_len;
-                        break 'step;
+                        break;
                     }
                 }
             }
@@ -819,21 +819,11 @@ pub(crate) fn next_leftmost_match_experimental<V: Copy>(
 
             if let Some(ep) = emit_pos {
                 extract_emits(&pma.emits, ep.get(), *pos, buf);
-                // Note: We cannot increment `*pos` before `extract_emits` because `*pos`
-                // represents the exact text coordinate corresponding to the end of the state's path.
-                // Incrementing `*pos` beforehand would shift all extracted match spans forward by `char_len`.
-                // If fallback reached root, attempt to consume the current character from root.
-                if *state_id == ROOT_STATE_IDX {
-                    *state_id = step_root(mapped_c, root_base, states);
-                    *pos += char_len;
-                }
                 return buf.pop();
             }
 
             if *state_id == ROOT_STATE_IDX {
-                *state_id = step_root(mapped_c, root_base, states);
-                *pos += char_len;
-                break 'step;
+                break;
             }
         }
     }
