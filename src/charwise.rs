@@ -1314,24 +1314,26 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         ROOT_STATE_IDX
     }
 
-    /// Reconstructs match spans from a reverse-linked chain of [`Emit`] nodes onto `buf`.
+    /// Returns an iterator yielding matches from the reverse-linked [`Emit`] chain
+    /// in reverse chronological order (head/latest to predecessor/earliest).
     #[inline(always)]
-    pub(crate) fn extract_emits(
+    pub(crate) fn iter_emits(
         &self,
         head_pos: NonZeroU32,
         mut anchor: usize,
-        buf: &mut Vec<Match<V>>,
-    ) where
+    ) -> impl Iterator<Item = Match<V>> + '_
+    where
         V: Copy,
     {
         let mut curr = Some(head_pos);
-        while let Some(idx) = curr {
+        core::iter::from_fn(move || {
+            let idx = curr?;
             let em = unsafe { self.emits.get_unchecked(idx.get() as usize - 1) };
             let end = anchor - em.gap as usize;
             anchor = end - em.length as usize;
-            buf.push(em.to_match(end));
             curr = em.pred;
-        }
+            Some(em.to_match(end))
+        })
     }
 
     /// # Safety
