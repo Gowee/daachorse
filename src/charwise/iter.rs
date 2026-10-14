@@ -724,20 +724,6 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
 ///
 /// Matches are pushed in reverse chronological order ($M_k, M_{k-1}, \dots, M_1$),
 /// so the earliest match $M_1$ sits at the top of the LIFO stack in `buf` and is popped first.
-impl<P, V> LeftmostFindIteratorExperimental<'_, P, V>
-where
-    P: AsRef<str>,
-    V: Copy,
-{
-    #[inline(always)]
-    fn flush_emits(&mut self, ep: NonZeroU32, pos: usize, state_id: u32) -> Option<Match<V>> {
-        self.buf.extend(self.pma.iter_emits(ep, pos));
-        self.pos = pos;
-        self.state_id = state_id;
-        self.buf.pop()
-    }
-}
-
 impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
 where
     P: AsRef<str>,
@@ -777,11 +763,14 @@ where
                 }
 
                 // Mismatch: Follow failure transition and commit prefix matches if any
-                let (target_state, emit_pos) = self.pma.step_fail(state_id);
-                state_id = target_state;
+                let state = unsafe { self.pma.states.get_unchecked(state_id as usize) };
+                state_id = state.fail();
 
-                if let Some(ep) = emit_pos {
-                    return self.flush_emits(ep, pos, state_id);
+                if let Some(ep) = state.output_pos() {
+                    self.buf.extend(self.pma.iter_emits(ep, pos));
+                    self.pos = pos;
+                    self.state_id = state_id;
+                    return self.buf.pop();
                 }
 
                 if state_id == ROOT_STATE_IDX {
@@ -792,10 +781,13 @@ where
 
         // EOF handling: Flush any pending committed matches in the suffix chain
         while state_id != ROOT_STATE_IDX {
-            let (target_state, emit_pos) = self.pma.step_fail(state_id);
-            state_id = target_state;
-            if let Some(ep) = emit_pos {
-                return self.flush_emits(ep, pos, state_id);
+            let state = unsafe { self.pma.states.get_unchecked(state_id as usize) };
+            state_id = state.fail();
+            if let Some(ep) = state.output_pos() {
+                self.buf.extend(self.pma.iter_emits(ep, pos));
+                self.pos = pos;
+                self.state_id = state_id;
+                return self.buf.pop();
             }
         }
 

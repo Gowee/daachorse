@@ -1316,13 +1316,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         }
     }
 
-    /// Follows the failure transition from `state_id`, returning `(target_state, emit_pos)`.
-    #[inline(always)]
-    pub(crate) fn step_fail(&self, state_id: u32) -> (u32, Option<NonZeroU32>) {
-        let state = unsafe { self.states.get_unchecked(state_id as usize) };
-        (state.fail(), state.output_pos())
-    }
-
     /// Returns an iterator yielding matches from the reverse-linked [`Emit`] chain
     /// in reverse chronological order (head/latest to predecessor/earliest).
     #[inline(always)]
