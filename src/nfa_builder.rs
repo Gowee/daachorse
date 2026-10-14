@@ -587,23 +587,20 @@ where
 
 /// An active match chain builder for a state in the leftmost-longest automaton.
 ///
-/// Tracks the in-flight head match whose trailing gap is maintained relative to the current state.
-/// Inter-match gaps and candidate suffix links are computed purely via relative delta offsets,
-/// with zero absolute coordinates or depth arrays.
+/// Tracks an in-flight head match whose trailing gap is maintained relative to the current state's
+/// byte boundary. Inter-match gaps and candidate suffix links are computed purely via relative delta
+/// offsets, with zero absolute coordinates or depth arrays.
 ///
-/// # Invariant: Head Gap Maintained Against State Byte Depth
+/// # Invariant
 ///
-/// At all times during the processing of state $S$, `chain.head.gap` represents the distance from
-/// the **state's byte depth** (the end of state $S$'s prefix path from ROOT) to the end of the head match.
+/// At all times, `chain.head.gap` represents the distance from the **current state's end boundary**
+/// (its byte depth) to the end of the head match.
 ///
-/// - **Transition Advance**: When extending from parent state $P$ to child state $S = P \cdot c$, the state
-///   byte depth advances by $|c|$. Therefore, the inherited head's trailing gap is advanced by $|c|$
-///   (`with_incremented_gap(c.num_bytes())`) before initializing `chain`.
-/// - **Candidate Suffix Splicing**: Matches harvested from candidate suffix $curr = \text{fail}(P)$ also
-///   originally ended at $P$'s boundary. Advancing $M_k\text{.gap}$ by $|c|$ brings it into alignment with $S$.
-/// - **O(1) Finalization**: Because `head.gap` is kept continuously synchronized with the current state's
-///   byte depth, `finish()` commits the in-flight head directly into `EmitStore` without any coordinate
-///   calculations or depth lookups.
+/// - Predecessor matches `M_1 .. M_{k-1}` maintain invariant inter-match distances.
+/// - `extend_from(&emits, store)` links incoming matches whose head gap is already relative to the
+///   state boundary, and updates the in-flight head.
+/// - `push_leaf(output, store)` commits a match ending directly at the state boundary (gap = 0).
+/// - `finish(store)` commits the in-flight head directly into `EmitStore` as-is.
 #[derive(Clone, Copy, Debug)]
 struct EmitChain<V> {
     head: Option<Emit<V>>,
