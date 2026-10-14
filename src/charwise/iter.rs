@@ -702,9 +702,6 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) buf: Vec<Match<V>>,
 }
 
-/// Deprecated type alias for [`LeftmostFindIteratorExperimental`].
-pub type LeftmostLongestFindIterator<'a, P, V> = LeftmostFindIteratorExperimental<'a, P, V>;
-
 /// Reconstructs match spans from a reverse-linked chain of [`Emit`] nodes.
 ///
 /// # Architecture and Invariants
