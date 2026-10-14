@@ -778,7 +778,7 @@ where
                 state_id = target_state;
 
                 if let Some(ep) = emit_pos {
-                    self.pma.extract_emits(ep.get(), pos, &mut self.buf);
+                    self.pma.extract_emits(ep, pos, &mut self.buf);
                     self.pos = pos;
                     self.state_id = state_id;
                     return self.buf.pop();
@@ -796,7 +796,7 @@ where
             let target_state = unsafe { states.get_unchecked(state_id as usize).fail() };
             state_id = target_state;
             if let Some(ep) = emit_pos {
-                self.pma.extract_emits(ep.get(), pos, &mut self.buf);
+                self.pma.extract_emits(ep, pos, &mut self.buf);
                 self.pos = pos;
                 self.state_id = state_id;
                 return self.buf.pop();
