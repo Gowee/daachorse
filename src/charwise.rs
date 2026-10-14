@@ -1294,13 +1294,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         }
     }
 
-    /// Helper to transition from ROOT on a pre-mapped character label.
-    #[inline(always)]
-    pub(crate) fn step_root(&self, mapped_c: Option<u32>) -> u32 {
-        self.child_state(ROOT_STATE_IDX, mapped_c)
-            .unwrap_or(ROOT_STATE_IDX)
-    }
-
     /// Finds the child state transitioned from `state_id` on mapped character label `mapped_c`.
     #[inline(always)]
     pub(crate) fn child_state(&self, state_id: u32, mapped_c: Option<u32>) -> Option<u32> {
