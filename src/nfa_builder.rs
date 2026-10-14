@@ -588,7 +588,7 @@ where
 /// An active match chain builder for a state in the leftmost-longest automaton.
 ///
 /// Tracks an in-flight head match whose trailing gap is maintained relative to the current state's
-/// byte boundary. Inter-match gaps and candidate suffix links are computed purely via relative delta
+/// byte boundary. Inter-match gaps and predecessor links are computed purely via relative delta
 /// offsets, with zero absolute coordinates or depth arrays.
 ///
 /// # Invariant
