@@ -759,10 +759,11 @@ where
                 }
 
                 // Mismatch: Follow failure transition and commit prefix matches if any
-                let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
-                self.state_id = state.fail();
+                let curr_state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
+                let emit_pos = curr_state.output_pos();
+                self.state_id = curr_state.fail();
 
-                if let Some(ep) = state.output_pos() {
+                if let Some(ep) = emit_pos {
                     self.buf.extend(self.pma.iter_emits(ep, self.pos));
                     return self.buf.pop();
                 }
@@ -773,9 +774,11 @@ where
 
         // EOF handling: Flush any pending committed matches in the suffix chain
         while self.state_id != ROOT_STATE_IDX {
-            let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
-            self.state_id = state.fail();
-            if let Some(ep) = state.output_pos() {
+            let curr_state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
+            let emit_pos = curr_state.output_pos();
+            self.state_id = curr_state.fail();
+
+            if let Some(ep) = emit_pos {
                 self.buf.extend(self.pma.iter_emits(ep, self.pos));
                 return self.buf.pop();
             }
