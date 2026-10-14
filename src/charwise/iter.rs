@@ -7,7 +7,7 @@ use core::num::NonZeroU32;
 use crate::charwise::CharwiseDoubleArrayAhoCorasick;
 use crate::prefilter::{Prefilter, PrefilterGate};
 use crate::utils::FromU32;
-use crate::{Emit, Match, ROOT_STATE_IDX};
+use crate::{Match, ROOT_STATE_IDX};
 
 /// Decodes the character starting at byte position `pos`.
 ///
@@ -724,121 +724,6 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
 ///
 /// Matches are pushed in reverse chronological order ($M_k, M_{k-1}, \dots, M_1$),
 /// so the earliest match $M_1$ sits at the top of the LIFO stack in `buf` and is popped first.
-#[inline(always)]
-fn extract_emits<V: Copy>(emits: &[Emit<V>], head_pos: u32, pos: usize, buf: &mut Vec<Match<V>>) {
-    let first_emit = unsafe { emits.get_unchecked(head_pos as usize - 1) };
-    let end = pos - first_emit.gap as usize;
-    let start = end - first_emit.length as usize;
-    buf.push(first_emit.to_match(end));
-
-    let mut last_start = start;
-    let mut curr_pos = first_emit.pred;
-    while let Some(pred) = curr_pos {
-        let em = unsafe { emits.get_unchecked(pred.get() as usize - 1) };
-        let end = last_start - em.gap as usize;
-        let start = end - em.length as usize;
-        buf.push(em.to_match(end));
-        last_start = start;
-        curr_pos = em.pred;
-    }
-}
-
-/// Helper to transition from ROOT on character `c`.
-#[inline(always)]
-fn step_root(
-    mapped_c: Option<u32>,
-    root_base: Option<core::num::NonZeroU32>,
-    states: &[crate::charwise::State],
-) -> u32 {
-    if let (Some(code), Some(base)) = (mapped_c, root_base) {
-        let child_idx = (base.get() ^ code) as usize;
-        if child_idx < states.len()
-            && unsafe { states.get_unchecked(child_idx).check() } == ROOT_STATE_IDX
-        {
-            return child_idx as u32;
-        }
-    }
-    ROOT_STATE_IDX
-}
-
-/// Advances the zero-rewind leftmost match iterator by one match.
-///
-/// Guaranteed $O(N)$ execution over the input string length without text rewinding.
-#[inline(always)]
-pub(crate) fn next_leftmost_match_experimental<V: Copy>(
-    pma: &CharwiseDoubleArrayAhoCorasick<V>,
-    haystack: &str,
-    pos: &mut usize,
-    state_id: &mut u32,
-    buf: &mut Vec<Match<V>>,
-) -> Option<Match<V>> {
-    // Yield pending matches from the stack in chronological order
-    if let Some(m) = buf.pop() {
-        return Some(m);
-    }
-
-    let bytes = haystack.as_bytes();
-    let text_len = bytes.len();
-    let states = pma.states.as_slice();
-    let states_len = states.len();
-    let root_base = unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
-
-    while *pos < text_len {
-        let (c, char_len) = unsafe { decode_char_unchecked(bytes, *pos) };
-        let mapped_c = pma.mapper.get(c);
-
-        // Fast Root Path: Scanning while at ROOT
-        if *state_id == ROOT_STATE_IDX {
-            *state_id = step_root(mapped_c, root_base, states);
-            *pos += char_len;
-            continue;
-        }
-
-        // State Traversal & Failure Path Resolution
-        loop {
-            if let Some(code) = mapped_c {
-                if let Some(base) = unsafe { states.get_unchecked(*state_id as usize).base() } {
-                    let child_idx = (base.get() ^ code) as usize;
-                    if child_idx < states_len
-                        && unsafe { states.get_unchecked(child_idx).check() } == *state_id
-                    {
-                        *state_id = child_idx as u32;
-                        *pos += char_len;
-                        break;
-                    }
-                }
-            }
-
-            // Mismatch: Follow failure transition and commit prefix matches if any
-            let emit_pos = unsafe { states.get_unchecked(*state_id as usize).output_pos() };
-            let target_state = unsafe { states.get_unchecked(*state_id as usize).fail() };
-            *state_id = target_state;
-
-            if let Some(ep) = emit_pos {
-                extract_emits(&pma.emits, ep.get(), *pos, buf);
-                return buf.pop();
-            }
-
-            if *state_id == ROOT_STATE_IDX {
-                break;
-            }
-        }
-    }
-
-    // EOF handling: Flush any pending committed matches in the suffix chain
-    while *state_id != ROOT_STATE_IDX {
-        let emit_pos = unsafe { states.get_unchecked(*state_id as usize).output_pos() };
-        let target_state = unsafe { states.get_unchecked(*state_id as usize).fail() };
-        *state_id = target_state;
-        if let Some(ep) = emit_pos {
-            extract_emits(&pma.emits, ep.get(), *pos, buf);
-            return buf.pop();
-        }
-    }
-
-    None
-}
-
 impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
 where
     P: AsRef<str>,
@@ -848,13 +733,79 @@ where
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        next_leftmost_match_experimental(
-            self.pma,
-            self.haystack.as_ref(),
-            &mut self.pos,
-            &mut self.state_id,
-            &mut self.buf,
-        )
+        // Yield pending matches from the stack in chronological order
+        if let Some(m) = self.buf.pop() {
+            return Some(m);
+        }
+
+        let bytes = self.haystack.as_ref().as_bytes();
+        let text_len = bytes.len();
+        let states = self.pma.states.as_slice();
+        let states_len = states.len();
+
+        let mut pos = self.pos;
+        let mut state_id = self.state_id;
+
+        while pos < text_len {
+            let (c, char_len) = unsafe { decode_char_unchecked(bytes, pos) };
+            let mapped_c = self.pma.mapper.get(c);
+
+            // Fast Root Path: Scanning while at ROOT
+            if state_id == ROOT_STATE_IDX {
+                state_id = self.pma.step_root(mapped_c);
+                pos += char_len;
+                continue;
+            }
+
+            // State Traversal & Failure Path Resolution
+            loop {
+                if let Some(code) = mapped_c {
+                    if let Some(base) = unsafe { states.get_unchecked(state_id as usize).base() } {
+                        let child_idx = (base.get() ^ code) as usize;
+                        if child_idx < states_len
+                            && unsafe { states.get_unchecked(child_idx).check() } == state_id
+                        {
+                            state_id = child_idx as u32;
+                            pos += char_len;
+                            break;
+                        }
+                    }
+                }
+
+                // Mismatch: Follow failure transition and commit prefix matches if any
+                let emit_pos = unsafe { states.get_unchecked(state_id as usize).output_pos() };
+                let target_state = unsafe { states.get_unchecked(state_id as usize).fail() };
+                state_id = target_state;
+
+                if let Some(ep) = emit_pos {
+                    self.pma.extract_emits(ep.get(), pos, &mut self.buf);
+                    self.pos = pos;
+                    self.state_id = state_id;
+                    return self.buf.pop();
+                }
+
+                if state_id == ROOT_STATE_IDX {
+                    break;
+                }
+            }
+        }
+
+        // EOF handling: Flush any pending committed matches in the suffix chain
+        while state_id != ROOT_STATE_IDX {
+            let emit_pos = unsafe { states.get_unchecked(state_id as usize).output_pos() };
+            let target_state = unsafe { states.get_unchecked(state_id as usize).fail() };
+            state_id = target_state;
+            if let Some(ep) = emit_pos {
+                self.pma.extract_emits(ep.get(), pos, &mut self.buf);
+                self.pos = pos;
+                self.state_id = state_id;
+                return self.buf.pop();
+            }
+        }
+
+        self.pos = pos;
+        self.state_id = state_id;
+        None
     }
 }
 
