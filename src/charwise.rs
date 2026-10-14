@@ -602,7 +602,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     /// # Panics
     ///
     /// Panics if the automaton was not constructed with [`MatchKind::LeftmostLongestExperimental`]
-    /// or [`MatchKind::LeftmostFirstExperimental`], or if the pattern set contains an empty pattern.
+    /// or [`MatchKind::LeftmostFirstExperimental`].
     ///
     /// # Examples
     ///
@@ -633,12 +633,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             self.match_kind.is_experimental(),
             "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
         );
-        assert!(
-            self.states[usize::from_u32(ROOT_STATE_IDX)]
-                .output_pos()
-                .is_none(),
-            "Error: pattern set contains empty string, which is unsupported for leftmost_find_iter_experimental."
-        );
         LeftmostFindIteratorExperimental {
             pma: self,
             haystack,
@@ -646,6 +640,9 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             state_id: ROOT_STATE_IDX,
             buf: Vec::new(),
             gate: PrefilterGate::new(),
+            epsilon_emit_pos: self.states[usize::from_u32(ROOT_STATE_IDX)].output_pos(),
+            skip_empty: false,
+            branch_start: 0,
         }
     }
 

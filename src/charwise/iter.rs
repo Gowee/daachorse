@@ -704,6 +704,9 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) state_id: u32,
     pub(crate) buf: Vec<Match<V>>,
     pub(crate) gate: PrefilterGate,
+    pub(crate) epsilon_emit_pos: Option<NonZeroU32>,
+    pub(crate) skip_empty: bool,
+    pub(crate) branch_start: usize,
 }
 
 impl<P, V> LeftmostFindIteratorExperimental<'_, P, V>
@@ -748,11 +751,29 @@ where
             // State Traversal & Failure Path Resolution
             loop {
                 if let Some(child) = self.pma.child_state(self.state_id, mapped_c) {
+                    if self.state_id == ROOT_STATE_IDX {
+                        self.branch_start = self.pos;
+                    }
                     self.state_id = child;
                     break;
                 }
 
                 if self.state_id == ROOT_STATE_IDX {
+                    if let Some(ep) = self.epsilon_emit_pos {
+                        if self.skip_empty {
+                            self.skip_empty = false;
+                        } else {
+                            let emit =
+                                unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
+                            debug_assert_eq!(emit.length, 0);
+                            debug_assert_eq!(emit.gap, 0);
+                            debug_assert!(emit.pred.is_none());
+                            self.pos += char_len;
+                            self.branch_start = self.pos;
+                            return Some(emit.to_match(self.pos - char_len));
+                        }
+                    }
+                    self.branch_start = self.pos + char_len;
                     break;
                 }
 
@@ -762,8 +783,38 @@ where
                 self.state_id = state.fail();
 
                 if let Some(ep) = emit_pos {
+                    self.skip_empty = true;
                     self.buf.extend(self.pma.iter_emits(ep, self.pos));
+                    self.branch_start = self.pos;
                     return self.buf.pop();
+                }
+
+                if self.state_id == ROOT_STATE_IDX {
+                    if let Some(ep) = self.epsilon_emit_pos {
+                        let emit = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
+                        debug_assert_eq!(emit.length, 0);
+                        debug_assert_eq!(emit.gap, 0);
+                        debug_assert!(emit.pred.is_none());
+                        debug_assert!(self.branch_start <= self.pos);
+                        let buf_start = self.buf.len();
+                        for (offset, _) in
+                            unsafe { haystack.get_unchecked(self.branch_start..self.pos) }
+                                .char_indices()
+                        {
+                            let boundary = self.branch_start + offset;
+                            if self.skip_empty {
+                                self.skip_empty = false;
+                            } else {
+                                self.buf.push(emit.to_match(boundary));
+                            }
+                        }
+                        self.branch_start = self.pos;
+                        if self.buf.len() > buf_start {
+                            self.buf[buf_start..].reverse();
+                            return self.buf.pop();
+                        }
+                    }
+                    self.branch_start = self.pos;
                 }
             }
 
@@ -781,7 +832,35 @@ where
             self.state_id = state.fail();
 
             if let Some(ep) = emit_pos {
+                self.skip_empty = true;
                 self.buf.extend(self.pma.iter_emits(ep, self.pos));
+                self.branch_start = self.pos;
+                return self.buf.pop();
+            }
+        }
+
+        if let Some(ep) = self.epsilon_emit_pos.take() {
+            let emit = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
+            debug_assert_eq!(emit.length, 0);
+            debug_assert_eq!(emit.gap, 0);
+            debug_assert!(emit.pred.is_none());
+            debug_assert!(self.branch_start <= self.pos);
+            let buf_start = self.buf.len();
+            for (offset, _) in
+                unsafe { haystack.get_unchecked(self.branch_start..self.pos) }.char_indices()
+            {
+                let boundary = self.branch_start + offset;
+                if self.skip_empty {
+                    self.skip_empty = false;
+                } else {
+                    self.buf.push(emit.to_match(boundary));
+                }
+            }
+            if !self.skip_empty {
+                self.buf.push(emit.to_match(self.pos));
+            }
+            if self.buf.len() > buf_start {
+                self.buf[buf_start..].reverse();
                 return self.buf.pop();
             }
         }
