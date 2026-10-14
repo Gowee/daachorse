@@ -592,6 +592,13 @@ struct EmitChain<V> {
     head: Option<Emit<V>>,
 }
 
+impl<V> Default for EmitChain<V> {
+    #[inline(always)]
+    fn default() -> Self {
+        Self { head: None }
+    }
+}
+
 impl<V: Copy + Eq + Hash> EmitChain<V> {
     /// Initializes an active match chain with an optional in-flight head match.
     #[inline(always)]
@@ -612,6 +619,10 @@ impl<V: Copy + Eq + Hash> EmitChain<V> {
         // Link earliest match M_1 to the previous head:
         let mut pred = if let Some(prev) = self.head {
             let span: u32 = emits.iter().map(|em| em.gap + em.length).sum();
+            debug_assert!(
+                prev.gap >= span,
+                "candidate match cannot overlap with committed ancestor match"
+            );
             let inter_gap = prev.gap - span;
             Some(store.insert(prev.with_gap(inter_gap)))
         } else {
@@ -631,6 +642,10 @@ impl<V: Copy + Eq + Hash> EmitChain<V> {
     #[inline(always)]
     fn push_leaf(&mut self, output: (V, u32), store: &mut EmitStore<V>) {
         let pred = if let Some(prev) = self.head {
+            debug_assert!(
+                prev.gap >= output.1,
+                "leaf pattern cannot overlap with committed ancestor match"
+            );
             let inter_gap = prev.gap - output.1;
             Some(store.insert(prev.with_gap(inter_gap)))
         } else {
@@ -751,10 +766,10 @@ impl<'a, V: Copy + Eq + Hash> Iterator for ChainIter<'a, V> {
 ///      computes the identical node: `(M.value, M.length, g + |c|, M.pred)`.
 ///    - *Example*: For a 54k-word dictionary, this accounts for **39,000+ deduplicated nodes**.
 ///
-/// 3. **Rekeying Previous Head in `push_match()` (~19% of deduplicated node count)**:
+/// 3. **Rekeying Previous Head on Chaining (~19% of deduplicated node count)**:
 ///    - When a new match $M_{new}$ is committed after an earlier match $M_{prev}$, the previous head
 ///      transitions from an active head (trailing gap) to an internal node (inter-match gap).
-///    - Its gap is rekeyed to $M_{new}.\text{start} - M_{prev}.\text{end}$.
+///    - Its gap is rekeyed to the inter-match distance ($\text{prev.gap} - \text{span}$ or $\text{prev.gap} - \text{pat.len}$).
 ///    - If multiple divergent branches commit pairs of patterns separated by the exact same
 ///      inter-match distance (e.g., adjacent words with gap 0), they generate the identical
 ///      `(M_{prev}.value, M_{prev}.length, inter_gap, M_{prev}.pred)`.
