@@ -1314,6 +1314,28 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         ROOT_STATE_IDX
     }
 
+    /// Finds the child state transitioned from `state_id` on mapped character label `mapped_c`.
+    #[inline(always)]
+    pub(crate) fn child_state(&self, state_id: u32, mapped_c: Option<u32>) -> Option<u32> {
+        let code = mapped_c?;
+        let base = unsafe { self.states.get_unchecked(state_id as usize).base()? };
+        let child_idx = (base.get() ^ code) as usize;
+        if child_idx < self.states.len()
+            && unsafe { self.states.get_unchecked(child_idx).check() } == state_id
+        {
+            Some(child_idx as u32)
+        } else {
+            None
+        }
+    }
+
+    /// Follows the failure transition from `state_id`, returning `(target_state, emit_pos)`.
+    #[inline(always)]
+    pub(crate) fn step_fail(&self, state_id: u32) -> (u32, Option<NonZeroU32>) {
+        let state = unsafe { self.states.get_unchecked(state_id as usize) };
+        (state.fail(), state.output_pos())
+    }
+
     /// Returns an iterator yielding matches from the reverse-linked [`Emit`] chain
     /// in reverse chronological order (head/latest to predecessor/earliest).
     #[inline(always)]
