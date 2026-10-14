@@ -333,13 +333,12 @@ where
         let mut q = Vec::with_capacity(num_states);
         let mut parents = vec![ROOT_STATE_ID; num_states];
         let mut edge_labels: Vec<Option<L>> = vec![None; num_states];
-        let mut char_depths = vec![0u32; num_states];
-        // Stage 1: BFS Traversal to Establish Topological Order, Metrics, and Parent Links.
+
+        // Stage 1: BFS Traversal to Establish Topological Order and Parent Links.
         //
         // This traversal computes:
         // 1. `q`: Topological BFS ordering ensuring ancestor states are processed before descendants.
         // 2. `parents` and `edge_labels`: Structural links for parent lookup and DP transitions.
-        // 3. `char_depths`: Exact character depths from ROOT for candidate transition logic.
         //
         // Initialize BFS queue starting with ROOT_STATE_ID:
         q.push(ROOT_STATE_ID);
@@ -351,7 +350,6 @@ where
             for &(ch, child_id) in self.states[state_id as usize].edges.iter() {
                 parents[child_id as usize] = state_id;
                 edge_labels[child_id as usize] = Some(ch);
-                char_depths[child_id as usize] = char_depths[state_id as usize] + 1;
                 q.push(child_id);
             }
         }
@@ -403,7 +401,7 @@ where
 
             // 2. Active Candidate Transition & Leaf Match Decision:
             let mut fail_state = ROOT_STATE_ID;
-            if char_depths[state_id as usize] > 1 {
+            if parent_id != ROOT_STATE_ID {
                 if let Some(child_id) = next_child {
                     if !self.states[child_id as usize].edges.is_empty() {
                         // Extend active candidate along child.
@@ -630,14 +628,14 @@ impl<V: Copy + Eq + Hash> EmitChain<V> {
 
     /// Appends a newly completed leaf pattern ending at the current state.
     #[inline(always)]
-    fn push_leaf(&mut self, pat: (V, u32), store: &mut EmitStore<V>) {
+    fn push_leaf(&mut self, output: (V, u32), store: &mut EmitStore<V>) {
         let pred = if let Some(prev) = self.head {
-            let inter_gap = prev.gap - pat.1;
+            let inter_gap = prev.gap - output.1;
             Some(store.insert(prev.with_gap(inter_gap)))
         } else {
             None
         };
-        self.head = Some(Emit::from_output(pat, 0, pred));
+        self.head = Some(Emit::from_output(output, 0, pred));
     }
 
     /// Finalizes the match chain by committing the in-flight head to `store`.
