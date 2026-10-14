@@ -378,9 +378,12 @@ where
             // S = P · c inherits P's in-flight head match with gap advanced by |c|.
             let parent_id = parents[state_id as usize];
             let ch = edge_labels[state_id as usize].unwrap();
-            let parent_head = self.states[parent_id as usize].output_pos.get();
+            let initial_head = self.states[parent_id as usize]
+                .output_pos
+                .get()
+                .map(|pos| store.get(pos).with_incremented_gap(ch.num_bytes()));
 
-            let mut chain = EmitChain::inherit(parent_head, ch.num_bytes(), &store);
+            let mut chain = EmitChain::new(initial_head);
 
             // 1. Failure Path Walk & Candidate Match Harvesting:
             // When an active candidate `curr = fail(parent_id)` cannot transition on `ch`,
@@ -392,7 +395,7 @@ where
                 if let Some(curr_head) = self.states[curr as usize].output_pos.get() {
                     scratch_buffer.clear();
                     scratch_buffer.extend(store.iter_chain(curr_head));
-                    scratch_buffer[0].gap += u32::try_from(ch.num_bytes()).unwrap();
+                    scratch_buffer[0] = scratch_buffer[0].with_incremented_gap(ch.num_bytes());
                     chain.extend_from(&scratch_buffer, &mut store);
                 }
                 curr = self.states[curr as usize].fail.get();
@@ -590,11 +593,9 @@ struct EmitChain<V> {
 }
 
 impl<V: Copy + Eq + Hash> EmitChain<V> {
-    /// Initializes an active match chain by inheriting the parent state's head match
-    /// with its gap advanced by `ch_num_bytes` to the current state.
+    /// Initializes an active match chain with an optional in-flight head match.
     #[inline(always)]
-    fn inherit(parent_head: Option<NonZeroU32>, ch_num_bytes: usize, store: &EmitStore<V>) -> Self {
-        let head = parent_head.map(|pos| store.get(pos).with_incremented_gap(ch_num_bytes));
+    const fn new(head: Option<Emit<V>>) -> Self {
         Self { head }
     }
 
