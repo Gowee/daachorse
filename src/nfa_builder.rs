@@ -381,6 +381,9 @@ where
             // Advancing from P to S via `ch` increments the trailing gap by |c| bytes.
             let parent_id = parents[state_id as usize];
             let ch = edge_labels[state_id as usize].unwrap();
+            // Direct children of ROOT start with an empty match chain (initial_head = None).
+            // Even if ROOT holds an output for the empty pattern (""), child transitions
+            // pursue non-empty extensions whose prefix does not commit the empty pattern.
             let initial_head = if parent_id == ROOT_STATE_ID {
                 None
             } else {

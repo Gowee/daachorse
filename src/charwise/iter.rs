@@ -704,8 +704,20 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) state_id: u32,
     pub(crate) buf: Vec<Match<V>>,
     pub(crate) gate: PrefilterGate,
+
+    // Cached ROOT state output position for the empty pattern (""), if present.
+    // In leftmost matching, a pattern set containing "" matches at every character
+    // boundary unless covered or immediately followed by a non-empty match.
     pub(crate) epsilon_emit_pos: Option<NonZeroU32>,
+
+    // When an empty pattern is present, this flag suppresses emitting a zero-length match
+    // at the boundary immediately following a committed non-empty match.
     pub(crate) skip_empty: bool,
+
+    // Starting text offset of the current speculative branch originating from ROOT.
+    // If the branch fails down to ROOT without committing any non-empty match,
+    // this offset allows recovering all intermediate unconsumed character boundaries
+    // as empty pattern matches without rewinding the text scanning pointer.
     pub(crate) branch_start: usize,
 }
 
@@ -751,6 +763,7 @@ where
             // State Traversal & Failure Path Resolution
             loop {
                 if let Some(child) = self.pma.child_state(self.state_id, mapped_c) {
+                    // Entering a candidate branch from ROOT; record the branch origin.
                     if self.state_id == ROOT_STATE_IDX {
                         self.branch_start = self.pos;
                     }
@@ -759,6 +772,8 @@ where
                 }
 
                 if self.state_id == ROOT_STATE_IDX {
+                    // Mismatch at ROOT: If the empty pattern is present, emit a zero-length match
+                    // at this boundary (unless suppressed by an immediately preceding match).
                     if let Some(ep) = self.epsilon_emit_pos {
                         if self.skip_empty {
                             self.skip_empty = false;
@@ -789,6 +804,11 @@ where
                     return self.buf.pop();
                 }
 
+                // When a candidate branch fails down to ROOT without committing any match,
+                // all character boundaries traversed in `branch_start..pos` were unconsumed.
+                // Under leftmost semantics with the empty pattern, every unconsumed boundary
+                // (respecting `skip_empty`) is a valid zero-length match. We harvest them into
+                // `buf` in reverse order so they are yielded chronologically without rewinding `pos`.
                 if self.state_id == ROOT_STATE_IDX {
                     if let Some(ep) = self.epsilon_emit_pos {
                         let emit = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
@@ -839,6 +859,9 @@ where
             }
         }
 
+        // If the empty pattern is present and the trailing branch drained to ROOT,
+        // harvest any remaining unconsumed boundaries up to EOF and the EOF position itself.
+        // `.take()` consumes the token, ensuring subsequent calls terminate with None.
         if let Some(ep) = self.epsilon_emit_pos.take() {
             let emit = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
             debug_assert_eq!(emit.length, 0);
