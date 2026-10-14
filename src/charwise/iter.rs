@@ -708,7 +708,12 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
 ///
 /// During automaton construction, any prefix string $W$ that matches patterns
 /// decomposes into a sequence of non-overlapping committed matches:
-/// $M_1 \text{ (earliest)} \to M_2 \to \dots \to M_k \text{ (latest)}$.
+/// $M_1 \text{ (earliest)} \to M_2 \to \dots \to M_k \text{ (latest)}$,
+/// followed by an active in-flight suffix represented by `state.fail()`.
+///
+/// Because `state.output_pos()` stores matches occurring *before* the active suffix,
+/// any mismatch or EOF condition must also drain `state.fail()` to flush pending
+/// non-overlapping matches that reside inside the trailing active suffix.
 ///
 /// In the emit pool, these matches are stored in reverse chronological order:
 /// `head` is $M_k$, which links via `pred` to $M_{k-1}$, and eventually to $M_1$ (`pred == None`).
@@ -769,7 +774,11 @@ where
             self.pos += char_len;
         }
 
-        // EOF handling: Flush any pending committed matches in the suffix chain
+        // EOF handling: Drain in-flight active suffixes along the failure chain.
+        // Even after `curr_state` emits its locked prefix matches (or if it has none),
+        // its active suffix `fail(S)` represents trailing text waiting for extensions
+        // that never arrived. Draining the failure chain to ROOT flushes any pending
+        // non-overlapping matches residing in those in-flight suffix states.
         while self.state_id != ROOT_STATE_IDX {
             let curr_state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
             let emit_pos = curr_state.output_pos();
