@@ -10,12 +10,14 @@ use core::num::NonZeroU32;
 use alloc::vec::Vec;
 
 pub use crate::charwise::builder::CharwiseDoubleArrayAhoCorasickBuilder;
-pub use crate::charwise::iter::LeftmostLongestFindIterator;
 use crate::charwise::iter::{
     CharWithEndOffsetIterator, FindIterator, FindOverlappingIterator,
     FindOverlappingNoSuffixIterator, FindOverlappingNoSuffixSliceIterator,
     FindOverlappingSliceIterator, FindOverlappingStepper, FindSliceIterator, FindStepper,
-    LeftmostFindIterator, PatternIterator,
+    PatternIterator,
+};
+pub use crate::charwise::iter::{
+    LeftmostFindIterator, LeftmostFindIteratorExperimental, LeftmostLongestFindIterator,
 };
 use crate::charwise::mapper::CodeMapper;
 use crate::errors::{DaachorseError, Result};
@@ -572,7 +574,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         assert!(
             self.match_kind == MatchKind::LeftmostFirst
                 || self.match_kind == MatchKind::LeftmostLongest,
-            "Error: match_kind must be leftmost_first or leftmost_longest. For MatchKind::LeftmostLongestExperimental, use leftmost_longest_find_iter()."
+            "Error: match_kind must be leftmost_first or leftmost_longest. For experimental matching, use leftmost_find_iter_experimental()."
         );
         LeftmostFindIterator {
             pma: self,
@@ -588,7 +590,8 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         }
     }
 
-    /// Returns an iterator of non-overlapping leftmost-longest matches in the input text.
+    /// Returns an iterator of non-overlapping leftmost matches in the input text using
+    /// the experimental zero-rewind algorithm.
     ///
     /// This method uses a zero-rewind forward-only stream matching algorithm with reverse
     /// delta-encoded match chains, guaranteeing worst-case linear time $O(N)$
@@ -600,8 +603,8 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     ///
     /// # Panics
     ///
-    /// Panics if the automaton was not constructed with [`MatchKind::LeftmostLongestExperimental`],
-    /// or if the pattern set contains an empty pattern.
+    /// Panics if the automaton was not constructed with [`MatchKind::LeftmostLongestExperimental`]
+    /// or [`MatchKind::LeftmostFirstExperimental`], or if the pattern set contains an empty pattern.
     ///
     /// # Examples
     ///
@@ -614,38 +617,50 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     ///     .build(&patterns)
     ///     .unwrap();
     ///
-    /// let mut it = pma.leftmost_longest_find_iter("abcd");
+    /// let mut it = pma.leftmost_find_iter_experimental("abcd");
     ///
     /// let m = it.next().unwrap();
     /// assert_eq!((0, 4, 1), (m.start(), m.end(), m.value()));
     ///
     /// assert_eq!(None, it.next());
     /// ```
-    pub fn leftmost_longest_find_iter<P>(
+    pub fn leftmost_find_iter_experimental<P>(
         &self,
         haystack: P,
-    ) -> LeftmostLongestFindIterator<'_, P, V>
+    ) -> LeftmostFindIteratorExperimental<'_, P, V>
     where
         P: AsRef<str>,
     {
-        assert_eq!(
-            self.match_kind,
-            MatchKind::LeftmostLongestExperimental,
-            "Error: match_kind must be leftmost_longest_experimental."
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
         );
         assert!(
             self.states[usize::from_u32(ROOT_STATE_IDX)]
                 .output_pos()
                 .is_none(),
-            "Error: pattern set contains empty string, which is unsupported for leftmost_longest_find_iter."
+            "Error: pattern set contains empty string, which is unsupported for leftmost_find_iter_experimental."
         );
-        LeftmostLongestFindIterator {
+        LeftmostFindIteratorExperimental {
             pma: self,
             haystack,
             pos: 0,
             state_id: ROOT_STATE_IDX,
             buf: Vec::new(),
         }
+    }
+
+    /// Deprecated alias for [`CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()`].
+    #[deprecated(note = "use `leftmost_find_iter_experimental()` instead")]
+    #[inline(always)]
+    pub fn leftmost_longest_find_iter<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V>
+    where
+        P: AsRef<str>,
+    {
+        self.leftmost_find_iter_experimental(haystack)
     }
 
     /// Returns a stepper of non-overlapping matches that consumes characters one by one.
@@ -1179,7 +1194,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             return Err(DaachorseError::invalid_automaton());
         }
         let states_len = pma.states.len();
-        let pool_len = if pma.match_kind == MatchKind::LeftmostLongestExperimental {
+        let pool_len = if pma.match_kind.is_experimental() {
             pma.emits.len()
         } else {
             pma.outputs.len()
@@ -1409,9 +1424,9 @@ struct State {
     /// 1-based index pointing to the head of the output/emit chain.
     ///
     /// This field has dual semantics depending on `MatchKind` to keep `State` at exactly 16 bytes:
-    /// - **Standard / LeftmostFirst**: 1-based index into `outputs: Vec<Output<V>>`
+    /// - **Standard / LeftmostFirst / LeftmostLongest**: 1-based index into `outputs: Vec<Output<V>>`
     ///   (dictionary suffix link chain, traversed via `Output::parent()`).
-    /// - **LeftmostLongestExperimental**: 1-based index into `emits: Vec<Emit<V>>`
+    /// - **LeftmostLongestExperimental / LeftmostFirstExperimental**: 1-based index into `emits: Vec<Emit<V>>`
     ///   (reverse delta-encoded pre-committed match chain, traversed via `Emit::pred()`).
     output_pos: Option<NonZeroU32>,
 }

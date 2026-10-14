@@ -647,7 +647,32 @@ fn search_leftmost_longest_experimental_charwise() {
                 .build(test.patterns)
                 .unwrap();
             let matches: Vec<Match<usize>> =
-                pma.leftmost_longest_find_iter(test.haystack).collect();
+                pma.leftmost_find_iter_experimental(test.haystack).collect();
+            assert_eq!(
+                test.matches,
+                get_match_triples(matches).as_slice(),
+                "test: {}, patterns: {:?}, haystack: {:?}",
+                test.name,
+                test.patterns,
+                test.haystack
+            );
+        }
+    }
+}
+
+#[test]
+fn search_leftmost_first_experimental_charwise() {
+    for &collection in AC_LEFTMOST_FIRST {
+        for test in collection {
+            if test.patterns.iter().any(|p| p.is_empty()) {
+                continue;
+            }
+            let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
+                .match_kind(MatchKind::LeftmostFirstExperimental)
+                .build(test.patterns)
+                .unwrap();
+            let matches: Vec<Match<usize>> =
+                pma.leftmost_find_iter_experimental(test.haystack).collect();
             assert_eq!(
                 test.matches,
                 get_match_triples(matches).as_slice(),

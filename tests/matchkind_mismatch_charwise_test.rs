@@ -94,32 +94,32 @@ fn test_cache_depth_with_leftmost_first() {
 
 #[test]
 #[should_panic]
-fn test_leftmost_longest_find_iter_with_standard() {
+fn test_leftmost_find_iter_experimental_with_standard() {
     let pma: CharwiseDoubleArrayAhoCorasick<usize> = CharwiseDoubleArrayAhoCorasickBuilder::new()
         .match_kind(MatchKind::Standard)
         .build(["pattern"])
         .unwrap();
-    pma.leftmost_longest_find_iter("");
+    pma.leftmost_find_iter_experimental("");
 }
 
 #[test]
 #[should_panic]
-fn test_leftmost_longest_find_iter_with_leftmost_first() {
+fn test_leftmost_find_iter_experimental_with_leftmost_first() {
     let pma: CharwiseDoubleArrayAhoCorasick<usize> = CharwiseDoubleArrayAhoCorasickBuilder::new()
         .match_kind(MatchKind::LeftmostFirst)
         .build(["pattern"])
         .unwrap();
-    pma.leftmost_longest_find_iter("");
+    pma.leftmost_find_iter_experimental("");
 }
 
 #[test]
 #[should_panic]
-fn test_leftmost_longest_find_iter_with_leftmost_longest() {
+fn test_leftmost_find_iter_experimental_with_leftmost_longest() {
     let pma: CharwiseDoubleArrayAhoCorasick<usize> = CharwiseDoubleArrayAhoCorasickBuilder::new()
         .match_kind(MatchKind::LeftmostLongest)
         .build(["pattern"])
         .unwrap();
-    pma.leftmost_longest_find_iter("");
+    pma.leftmost_find_iter_experimental("");
 }
 
 #[test]
@@ -134,9 +134,28 @@ fn test_leftmost_find_iter_with_leftmost_longest_experimental() {
 
 #[test]
 #[should_panic]
+fn test_leftmost_find_iter_with_leftmost_first_experimental() {
+    let pma: CharwiseDoubleArrayAhoCorasick<usize> = CharwiseDoubleArrayAhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostFirstExperimental)
+        .build(["pattern"])
+        .unwrap();
+    pma.leftmost_find_iter("");
+}
+
+#[test]
+#[should_panic]
 fn test_leftmost_longest_experimental_with_empty_pattern() {
     let _pma: CharwiseDoubleArrayAhoCorasick<usize> = CharwiseDoubleArrayAhoCorasickBuilder::new()
         .match_kind(MatchKind::LeftmostLongestExperimental)
+        .build(["", "pattern"])
+        .unwrap();
+}
+
+#[test]
+#[should_panic]
+fn test_leftmost_first_experimental_with_empty_pattern() {
+    let _pma: CharwiseDoubleArrayAhoCorasick<usize> = CharwiseDoubleArrayAhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostFirstExperimental)
         .build(["", "pattern"])
         .unwrap();
 }

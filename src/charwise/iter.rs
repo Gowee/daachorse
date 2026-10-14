@@ -691,19 +691,22 @@ where
     }
 }
 
-/// Dedicated iterator created by [`CharwiseDoubleArrayAhoCorasick::leftmost_longest_find_iter()`].
+/// Dedicated iterator created by [`CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()`].
 ///
-/// This iterator executes non-overlapping leftmost-longest pattern matching using pre-committed
+/// This iterator executes non-overlapping leftmost pattern matching using pre-committed
 /// match chains. It performs purely forward, single-pass streaming matching in guaranteed linear
 /// time `O(N)` over the input text, completely eliminating the worst-case `O(N * L)` text rewind
 /// behavior present in classic Aho-Corasick leftmost matching.
-pub struct LeftmostLongestFindIterator<'a, P, V> {
+pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
     pub(crate) haystack: P,
     pub(crate) pos: usize,
     pub(crate) state_id: u32,
     pub(crate) buf: Vec<Match<V>>,
 }
+
+/// Deprecated type alias for [`LeftmostFindIteratorExperimental`].
+pub type LeftmostLongestFindIterator<'a, P, V> = LeftmostFindIteratorExperimental<'a, P, V>;
 
 /// Reconstructs match spans from a reverse-linked chain of [`Emit`] nodes.
 ///
@@ -724,8 +727,6 @@ pub struct LeftmostLongestFindIterator<'a, P, V> {
 /// - **Head match $M_k$**: $\text{end}(M_k) = \text{anchor}_k - M_k.\text{gap}$, $\text{start}(M_k) = \text{end}(M_k) - M_k.\text{length}$
 /// - **Inductive step for $M_{i-1}$**: $\text{anchor}_{i-1} = \text{start}(M_i)$
 /// - **Predecessor match $M_{i-1}$**: $\text{end}(M_{i-1}) = \text{anchor}_{i-1} - M_{i-1}.\text{gap}$, $\text{start}(M_{i-1}) = \text{end}(M_{i-1}) - M_{i-1}.\text{length}$
-///
-/// Unpacks match spans from a reverse-linked chain of [`Emit`] nodes onto `buf`.
 ///
 /// Matches are pushed in reverse chronological order ($M_k, M_{k-1}, \dots, M_1$),
 /// so the earliest match $M_1$ sits at the top of the LIFO stack in `buf` and is popped first.
@@ -766,11 +767,11 @@ fn step_root(
     ROOT_STATE_IDX
 }
 
-/// Advances the zero-rewind leftmost-longest match iterator by one match.
+/// Advances the zero-rewind leftmost match iterator by one match.
 ///
 /// Guaranteed $O(N)$ execution over the input string length without text rewinding.
 #[inline(always)]
-pub(crate) fn next_leftmost_longest_match<V: Copy>(
+pub(crate) fn next_leftmost_match_experimental<V: Copy>(
     pma: &CharwiseDoubleArrayAhoCorasick<V>,
     haystack: &str,
     pos: &mut usize,
@@ -854,7 +855,7 @@ pub(crate) fn next_leftmost_longest_match<V: Copy>(
     None
 }
 
-impl<P, V> Iterator for LeftmostLongestFindIterator<'_, P, V>
+impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
 where
     P: AsRef<str>,
     V: Copy,
@@ -863,7 +864,7 @@ where
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        next_leftmost_longest_match(
+        next_leftmost_match_experimental(
             self.pma,
             self.haystack.as_ref(),
             &mut self.pos,

@@ -313,7 +313,9 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
             MatchKind::LeftmostFirst | MatchKind::LeftmostLongest => {
                 nfa.build_outputs(&nfa.build_fails_leftmost())
             }
-            MatchKind::LeftmostLongestExperimental => nfa.build_fails_and_emits_leftmost_longest(),
+            MatchKind::LeftmostLongestExperimental | MatchKind::LeftmostFirstExperimental => {
+                nfa.build_fails_and_emits_leftmost_experimental()
+            }
         };
         Ok((nfa, prefilter_builder.and_then(PrefilterBuilder::build)))
     }

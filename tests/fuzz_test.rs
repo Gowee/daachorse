@@ -69,7 +69,7 @@ fn differential_fuzz_round(patterns: &[String], haystack: &str, round: usize) {
         .collect();
 
     let matches_linear: Vec<_> = pma_linear
-        .leftmost_longest_find_iter(haystack)
+        .leftmost_find_iter_experimental(haystack)
         .map(|m| (m.start(), m.end(), m.value()))
         .collect();
 
@@ -263,51 +263,62 @@ fn test_fuzz_stress_large_corpus() {
     }
 }
 
-#[test]
-fn test_debug_trace() {
-    let patterns = vec![
-        "da".to_string(),
-        "dbacbc".to_string(),
-        "a".to_string(),
-        "bbdadd".to_string(),
-        "d".to_string(),
-        "dbc".to_string(),
-        "dbacbd".to_string(),
-        "bad".to_string(),
-        "cbac".to_string(),
-        "cc".to_string(),
-        "ddacad".to_string(),
-        "b".to_string(),
-    ];
-    let pma_linear: daachorse::CharwiseDoubleArrayAhoCorasick<usize> =
-        daachorse::CharwiseDoubleArrayAhoCorasickBuilder::new()
-            .match_kind(daachorse::MatchKind::LeftmostLongestExperimental)
-            .build(&patterns)
-            .unwrap();
-
-    let haystack = "abbddbac";
-    println!("Tracing haystack: {}", haystack);
-    for m in pma_linear.leftmost_longest_find_iter(haystack) {
-        println!(
-            "Match: [{}..{}] = {}",
-            m.start(),
-            m.end(),
-            patterns[m.value()]
-        );
+fn differential_fuzz_round_leftmost_first(patterns: &[String], haystack: &str, round: usize) {
+    if patterns.is_empty() {
+        return;
     }
 
-    let pma_legacy: daachorse::CharwiseDoubleArrayAhoCorasick<usize> =
-        daachorse::CharwiseDoubleArrayAhoCorasickBuilder::new()
-            .match_kind(daachorse::MatchKind::LeftmostLongest)
-            .build(&patterns)
-            .unwrap();
-    println!("Legacy matches:");
-    for m in pma_legacy.leftmost_find_iter(haystack) {
-        println!(
-            "Legacy Match: [{}..{}] = {}",
-            m.start(),
-            m.end(),
-            patterns[m.value()]
-        );
+    let pma_legacy: CharwiseDoubleArrayAhoCorasick<usize> =
+        match CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostFirst)
+            .build(patterns)
+        {
+            Ok(pma) => pma,
+            Err(_) => return,
+        };
+
+    let pma_linear: CharwiseDoubleArrayAhoCorasick<usize> =
+        match CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostFirstExperimental)
+            .build(patterns)
+        {
+            Ok(pma) => pma,
+            Err(e) => panic!("Linear builder failed when legacy succeeded: {:?}", e),
+        };
+
+    let matches_legacy: Vec<_> = pma_legacy
+        .leftmost_find_iter(haystack)
+        .map(|m| (m.start(), m.end(), m.value()))
+        .collect();
+
+    let matches_linear: Vec<_> = pma_linear
+        .leftmost_find_iter_experimental(haystack)
+        .map(|m| (m.start(), m.end(), m.value()))
+        .collect();
+
+    if matches_legacy != matches_linear {
+        eprintln!("=== MISMATCH in Round {} (LeftmostFirst) ===", round);
+        eprintln!("Patterns ({}): {:?}", patterns.len(), patterns);
+        eprintln!("Haystack (len {}): {:?}", haystack.len(), haystack);
+        panic!("LeftmostFirst mismatch detected!");
+    }
+}
+
+#[test]
+fn test_fuzz_leftmost_first_equivalence() {
+    let mut rng = Rng::new(0xdeadbeef12345678);
+    let alphabet = ['a', 'b', 'c', 'd'];
+
+    for round in 0..1000 {
+        let num_pats = rng.gen_range(2, 20);
+        let mut patterns = Vec::with_capacity(num_pats);
+        for _ in 0..num_pats {
+            let pat = rng.gen_string(&alphabet, 1, 8);
+            if !patterns.contains(&pat) {
+                patterns.push(pat);
+            }
+        }
+        let haystack = rng.gen_string(&alphabet, 20, 1000);
+        differential_fuzz_round_leftmost_first(&patterns, &haystack, round);
     }
 }

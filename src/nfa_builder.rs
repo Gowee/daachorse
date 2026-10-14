@@ -321,12 +321,12 @@ where
     ///        onto the chain with `gap = 0` (`fail = ROOT`).
     ///   3. **Head Gap Expansion**:
     ///      If no new matches were cons'd, the parent's head match gap simply expands by `|c|` bytes.
-    pub(crate) fn build_fails_and_emits_leftmost_longest(&mut self) {
+    pub(crate) fn build_fails_and_emits_leftmost_experimental(&mut self) {
         assert!(
             self.states[usize::from_u32(ROOT_STATE_ID)]
                 .output
                 .is_empty(),
-            "Error: empty pattern is not supported for MatchKind::LeftmostLongestExperimental"
+            "Error: empty pattern is not supported for experimental leftmost matching"
         );
         let num_states = self.states.len();
         let mut q = Vec::with_capacity(num_states);
