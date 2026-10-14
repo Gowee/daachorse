@@ -747,17 +747,15 @@ where
             let (c, char_len) = unsafe { decode_char_unchecked(bytes, self.pos) };
             let mapped_c = self.pma.mapper.get(c);
 
-            // Fast Root Path: Scanning while at ROOT
-            if self.state_id == ROOT_STATE_IDX {
-                self.state_id = self.pma.step_root(mapped_c);
-                self.pos += char_len;
-                continue;
-            }
-
             // State Traversal & Failure Path Resolution
             loop {
                 if let Some(child) = self.pma.child_state(self.state_id, mapped_c) {
                     self.state_id = child;
+                    self.pos += char_len;
+                    break;
+                }
+
+                if self.state_id == ROOT_STATE_IDX {
                     self.pos += char_len;
                     break;
                 }
@@ -769,10 +767,6 @@ where
                 if let Some(ep) = state.output_pos() {
                     self.buf.extend(self.pma.iter_emits(ep, self.pos));
                     return self.buf.pop();
-                }
-
-                if self.state_id == ROOT_STATE_IDX {
-                    break;
                 }
             }
         }
