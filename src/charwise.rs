@@ -1327,21 +1327,8 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     /// Helper to transition from ROOT on a pre-mapped character label.
     #[inline(always)]
     pub(crate) fn step_root(&self, mapped_c: Option<u32>) -> u32 {
-        if let Some(code) = mapped_c {
-            if let Some(base) = unsafe {
-                self.states
-                    .get_unchecked(usize::from_u32(ROOT_STATE_IDX))
-                    .base()
-            } {
-                let child_idx = (base.get() ^ code) as usize;
-                if child_idx < self.states.len()
-                    && unsafe { self.states.get_unchecked(child_idx).check() } == ROOT_STATE_IDX
-                {
-                    return child_idx as u32;
-                }
-            }
-        }
-        ROOT_STATE_IDX
+        self.child_state(ROOT_STATE_IDX, mapped_c)
+            .unwrap_or(ROOT_STATE_IDX)
     }
 
     /// Finds the child state transitioned from `state_id` on mapped character label `mapped_c`.
