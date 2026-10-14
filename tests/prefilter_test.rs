@@ -150,6 +150,22 @@ prefilter_equivalence_test!(
     leftmost_find_iter
 );
 
+prefilter_equivalence_test!(
+    charwise_leftmost_longest_experimental,
+    CharwiseDoubleArrayAhoCorasickBuilder,
+    CharwiseDoubleArrayAhoCorasick<u32>,
+    MatchKind::LeftmostLongestExperimental,
+    leftmost_find_iter_experimental
+);
+
+prefilter_equivalence_test!(
+    charwise_leftmost_first_experimental,
+    CharwiseDoubleArrayAhoCorasickBuilder,
+    CharwiseDoubleArrayAhoCorasick<u32>,
+    MatchKind::LeftmostFirstExperimental,
+    leftmost_find_iter_experimental
+);
+
 macro_rules! gate_close_test {
     ($name:ident, $builder:ident, $pma:ty, $kind:expr, $find:ident) => {
         #[test]
@@ -222,6 +238,22 @@ gate_close_test!(
     CharwiseDoubleArrayAhoCorasick<u32>,
     MatchKind::LeftmostLongest,
     leftmost_find_iter
+);
+
+gate_close_test!(
+    charwise_gate_close_leftmost_longest_experimental,
+    CharwiseDoubleArrayAhoCorasickBuilder,
+    CharwiseDoubleArrayAhoCorasick<u32>,
+    MatchKind::LeftmostLongestExperimental,
+    leftmost_find_iter_experimental
+);
+
+gate_close_test!(
+    charwise_gate_close_leftmost_first_experimental,
+    CharwiseDoubleArrayAhoCorasickBuilder,
+    CharwiseDoubleArrayAhoCorasick<u32>,
+    MatchKind::LeftmostFirstExperimental,
+    leftmost_find_iter_experimental
 );
 
 #[test]

@@ -700,52 +700,45 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) pos: usize,
     pub(crate) state_id: u32,
     pub(crate) buf: Vec<Match<V>>,
+    pub(crate) gate: PrefilterGate,
 }
 
-/// Reconstructs match spans from a reverse-linked chain of [`Emit`] nodes.
-///
-/// # Architecture and Invariants
-///
-/// During automaton construction, any prefix string $W$ that matches patterns
-/// decomposes into a sequence of non-overlapping committed matches:
-/// $M_1 \text{ (earliest)} \to M_2 \to \dots \to M_k \text{ (latest)}$,
-/// followed by an active in-flight suffix represented by `state.fail()`.
-///
-/// Because `state.output_pos()` stores matches occurring *before* the active suffix,
-/// any mismatch or EOF condition must also drain `state.fail()` to flush pending
-/// non-overlapping matches that reside inside the trailing active suffix.
-///
-/// In the emit pool, these matches are stored in reverse chronological order:
-/// `head` is $M_k$, which links via `pred` to $M_{k-1}$, and eventually to $M_1$ (`pred == None`).
-///
-/// # Backward Inductive Recurrence
-///
-/// Given the scan position $P = \text{pos}$ at mismatch:
-///
-/// - **Base anchor**: $\text{anchor}_k = P$
-/// - **Head match $M_k$**: $\text{end}(M_k) = \text{anchor}_k - M_k.\text{gap}$, $\text{start}(M_k) = \text{end}(M_k) - M_k.\text{length}$
-/// - **Inductive step for $M_{i-1}$**: $\text{anchor}_{i-1} = \text{start}(M_i)$
-/// - **Predecessor match $M_{i-1}$**: $\text{end}(M_{i-1}) = \text{anchor}_{i-1} - M_{i-1}.\text{gap}$, $\text{start}(M_{i-1}) = \text{end}(M_{i-1}) - M_{i-1}.\text{length}$
-///
-/// Matches are pushed in reverse chronological order ($M_k, M_{k-1}, \dots, M_1$),
-/// so the earliest match $M_1$ sits at the top of the LIFO stack in `buf` and is popped first.
-impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
+impl<P, V> LeftmostFindIteratorExperimental<'_, P, V>
 where
     P: AsRef<str>,
     V: Copy,
 {
-    type Item = Match<V>;
-
     #[inline(always)]
-    fn next(&mut self) -> Option<Self::Item> {
-        // Yield pending matches from the stack in chronological order
+    fn next_impl<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
+        // Yield ready matches from the stack in chronological order
         if let Some(m) = self.buf.pop() {
             return Some(m);
         }
 
-        let bytes = self.haystack.as_ref().as_bytes();
+        let haystack = self.haystack.as_ref();
+        let bytes = haystack.as_bytes();
+
+        let mut prefilter = if FILTERED {
+            self.pma.prefilter.as_ref()
+        } else {
+            None
+        };
 
         while self.pos < bytes.len() {
+            if let Some(pf) = prefilter {
+                if self.state_id == ROOT_STATE_IDX {
+                    let candidate_pos = pf.next_position_at_char_boundary(haystack, self.pos);
+                    self.gate.record(candidate_pos - self.pos);
+                    self.pos = candidate_pos;
+                    if !self.gate.is_enabled() {
+                        prefilter = None;
+                    }
+                    if self.pos >= bytes.len() {
+                        break;
+                    }
+                }
+            }
+
             let (c, char_len) = unsafe { decode_char_unchecked(bytes, self.pos) };
             let mapped_c = self.pma.mapper.get(c);
 
@@ -791,6 +784,50 @@ where
         }
 
         None
+    }
+}
+
+/// Reconstructs match spans from a reverse-linked chain of [`Emit`] nodes.
+///
+/// # Architecture and Invariants
+///
+/// During automaton construction, any prefix string $W$ that matches patterns
+/// decomposes into a sequence of non-overlapping committed matches:
+/// $M_1 \text{ (earliest)} \to M_2 \to \dots \to M_k \text{ (latest)}$,
+/// followed by an active in-flight suffix represented by `state.fail()`.
+///
+/// Because `state.output_pos()` stores matches occurring *before* the active suffix,
+/// any mismatch or EOF condition must also drain `state.fail()` to flush pending
+/// non-overlapping matches that reside inside the trailing active suffix.
+///
+/// In the emit pool, these matches are stored in reverse chronological order:
+/// `head` is $M_k$, which links via `pred` to $M_{k-1}$, and eventually to $M_1$ (`pred == None`).
+///
+/// # Backward Inductive Recurrence
+///
+/// Given the scan position $P = \text{pos}$ at mismatch:
+///
+/// - **Base anchor**: $\text{anchor}_k = P$
+/// - **Head match $M_k$**: $\text{end}(M_k) = \text{anchor}_k - M_k.\text{gap}$, $\text{start}(M_k) = \text{end}(M_k) - M_k.\text{length}$
+/// - **Inductive step for $M_{i-1}$**: $\text{anchor}_{i-1} = \text{start}(M_i)$
+/// - **Predecessor match $M_{i-1}$**: $\text{end}(M_{i-1}) = \text{anchor}_{i-1} - M_{i-1}.\text{gap}$, $\text{start}(M_{i-1}) = \text{end}(M_{i-1}) - M_{i-1}.\text{length}$
+///
+/// Matches are pushed in reverse chronological order ($M_k, M_{k-1}, \dots, M_1$),
+/// so the earliest match $M_1$ sits at the top of the LIFO stack in `buf` and is popped first.
+impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
+where
+    P: AsRef<str>,
+    V: Copy,
+{
+    type Item = Match<V>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pma.prefilter.is_some() && self.gate.is_enabled() {
+            self.next_impl::<true>()
+        } else {
+            self.next_impl::<false>()
+        }
     }
 }
 
