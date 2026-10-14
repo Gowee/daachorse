@@ -748,12 +748,10 @@ where
             loop {
                 if let Some(child) = self.pma.child_state(self.state_id, mapped_c) {
                     self.state_id = child;
-                    self.pos += char_len;
                     break;
                 }
 
                 if self.state_id == ROOT_STATE_IDX {
-                    self.pos += char_len;
                     break;
                 }
 
@@ -766,6 +764,8 @@ where
                     return self.buf.pop();
                 }
             }
+
+            self.pos += char_len;
         }
 
         // EOF handling: Flush any pending committed matches in the suffix chain
