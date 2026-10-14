@@ -645,6 +645,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             pos: 0,
             state_id: ROOT_STATE_IDX,
             buf: Vec::new(),
+            gate: PrefilterGate::new(),
         }
     }
 
