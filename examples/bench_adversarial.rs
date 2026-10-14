@@ -59,7 +59,7 @@ fn bench_case(case_name: &str, patterns: &[&str], haystack: &str, iters: usize) 
         let _ = pma_linear.leftmost_longest_find_iter(haystack).count();
     }
 
-    // Measure Linear Semi-DFA
+    // Measure Zero-Rewind Leftmost-Longest
     let t0 = Instant::now();
     let mut count_linear = 0;
     for _ in 0..iters {

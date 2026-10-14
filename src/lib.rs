@@ -349,7 +349,7 @@ where
 
 /// An output node used in leftmost-longest matching with gap chaining.
 ///
-/// In prefix-committed semi-DFA execution, each state commits a sequence of non-overlapping
+/// In zero-rewind leftmost-longest matching, each state commits a sequence of non-overlapping
 /// matches `[M_1, M_2, ..., M_k]`. These matches are linked in reverse chronological order
 /// (`M_k -> M_{k-1} -> ... -> M_1`) via `pred`.
 ///
@@ -536,7 +536,7 @@ pub enum MatchKind {
     /// reported.
     LeftmostFirst = 2,
 
-    /// Experimental leftmost-longest match semantics using prefix-committed semi-DFA with gap chaining.
+    /// Experimental leftmost-longest match semantics using a zero-rewind automaton with delta-encoded match chains.
     ///
     /// This enables [`leftmost_longest_find_iter()`](CharwiseDoubleArrayAhoCorasick::leftmost_longest_find_iter()),
     /// executing single-pass forward streaming matching in guaranteed $O(N)$ worst-case time without

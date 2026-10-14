@@ -328,7 +328,6 @@ where
                 .is_empty(),
             "Error: empty pattern is not supported for MatchKind::LeftmostLongestExperimental"
         );
-        // TODO: choose an universal set of glossry to describe our implementation consistently, say pending suffix? committed prefix? Better ones?
         let num_states = self.states.len();
         let mut q = Vec::with_capacity(num_states);
         let mut parents = vec![ROOT_STATE_ID; num_states];
@@ -360,11 +359,11 @@ where
         // Reusable scratch buffer for harvesting matches during failure fallback walks.
         let mut scratch_buffer = Vec::new();
 
-        // Stage 2: Resolving Active Candidate Fail Transitions and Committed Match Chains.
+        // Stage 2: Resolving Active Suffix Fail Transitions and Committed Match Chains.
         for &state_id in &q[1..] {
             // Fast Path: Root-Covered Pattern (Barrier Reset).
             // If `state_id` itself is a complete pattern from ROOT, under leftmost-longest priority
-            // it supersedes any candidate fallback. `fail` is reset to ROOT and `gap` is 0.
+            // it supersedes any suffix fallback. `fail` is reset to ROOT and `gap` is 0.
             if let Some(&pat) = self.states[state_id as usize].output.first() {
                 let emit = Emit::from_output(pat, 0, None);
                 self.states[state_id as usize]
@@ -387,9 +386,9 @@ where
 
             let mut chain = EmitChain::new(initial_head);
 
-            // 1. Failure Path Walk & Candidate Match Harvesting:
-            // When an active candidate `curr = fail(parent_id)` cannot transition on `ch`,
-            // its pattern pursuit has failed. Any pre-committed non-overlapping matches
+            // 1. Failure Path Walk & Prefix Match Harvesting:
+            // When an active suffix `curr = fail(parent_id)` cannot transition on `ch`,
+            // its branch has failed. Any pre-committed non-overlapping matches
             // along `curr`'s prefix are appended onto `chain`.
             let mut curr = self.states[parent_id as usize].fail.get();
             let mut next_child = Self::child_id_from_states(&self.states, curr, ch);
@@ -397,7 +396,7 @@ where
                 if let Some(curr_head) = self.states[curr as usize].output_pos.get() {
                     scratch_buffer.clear();
                     scratch_buffer.extend(store.iter_chain(curr_head));
-                    // Candidate suffix from curr ended at P; advance its head gap by |c| to align with S:
+                    // Matches along curr's prefix ended at P; advance the head gap by |c| to align with S:
                     scratch_buffer[0] = scratch_buffer[0].with_incremented_gap(ch.num_bytes());
                     chain.extend_from(&scratch_buffer, &mut store);
                 }
@@ -405,12 +404,12 @@ where
                 next_child = Self::child_id_from_states(&self.states, curr, ch);
             }
 
-            // 2. Active Candidate Transition & Leaf Match Decision:
+            // 2. Active Suffix Transition & Leaf Match Decision:
             let mut fail_state = ROOT_STATE_ID;
             if parent_id != ROOT_STATE_ID {
                 if let Some(child_id) = next_child {
                     if !self.states[child_id as usize].edges.is_empty() {
-                        // Extend active candidate along child.
+                        // Extend active suffix along child.
                         fail_state = child_id;
                     } else {
                         // Suffix completes a leaf pattern at the very end of `state_id`.

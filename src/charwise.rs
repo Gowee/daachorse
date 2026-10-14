@@ -590,8 +590,8 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 
     /// Returns an iterator of non-overlapping leftmost-longest matches in the input text.
     ///
-    /// This method uses a zero-rewind forward-only stream matching algorithm based on a
-    /// prefix-committed semi-DFA with gap chaining, guaranteeing worst-case linear time $O(N)$
+    /// This method uses a zero-rewind forward-only stream matching algorithm with reverse
+    /// delta-encoded match chains, guaranteeing worst-case linear time $O(N)$
     /// over the text length.
     ///
     /// # Arguments
