@@ -727,6 +727,20 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
 ///
 /// Matches are pushed in reverse chronological order ($M_k, M_{k-1}, \dots, M_1$),
 /// so the earliest match $M_1$ sits at the top of the LIFO stack in `buf` and is popped first.
+impl<P, V> LeftmostFindIteratorExperimental<'_, P, V>
+where
+    P: AsRef<str>,
+    V: Copy,
+{
+    #[inline(always)]
+    fn flush_emits(&mut self, ep: NonZeroU32, pos: usize, state_id: u32) -> Option<Match<V>> {
+        self.buf.extend(self.pma.iter_emits(ep, pos));
+        self.pos = pos;
+        self.state_id = state_id;
+        self.buf.pop()
+    }
+}
+
 impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
 where
     P: AsRef<str>,
@@ -743,9 +757,6 @@ where
 
         let bytes = self.haystack.as_ref().as_bytes();
         let text_len = bytes.len();
-        let states = self.pma.states.as_slice();
-        let states_len = states.len();
-
         let mut pos = self.pos;
         let mut state_id = self.state_id;
 
@@ -762,29 +773,18 @@ where
 
             // State Traversal & Failure Path Resolution
             loop {
-                if let Some(code) = mapped_c {
-                    if let Some(base) = unsafe { states.get_unchecked(state_id as usize).base() } {
-                        let child_idx = (base.get() ^ code) as usize;
-                        if child_idx < states_len
-                            && unsafe { states.get_unchecked(child_idx).check() } == state_id
-                        {
-                            state_id = child_idx as u32;
-                            pos += char_len;
-                            break;
-                        }
-                    }
+                if let Some(child) = self.pma.child_state(state_id, mapped_c) {
+                    state_id = child;
+                    pos += char_len;
+                    break;
                 }
 
                 // Mismatch: Follow failure transition and commit prefix matches if any
-                let emit_pos = unsafe { states.get_unchecked(state_id as usize).output_pos() };
-                let target_state = unsafe { states.get_unchecked(state_id as usize).fail() };
+                let (target_state, emit_pos) = self.pma.step_fail(state_id);
                 state_id = target_state;
 
                 if let Some(ep) = emit_pos {
-                    self.buf.extend(self.pma.iter_emits(ep, pos));
-                    self.pos = pos;
-                    self.state_id = state_id;
-                    return self.buf.pop();
+                    return self.flush_emits(ep, pos, state_id);
                 }
 
                 if state_id == ROOT_STATE_IDX {
@@ -795,14 +795,10 @@ where
 
         // EOF handling: Flush any pending committed matches in the suffix chain
         while state_id != ROOT_STATE_IDX {
-            let emit_pos = unsafe { states.get_unchecked(state_id as usize).output_pos() };
-            let target_state = unsafe { states.get_unchecked(state_id as usize).fail() };
+            let (target_state, emit_pos) = self.pma.step_fail(state_id);
             state_id = target_state;
             if let Some(ep) = emit_pos {
-                self.buf.extend(self.pma.iter_emits(ep, pos));
-                self.pos = pos;
-                self.state_id = state_id;
-                return self.buf.pop();
+                return self.flush_emits(ep, pos, state_id);
             }
         }
 
