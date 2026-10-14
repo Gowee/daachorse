@@ -258,8 +258,8 @@ use alloc::vec::Vec;
 
 pub use crate::bytewise::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
 pub use crate::charwise::{
-    CharwiseDoubleArrayAhoCorasick, CharwiseDoubleArrayAhoCorasickBuilder,
-    LeftmostLongestFindIterator,
+    CharwiseDoubleArrayAhoCorasick, CharwiseDoubleArrayAhoCorasickBuilder, LeftmostFindIterator,
+    LeftmostFindIteratorExperimental, LeftmostLongestFindIterator,
 };
 use crate::errors::DaachorseError;
 pub use crate::errors::Result;
@@ -538,10 +538,17 @@ pub enum MatchKind {
 
     /// Experimental leftmost-longest match semantics using a zero-rewind automaton with delta-encoded match chains.
     ///
-    /// This enables [`leftmost_longest_find_iter()`](CharwiseDoubleArrayAhoCorasick::leftmost_longest_find_iter()),
+    /// This enables [`leftmost_find_iter_experimental()`](CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()),
     /// executing single-pass forward streaming matching in guaranteed $O(N)$ worst-case time without
     /// text rewinding or backtracking. Note that empty patterns `""` are not supported.
     LeftmostLongestExperimental = 3,
+
+    /// Experimental leftmost-first match semantics using a zero-rewind automaton with delta-encoded match chains.
+    ///
+    /// This enables [`leftmost_find_iter_experimental()`](CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()),
+    /// executing single-pass forward streaming matching in guaranteed $O(N)$ worst-case time without
+    /// text rewinding or backtracking. Note that empty patterns `""` are not supported.
+    LeftmostFirstExperimental = 4,
 }
 
 impl MatchKind {
@@ -553,10 +560,15 @@ impl MatchKind {
         self == Self::LeftmostFirst
             || self == Self::LeftmostLongest
             || self == Self::LeftmostLongestExperimental
+            || self == Self::LeftmostFirstExperimental
     }
 
     pub(crate) fn is_leftmost_first(self) -> bool {
-        self == Self::LeftmostFirst
+        self == Self::LeftmostFirst || self == Self::LeftmostFirstExperimental
+    }
+
+    pub(crate) fn is_experimental(self) -> bool {
+        self == Self::LeftmostLongestExperimental || self == Self::LeftmostFirstExperimental
     }
 }
 
@@ -566,6 +578,7 @@ impl From<u8> for MatchKind {
             1 => Self::LeftmostLongest,
             2 => Self::LeftmostFirst,
             3 => Self::LeftmostLongestExperimental,
+            4 => Self::LeftmostFirstExperimental,
             _ => Self::Standard,
         }
     }
@@ -578,6 +591,7 @@ impl From<MatchKind> for u8 {
             MatchKind::LeftmostLongest => 1,
             MatchKind::LeftmostFirst => 2,
             MatchKind::LeftmostLongestExperimental => 3,
+            MatchKind::LeftmostFirstExperimental => 4,
         }
     }
 }

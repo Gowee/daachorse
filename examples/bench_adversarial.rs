@@ -32,7 +32,7 @@ fn bench_case(case_name: &str, patterns: &[&str], haystack: &str, iters: usize) 
         .map(|m| (m.start(), m.end(), m.value()))
         .collect();
     let matches_linear: Vec<_> = pma_linear
-        .leftmost_longest_find_iter(haystack)
+        .leftmost_find_iter_experimental(haystack)
         .map(|m| (m.start(), m.end(), m.value()))
         .collect();
 
@@ -56,14 +56,14 @@ fn bench_case(case_name: &str, patterns: &[&str], haystack: &str, iters: usize) 
     // Warm-up
     for _ in 0..2 {
         let _ = pma_legacy.leftmost_find_iter(haystack).count();
-        let _ = pma_linear.leftmost_longest_find_iter(haystack).count();
+        let _ = pma_linear.leftmost_find_iter_experimental(haystack).count();
     }
 
     // Measure Zero-Rewind Leftmost-Longest
     let t0 = Instant::now();
     let mut count_linear = 0;
     for _ in 0..iters {
-        count_linear += pma_linear.leftmost_longest_find_iter(haystack).count();
+        count_linear += pma_linear.leftmost_find_iter_experimental(haystack).count();
     }
     let dur_linear = t0.elapsed();
     assert_eq!(count_linear, matches_linear.len() * iters);

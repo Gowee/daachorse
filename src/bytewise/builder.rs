@@ -327,8 +327,8 @@ impl DoubleArrayAhoCorasickBuilder {
         let q = match self.match_kind {
             MatchKind::Standard => nfa.build_fails(),
             MatchKind::LeftmostLongest | MatchKind::LeftmostFirst => nfa.build_fails_leftmost(),
-            MatchKind::LeftmostLongestExperimental => {
-                unimplemented!("MatchKind::LeftmostLongestExperimental is currently only implemented for CharwiseDoubleArrayAhoCorasick")
+            MatchKind::LeftmostLongestExperimental | MatchKind::LeftmostFirstExperimental => {
+                unimplemented!("Experimental leftmost matching is currently only implemented for CharwiseDoubleArrayAhoCorasick")
             }
         };
         nfa.build_outputs(&q);
