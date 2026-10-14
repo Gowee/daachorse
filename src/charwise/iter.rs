@@ -713,12 +713,6 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     // When an empty pattern is present, this flag suppresses emitting a zero-length match
     // at the boundary immediately following a committed non-empty match.
     pub(crate) skip_empty: bool,
-
-    // Starting text offset of the current speculative branch originating from ROOT.
-    // If the branch fails down to ROOT without committing any non-empty match,
-    // this offset allows recovering all intermediate unconsumed character boundaries
-    // as empty pattern matches without rewinding the text scanning pointer.
-    pub(crate) branch_start: usize,
 }
 
 impl<P, V> LeftmostFindIteratorExperimental<'_, P, V>
@@ -741,6 +735,8 @@ where
         } else {
             None
         };
+
+        let mut branch_start = self.pos;
 
         while self.pos < bytes.len() {
             if let Some(pf) = prefilter {
@@ -765,7 +761,7 @@ where
                 if let Some(child) = self.pma.child_state(self.state_id, mapped_c) {
                     // Entering a candidate branch from ROOT; record the branch origin.
                     if self.state_id == ROOT_STATE_IDX {
-                        self.branch_start = self.pos;
+                        branch_start = self.pos;
                     }
                     self.state_id = child;
                     break;
@@ -784,11 +780,10 @@ where
                             debug_assert_eq!(emit.gap, 0);
                             debug_assert!(emit.pred.is_none());
                             self.pos += char_len;
-                            self.branch_start = self.pos;
                             return Some(emit.to_match(self.pos - char_len));
                         }
                     }
-                    self.branch_start = self.pos + char_len;
+                    branch_start = self.pos + char_len;
                     break;
                 }
 
@@ -800,7 +795,6 @@ where
                 if let Some(ep) = emit_pos {
                     self.skip_empty = true;
                     self.buf.extend(self.pma.iter_emits(ep, self.pos));
-                    self.branch_start = self.pos;
                     return self.buf.pop();
                 }
 
@@ -815,26 +809,24 @@ where
                         debug_assert_eq!(emit.length, 0);
                         debug_assert_eq!(emit.gap, 0);
                         debug_assert!(emit.pred.is_none());
-                        debug_assert!(self.branch_start <= self.pos);
+                        debug_assert!(branch_start <= self.pos);
                         let buf_start = self.buf.len();
                         for (offset, _) in
-                            unsafe { haystack.get_unchecked(self.branch_start..self.pos) }
-                                .char_indices()
+                            unsafe { haystack.get_unchecked(branch_start..self.pos) }.char_indices()
                         {
-                            let boundary = self.branch_start + offset;
+                            let boundary = branch_start + offset;
                             if self.skip_empty {
                                 self.skip_empty = false;
                             } else {
                                 self.buf.push(emit.to_match(boundary));
                             }
                         }
-                        self.branch_start = self.pos;
                         if self.buf.len() > buf_start {
                             self.buf[buf_start..].reverse();
                             return self.buf.pop();
                         }
                     }
-                    self.branch_start = self.pos;
+                    branch_start = self.pos;
                 }
             }
 
@@ -854,7 +846,6 @@ where
             if let Some(ep) = emit_pos {
                 self.skip_empty = true;
                 self.buf.extend(self.pma.iter_emits(ep, self.pos));
-                self.branch_start = self.pos;
                 return self.buf.pop();
             }
         }
@@ -867,12 +858,12 @@ where
             debug_assert_eq!(emit.length, 0);
             debug_assert_eq!(emit.gap, 0);
             debug_assert!(emit.pred.is_none());
-            debug_assert!(self.branch_start <= self.pos);
+            debug_assert!(branch_start <= self.pos);
             let buf_start = self.buf.len();
             for (offset, _) in
-                unsafe { haystack.get_unchecked(self.branch_start..self.pos) }.char_indices()
+                unsafe { haystack.get_unchecked(branch_start..self.pos) }.char_indices()
             {
-                let boundary = self.branch_start + offset;
+                let boundary = branch_start + offset;
                 if self.skip_empty {
                     self.skip_empty = false;
                 } else {
