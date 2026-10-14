@@ -742,60 +742,51 @@ where
         }
 
         let bytes = self.haystack.as_ref().as_bytes();
-        let text_len = bytes.len();
-        let mut pos = self.pos;
-        let mut state_id = self.state_id;
 
-        while pos < text_len {
-            let (c, char_len) = unsafe { decode_char_unchecked(bytes, pos) };
+        while self.pos < bytes.len() {
+            let (c, char_len) = unsafe { decode_char_unchecked(bytes, self.pos) };
             let mapped_c = self.pma.mapper.get(c);
 
             // Fast Root Path: Scanning while at ROOT
-            if state_id == ROOT_STATE_IDX {
-                state_id = self.pma.step_root(mapped_c);
-                pos += char_len;
+            if self.state_id == ROOT_STATE_IDX {
+                self.state_id = self.pma.step_root(mapped_c);
+                self.pos += char_len;
                 continue;
             }
 
             // State Traversal & Failure Path Resolution
             loop {
-                if let Some(child) = self.pma.child_state(state_id, mapped_c) {
-                    state_id = child;
-                    pos += char_len;
+                if let Some(child) = self.pma.child_state(self.state_id, mapped_c) {
+                    self.state_id = child;
+                    self.pos += char_len;
                     break;
                 }
 
                 // Mismatch: Follow failure transition and commit prefix matches if any
-                let state = unsafe { self.pma.states.get_unchecked(state_id as usize) };
-                state_id = state.fail();
+                let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
+                self.state_id = state.fail();
 
                 if let Some(ep) = state.output_pos() {
-                    self.buf.extend(self.pma.iter_emits(ep, pos));
-                    self.pos = pos;
-                    self.state_id = state_id;
+                    self.buf.extend(self.pma.iter_emits(ep, self.pos));
                     return self.buf.pop();
                 }
 
-                if state_id == ROOT_STATE_IDX {
+                if self.state_id == ROOT_STATE_IDX {
                     break;
                 }
             }
         }
 
         // EOF handling: Flush any pending committed matches in the suffix chain
-        while state_id != ROOT_STATE_IDX {
-            let state = unsafe { self.pma.states.get_unchecked(state_id as usize) };
-            state_id = state.fail();
+        while self.state_id != ROOT_STATE_IDX {
+            let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
+            self.state_id = state.fail();
             if let Some(ep) = state.output_pos() {
-                self.buf.extend(self.pma.iter_emits(ep, pos));
-                self.pos = pos;
-                self.state_id = state_id;
+                self.buf.extend(self.pma.iter_emits(ep, self.pos));
                 return self.buf.pop();
             }
         }
 
-        self.pos = pos;
-        self.state_id = state_id;
         None
     }
 }
