@@ -375,7 +375,9 @@ where
             }
 
             // Universal Recurrence System:
-            // S = P · c inherits P's in-flight head match with gap advanced by |c|.
+            // S = P · c inherits P's in-flight head match.
+            // Note: We maintain the chain head's gap directly against the state's byte depth.
+            // Advancing from P to S via `ch` increments the trailing gap by |c| bytes.
             let parent_id = parents[state_id as usize];
             let ch = edge_labels[state_id as usize].unwrap();
             let initial_head = self.states[parent_id as usize]
@@ -395,6 +397,7 @@ where
                 if let Some(curr_head) = self.states[curr as usize].output_pos.get() {
                     scratch_buffer.clear();
                     scratch_buffer.extend(store.iter_chain(curr_head));
+                    // Candidate suffix from curr ended at P; advance its head gap by |c| to align with S:
                     scratch_buffer[0] = scratch_buffer[0].with_incremented_gap(ch.num_bytes());
                     chain.extend_from(&scratch_buffer, &mut store);
                 }
@@ -587,6 +590,20 @@ where
 /// Tracks the in-flight head match whose trailing gap is maintained relative to the current state.
 /// Inter-match gaps and candidate suffix links are computed purely via relative delta offsets,
 /// with zero absolute coordinates or depth arrays.
+///
+/// # Invariant: Head Gap Maintained Against State Byte Depth
+///
+/// At all times during the processing of state $S$, `chain.head.gap` represents the distance from
+/// the **state's byte depth** (the end of state $S$'s prefix path from ROOT) to the end of the head match.
+///
+/// - **Transition Advance**: When extending from parent state $P$ to child state $S = P \cdot c$, the state
+///   byte depth advances by $|c|$. Therefore, the inherited head's trailing gap is advanced by $|c|$
+///   (`with_incremented_gap(c.num_bytes())`) before initializing `chain`.
+/// - **Candidate Suffix Splicing**: Matches harvested from candidate suffix $curr = \text{fail}(P)$ also
+///   originally ended at $P$'s boundary. Advancing $M_k\text{.gap}$ by $|c|$ brings it into alignment with $S$.
+/// - **O(1) Finalization**: Because `head.gap` is kept continuously synchronized with the current state's
+///   byte depth, `finish()` commits the in-flight head directly into `EmitStore` without any coordinate
+///   calculations or depth lookups.
 #[derive(Clone, Copy, Debug)]
 struct EmitChain<V> {
     head: Option<Emit<V>>,
