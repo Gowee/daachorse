@@ -1330,9 +1330,8 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         let code = mapped_c?;
         let base = unsafe { self.states.get_unchecked(state_id as usize).base()? };
         let child_idx = (base.get() ^ code) as usize;
-        if child_idx < self.states.len()
-            && unsafe { self.states.get_unchecked(child_idx).check() } == state_id
-        {
+        let child = self.states.get(child_idx)?;
+        if child.check() == state_id {
             Some(child_idx as u32)
         } else {
             None
