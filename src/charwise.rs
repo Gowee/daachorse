@@ -1346,24 +1346,21 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 
     /// Reconstructs match spans from a reverse-linked chain of [`Emit`] nodes onto `buf`.
     #[inline(always)]
-    pub(crate) fn extract_emits(&self, head_pos: u32, pos: usize, buf: &mut Vec<Match<V>>)
-    where
+    pub(crate) fn extract_emits(
+        &self,
+        head_pos: NonZeroU32,
+        mut anchor: usize,
+        buf: &mut Vec<Match<V>>,
+    ) where
         V: Copy,
     {
-        let first_emit = unsafe { self.emits.get_unchecked(head_pos as usize - 1) };
-        let end = pos - first_emit.gap as usize;
-        let start = end - first_emit.length as usize;
-        buf.push(first_emit.to_match(end));
-
-        let mut last_start = start;
-        let mut curr_pos = first_emit.pred;
-        while let Some(pred) = curr_pos {
-            let em = unsafe { self.emits.get_unchecked(pred.get() as usize - 1) };
-            let end = last_start - em.gap as usize;
-            let start = end - em.length as usize;
+        let mut curr = Some(head_pos);
+        while let Some(idx) = curr {
+            let em = unsafe { self.emits.get_unchecked(idx.get() as usize - 1) };
+            let end = anchor - em.gap as usize;
+            anchor = end - em.length as usize;
             buf.push(em.to_match(end));
-            last_start = start;
-            curr_pos = em.pred;
+            curr = em.pred;
         }
     }
 
