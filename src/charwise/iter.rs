@@ -764,9 +764,9 @@ where
                 }
 
                 // Mismatch: Follow failure transition and commit prefix matches if any
-                let curr_state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
-                let emit_pos = curr_state.output_pos();
-                self.state_id = curr_state.fail();
+                let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
+                let emit_pos = state.output_pos();
+                self.state_id = state.fail();
 
                 if let Some(ep) = emit_pos {
                     self.buf.extend(self.pma.iter_emits(ep, self.pos));
@@ -778,14 +778,14 @@ where
         }
 
         // EOF handling: Drain in-flight active suffixes along the failure chain.
-        // Even after `curr_state` emits its locked prefix matches (or if it has none),
+        // Even after `state` emits its locked prefix matches (or if it has none),
         // its active suffix `fail(S)` represents trailing text waiting for extensions
         // that never arrived. Draining the failure chain to ROOT flushes any pending
         // non-overlapping matches residing in those in-flight suffix states.
         while self.state_id != ROOT_STATE_IDX {
-            let curr_state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
-            let emit_pos = curr_state.output_pos();
-            self.state_id = curr_state.fail();
+            let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
+            let emit_pos = state.output_pos();
+            self.state_id = state.fail();
 
             if let Some(ep) = emit_pos {
                 self.buf.extend(self.pma.iter_emits(ep, self.pos));
