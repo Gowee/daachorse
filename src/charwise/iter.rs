@@ -716,6 +716,9 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
 
     // Monotonically advancing text cursor tracking the next character boundary for epsilon emission.
     pub(crate) epsilon_cursor: usize,
+
+    // Staged non-empty match waiting to be emitted after preceding gaps are filled.
+    pub(crate) pending: Option<Match<V>>,
 }
 
 impl<P, V> LeftmostFindIteratorExperimental<'_, P, V>
@@ -723,8 +726,17 @@ where
     P: AsRef<str>,
     V: Copy,
 {
+    /// Inner scanning engine for non-empty pattern matches.
+    ///
+    /// This function performs the core linear-time leftmost pattern matching over the
+    /// automaton, completely free of zero-length / epsilon handling logic.
     #[inline(always)]
-    fn next_impl<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
+    fn next_non_empty<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
+        // Yield ready matches from the stack in chronological order
+        if let Some(m) = self.buf.pop() {
+            return Some(m);
+        }
+
         let haystack = self.haystack.as_ref();
         let bytes = haystack.as_bytes();
 
@@ -734,75 +746,88 @@ where
             None
         };
 
-        // 1. Scan forward if we need more matches
-        if self.buf.is_empty() && self.pos < bytes.len() {
-            'scan: while self.pos < bytes.len() {
-                if let Some(pf) = prefilter {
-                    if self.state_id == ROOT_STATE_IDX {
-                        let candidate_pos = pf.next_position_at_char_boundary(haystack, self.pos);
-                        self.gate.record(candidate_pos - self.pos);
-                        self.pos = candidate_pos;
-                        if !self.gate.is_enabled() {
-                            prefilter = None;
-                        }
-                        if self.pos >= bytes.len() {
-                            break;
-                        }
+        while self.pos < bytes.len() {
+            if let Some(pf) = prefilter {
+                if self.state_id == ROOT_STATE_IDX {
+                    let candidate_pos = pf.next_position_at_char_boundary(haystack, self.pos);
+                    self.gate.record(candidate_pos - self.pos);
+                    self.pos = candidate_pos;
+                    if !self.gate.is_enabled() {
+                        prefilter = None;
                     }
-                }
-
-                let (c, char_len) = unsafe { decode_char_unchecked(bytes, self.pos) };
-                let mapped_c = self.pma.mapper.get(c);
-
-                loop {
-                    if let Some(child) = self.pma.child_state(self.state_id, mapped_c) {
-                        self.state_id = child;
+                    if self.pos >= bytes.len() {
                         break;
                     }
-
-                    if self.state_id == ROOT_STATE_IDX {
-                        break;
-                    }
-
-                    let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
-                    let emit_pos = state.output_pos();
-                    self.state_id = state.fail();
-
-                    if let Some(ep) = emit_pos {
-                        self.buf.extend(self.pma.iter_emits(ep, self.pos));
-                        break 'scan;
-                    }
                 }
-
-                self.pos += char_len;
             }
-        }
 
-        // 2. Drain active suffix at EOF if no matches ready
-        if self.buf.is_empty() && self.pos >= bytes.len() {
-            while self.state_id != ROOT_STATE_IDX {
+            let (c, char_len) = unsafe { decode_char_unchecked(bytes, self.pos) };
+            let mapped_c = self.pma.mapper.get(c);
+
+            loop {
+                if let Some(child) = self.pma.child_state(self.state_id, mapped_c) {
+                    self.state_id = child;
+                    break;
+                }
+
+                if self.state_id == ROOT_STATE_IDX {
+                    break;
+                }
+
                 let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
                 let emit_pos = state.output_pos();
                 self.state_id = state.fail();
 
                 if let Some(ep) = emit_pos {
                     self.buf.extend(self.pma.iter_emits(ep, self.pos));
-                    break;
+                    return self.buf.pop();
                 }
+            }
+
+            self.pos += char_len;
+        }
+
+        // EOF handling: Drain in-flight active suffixes along the failure chain.
+        while self.state_id != ROOT_STATE_IDX {
+            let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
+            let emit_pos = state.output_pos();
+            self.state_id = state.fail();
+
+            if let Some(ep) = emit_pos {
+                self.buf.extend(self.pma.iter_emits(ep, self.pos));
+                return self.buf.pop();
             }
         }
 
-        // 3. Fast Path: No empty pattern in dictionary
-        let Some(ep) = self.epsilon_emit_pos else {
-            return self.buf.pop();
-        };
+        None
+    }
 
-        // 4. Epsilon Emission: Fill gaps before next non-empty match (or EOF).
-        // `self.buf` is a LIFO stack where `buf.last()` is the chronologically earliest
-        // non-empty match. Any text boundaries between `epsilon_cursor` and `target`
-        // represent unconsumed text where the empty pattern matches.
-        let target = self.buf.last().map_or(bytes.len(), |m| m.start());
+    /// Dispatches non-empty matching based on active prefilter status.
+    #[inline(always)]
+    fn next_non_empty_dispatch(&mut self) -> Option<Match<V>> {
+        if self.pma.prefilter.is_some() && self.gate.is_enabled() {
+            self.next_non_empty::<true>()
+        } else {
+            self.next_non_empty::<false>()
+        }
+    }
 
+    /// Wrapper interpolating zero-length matches ("") into the unconsumed text gaps
+    /// between consecutive non-empty matches and at text boundaries.
+    #[inline(always)]
+    fn next_with_epsilon(&mut self, ep: NonZeroU32) -> Option<Match<V>> {
+        if self.pending.is_none()
+            && (self.pos < self.haystack.as_ref().len()
+                || !self.buf.is_empty()
+                || self.state_id != ROOT_STATE_IDX)
+        {
+            self.pending = self.next_non_empty_dispatch();
+        }
+
+        let bytes = self.haystack.as_ref().as_bytes();
+        let target = self.pending.as_ref().map_or(bytes.len(), |m| m.start());
+
+        // Emit unconsumed boundaries before the non-empty match (or EOF)
         if self.epsilon_cursor < target {
             if self.skip_empty {
                 self.skip_empty = false;
@@ -821,14 +846,14 @@ where
             }
         }
 
-        // Emit the ready non-empty match when the cursor reaches its start position.
-        if let Some(m) = self.buf.pop() {
+        // Emit the ready non-empty match when the cursor reaches its start position
+        if let Some(m) = self.pending.take() {
             self.skip_empty = true;
             self.epsilon_cursor = m.end();
             return Some(m);
         }
 
-        // Emit the boundary at EOF if not suppressed by an immediately preceding match.
+        // Emit trailing boundary at EOF if not suppressed by an immediately preceding match
         if !self.skip_empty {
             self.skip_empty = true;
             let emit = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
@@ -879,11 +904,11 @@ where
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pma.prefilter.is_some() && self.gate.is_enabled() {
-            self.next_impl::<true>()
-        } else {
-            self.next_impl::<false>()
-        }
+        let Some(ep) = self.epsilon_emit_pos else {
+            return self.next_non_empty_dispatch();
+        };
+
+        self.next_with_epsilon(ep)
     }
 }
 

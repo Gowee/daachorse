@@ -718,7 +718,7 @@ fn test_experimental_empty_pattern_with_prefixes() {
     ] {
         let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
             .match_kind(match_kind)
-            .build(&["", "ab"])
+            .build(["", "ab"])
             .unwrap();
         let matches = get_match_triples(pma.leftmost_find_iter_experimental("").collect());
         assert_eq!(matches, &[(0, 0, 0)]);
@@ -735,7 +735,7 @@ fn test_experimental_empty_pattern_with_prefixes() {
 
         let pma_rev = CharwiseDoubleArrayAhoCorasickBuilder::new()
             .match_kind(match_kind)
-            .build(&["ab", ""])
+            .build(["ab", ""])
             .unwrap();
         let matches = get_match_triples(pma_rev.leftmost_find_iter_experimental("ab").collect());
         assert_eq!(matches, &[(0, 0, 2)]);
@@ -743,7 +743,7 @@ fn test_experimental_empty_pattern_with_prefixes() {
         // 3-char prefix with mismatch halfway
         let pma_abc = CharwiseDoubleArrayAhoCorasickBuilder::new()
             .match_kind(match_kind)
-            .build(&["", "abc"])
+            .build(["", "abc"])
             .unwrap();
         let matches = get_match_triples(pma_abc.leftmost_find_iter_experimental("ab").collect());
         assert_eq!(matches, &[(0, 0, 0), (0, 1, 1), (0, 2, 2)]);
@@ -751,7 +751,7 @@ fn test_experimental_empty_pattern_with_prefixes() {
         // Multi-byte UTF-8 test
         let pma_utf8 = CharwiseDoubleArrayAhoCorasickBuilder::new()
             .match_kind(match_kind)
-            .build(&["", "你好"])
+            .build(["", "你好"])
             .unwrap();
         let matches = get_match_triples(pma_utf8.leftmost_find_iter_experimental("你").collect());
         assert_eq!(matches, &[(0, 0, 0), (0, 3, 3)]);
