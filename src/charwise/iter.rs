@@ -804,12 +804,49 @@ where
             }
         }
     }
+}
 
-    /// Wrapper interpolating zero-length matches ("") into the unconsumed text gaps
-    /// between consecutive non-empty matches and at text boundaries.
-    #[inline]
-    fn next_with_epsilon(&mut self, ep: NonZeroU32) -> Option<Match<V>> {
+/// Reconstructs match spans from a reverse-linked chain of [`Emit`] nodes.
+///
+/// # Architecture and Invariants
+///
+/// During automaton construction, any prefix string $W$ that matches patterns
+/// decomposes into a sequence of non-overlapping committed matches:
+/// $M_1 \text{ (earliest)} \to M_2 \to \dots \to M_k \text{ (latest)}$,
+/// followed by an active in-flight suffix represented by `state.fail()`.
+///
+/// Because `state.output_pos()` stores matches occurring *before* the active suffix,
+/// any mismatch or EOF condition must also drain `state.fail()` to flush pending
+/// non-overlapping matches that reside inside the trailing active suffix.
+///
+/// In the emit pool, these matches are stored in reverse chronological order:
+/// `head` is $M_k$, which links via `pred` to $M_{k-1}$, and eventually to $M_1$ (`pred == None`).
+///
+/// # Backward Inductive Recurrence
+///
+/// Given the scan position $P = \text{pos}$ at mismatch:
+///
+/// - **Base anchor**: $\text{anchor}_k = P$
+/// - **Head match $M_k$**: $\text{end}(M_k) = \text{anchor}_k - M_k.\text{gap}$, $\text{start}(M_k) = \text{end}(M_k) - M_k.\text{length}$
+/// - **Inductive step for $M_{i-1}$**: $\text{anchor}_{i-1} = \text{start}(M_i)$
+/// - **Predecessor match $M_{i-1}$**: $\text{end}(M_{i-1}) = \text{anchor}_{i-1} - M_{i-1}.\text{gap}$, $\text{start}(M_{i-1}) = \text{end}(M_{i-1}) - M_{i-1}.\text{length}$
+///
+/// Matches are pushed in reverse chronological order ($M_k, M_{k-1}, \dots, M_1$),
+/// so the earliest match $M_1$ sits at the top of the LIFO stack in `buf` and is popped first.
+impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
+where
+    P: AsRef<str>,
+    V: Copy,
+{
+    type Item = Match<V>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
         self.ensure_buffered();
+
+        let Some(ep) = self.epsilon_emit_pos else {
+            return self.buf.pop();
+        };
 
         let bytes = self.haystack.as_ref().as_bytes();
         let target = self.buf.last().map_or(bytes.len(), |m| m.start());
@@ -849,51 +886,6 @@ where
 
         self.epsilon_emit_pos = None;
         None
-    }
-}
-
-/// Reconstructs match spans from a reverse-linked chain of [`Emit`] nodes.
-///
-/// # Architecture and Invariants
-///
-/// During automaton construction, any prefix string $W$ that matches patterns
-/// decomposes into a sequence of non-overlapping committed matches:
-/// $M_1 \text{ (earliest)} \to M_2 \to \dots \to M_k \text{ (latest)}$,
-/// followed by an active in-flight suffix represented by `state.fail()`.
-///
-/// Because `state.output_pos()` stores matches occurring *before* the active suffix,
-/// any mismatch or EOF condition must also drain `state.fail()` to flush pending
-/// non-overlapping matches that reside inside the trailing active suffix.
-///
-/// In the emit pool, these matches are stored in reverse chronological order:
-/// `head` is $M_k$, which links via `pred` to $M_{k-1}$, and eventually to $M_1$ (`pred == None`).
-///
-/// # Backward Inductive Recurrence
-///
-/// Given the scan position $P = \text{pos}$ at mismatch:
-///
-/// - **Base anchor**: $\text{anchor}_k = P$
-/// - **Head match $M_k$**: $\text{end}(M_k) = \text{anchor}_k - M_k.\text{gap}$, $\text{start}(M_k) = \text{end}(M_k) - M_k.\text{length}$
-/// - **Inductive step for $M_{i-1}$**: $\text{anchor}_{i-1} = \text{start}(M_i)$
-/// - **Predecessor match $M_{i-1}$**: $\text{end}(M_{i-1}) = \text{anchor}_{i-1} - M_{i-1}.\text{gap}$, $\text{start}(M_{i-1}) = \text{end}(M_{i-1}) - M_{i-1}.\text{length}$
-///
-/// Matches are pushed in reverse chronological order ($M_k, M_{k-1}, \dots, M_1$),
-/// so the earliest match $M_1$ sits at the top of the LIFO stack in `buf` and is popped first.
-impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
-where
-    P: AsRef<str>,
-    V: Copy,
-{
-    type Item = Match<V>;
-
-    #[inline(always)]
-    fn next(&mut self) -> Option<Self::Item> {
-        let Some(ep) = self.epsilon_emit_pos else {
-            self.ensure_buffered();
-            return self.buf.pop();
-        };
-
-        self.next_with_epsilon(ep)
     }
 }
 
