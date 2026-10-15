@@ -710,10 +710,6 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     // boundary unless covered or immediately followed by a non-empty match.
     pub(crate) epsilon_emit_pos: Option<NonZeroU32>,
 
-    // When an empty pattern is present, this flag suppresses emitting a zero-length match
-    // at the boundary immediately following a committed non-empty match.
-    pub(crate) skip_empty: bool,
-
     // Monotonically advancing text cursor tracking the next character boundary for epsilon emission.
     pub(crate) epsilon_cursor: usize,
 }
@@ -823,33 +819,30 @@ where
 
         // Emit unconsumed boundaries before the non-empty match (or EOF)
         if self.epsilon_cursor < target {
-            if self.skip_empty {
-                self.skip_empty = false;
-                let (_, char_len) = unsafe { decode_char_unchecked(bytes, self.epsilon_cursor) };
-                self.epsilon_cursor += char_len;
-            }
-            if self.epsilon_cursor < target {
-                let emit = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
-                debug_assert_eq!(emit.length, 0);
-                debug_assert_eq!(emit.gap, 0);
-                debug_assert!(emit.pred.is_none());
-                let end = self.epsilon_cursor;
-                let (_, char_len) = unsafe { decode_char_unchecked(bytes, self.epsilon_cursor) };
-                self.epsilon_cursor += char_len;
-                return Some(emit.to_match(end));
-            }
+            let emit = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
+            debug_assert_eq!(emit.length, 0);
+            debug_assert_eq!(emit.gap, 0);
+            debug_assert!(emit.pred.is_none());
+            let end = self.epsilon_cursor;
+            let (_, char_len) = unsafe { decode_char_unchecked(bytes, self.epsilon_cursor) };
+            self.epsilon_cursor += char_len;
+            return Some(emit.to_match(end));
         }
 
         // Cursor reached target: emit the ready non-empty match from the buffer
         if let Some(m) = self.buf.pop() {
-            self.skip_empty = true;
-            self.epsilon_cursor = m.end();
+            self.epsilon_cursor = if m.end() < bytes.len() {
+                let (_, char_len) = unsafe { decode_char_unchecked(bytes, m.end()) };
+                m.end() + char_len
+            } else {
+                usize::MAX
+            };
             return Some(m);
         }
 
         // Emit trailing boundary at EOF if not suppressed by an immediately preceding match
-        if !self.skip_empty {
-            self.skip_empty = true;
+        if self.epsilon_cursor <= bytes.len() {
+            self.epsilon_cursor = usize::MAX;
             let emit = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
             debug_assert_eq!(emit.length, 0);
             debug_assert_eq!(emit.gap, 0);
