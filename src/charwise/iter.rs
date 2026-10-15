@@ -814,7 +814,8 @@ where
 
     /// Wrapper interpolating zero-length matches ("") into the unconsumed text gaps
     /// between consecutive non-empty matches and at text boundaries.
-    #[inline(always)]
+    #[cold]
+    #[inline(never)]
     fn next_with_epsilon(&mut self, ep: NonZeroU32) -> Option<Match<V>> {
         if self.pending.is_none()
             && (self.pos < self.haystack.as_ref().len()
