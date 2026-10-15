@@ -713,9 +713,6 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
 
     // Monotonically advancing text cursor tracking the next character boundary for epsilon emission.
     pub(crate) epsilon_cursor: usize,
-
-    // Staged non-empty match waiting to be emitted after preceding gaps are filled.
-    pub(crate) pending: Option<Match<V>>,
 }
 
 impl<P, V> LeftmostFindIteratorExperimental<'_, P, V>
@@ -723,15 +720,17 @@ where
     P: AsRef<str>,
     V: Copy,
 {
-    /// Core scanning engine for non-empty pattern matches.
+    /// Core scanning engine that advances the automaton forward until matches
+    /// are buffered into `self.buf` or EOF is reached.
     ///
     /// This function performs the core linear-time leftmost pattern matching over the
     /// automaton, completely free of zero-length / epsilon handling logic.
     #[inline(always)]
-    fn next_core<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
-        // Yield ready matches from the stack in chronological order
-        if let Some(m) = self.buf.pop() {
-            return Some(m);
+    fn scan_core<const FILTERED: bool>(&mut self) {
+        if !self.buf.is_empty()
+            || (self.pos >= self.haystack.as_ref().len() && self.state_id == ROOT_STATE_IDX)
+        {
+            return;
         }
 
         let haystack = self.haystack.as_ref();
@@ -777,7 +776,7 @@ where
 
                 if let Some(ep) = emit_pos {
                     self.buf.extend(self.pma.iter_emits(ep, self.pos));
-                    return self.buf.pop();
+                    return;
                 }
             }
 
@@ -792,20 +791,18 @@ where
 
             if let Some(ep) = emit_pos {
                 self.buf.extend(self.pma.iter_emits(ep, self.pos));
-                return self.buf.pop();
+                return;
             }
         }
-
-        None
     }
 
     /// Dispatches the core search engine based on active prefilter status.
     #[inline(always)]
-    fn next_core_maybe_prefiltered(&mut self) -> Option<Match<V>> {
+    fn scan_core_maybe_prefiltered(&mut self) {
         if self.pma.prefilter.is_some() && self.gate.is_enabled() {
-            self.next_core::<true>()
+            self.scan_core::<true>()
         } else {
-            self.next_core::<false>()
+            self.scan_core::<false>()
         }
     }
 
@@ -813,16 +810,12 @@ where
     /// between consecutive non-empty matches and at text boundaries.
     #[inline]
     fn next_with_epsilon(&mut self, ep: NonZeroU32) -> Option<Match<V>> {
-        if self.pending.is_none()
-            && (self.pos < self.haystack.as_ref().len()
-                || !self.buf.is_empty()
-                || self.state_id != ROOT_STATE_IDX)
-        {
-            self.pending = self.next_core_maybe_prefiltered();
+        if self.buf.is_empty() {
+            self.scan_core_maybe_prefiltered();
         }
 
         let bytes = self.haystack.as_ref().as_bytes();
-        let target = self.pending.as_ref().map_or(bytes.len(), |m| m.start());
+        let target = self.buf.last().map_or(bytes.len(), |m| m.start());
 
         // Emit unconsumed boundaries before the non-empty match (or EOF)
         if self.epsilon_cursor < target {
@@ -843,8 +836,8 @@ where
             }
         }
 
-        // Emit the ready non-empty match when the cursor reaches its start position
-        if let Some(m) = self.pending.take() {
+        // Cursor reached target: emit the ready non-empty match from the buffer
+        if let Some(m) = self.buf.pop() {
             self.skip_empty = true;
             self.epsilon_cursor = m.end();
             return Some(m);
@@ -902,7 +895,10 @@ where
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let Some(ep) = self.epsilon_emit_pos else {
-            return self.next_core_maybe_prefiltered();
+            if self.buf.is_empty() {
+                self.scan_core_maybe_prefiltered();
+            }
+            return self.buf.pop();
         };
 
         self.next_with_epsilon(ep)
