@@ -709,3 +709,52 @@ fn run_search_tests<F: FnMut(&SearchTest) -> Vec<Match<usize>>>(which: TestColle
         }
     }
 }
+
+#[test]
+fn test_experimental_empty_pattern_with_prefixes() {
+    for match_kind in [
+        MatchKind::LeftmostLongestExperimental,
+        MatchKind::LeftmostFirstExperimental,
+    ] {
+        let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(match_kind)
+            .build(&["", "ab"])
+            .unwrap();
+        let matches = get_match_triples(pma.leftmost_find_iter_experimental("").collect());
+        assert_eq!(matches, &[(0, 0, 0)]);
+
+        let matches = get_match_triples(pma.leftmost_find_iter_experimental("a").collect());
+        assert_eq!(matches, &[(0, 0, 0), (0, 1, 1)]);
+
+        let matches = get_match_triples(pma.leftmost_find_iter_experimental("ab").collect());
+        if match_kind == MatchKind::LeftmostLongestExperimental {
+            assert_eq!(matches, &[(1, 0, 2)]);
+        } else {
+            assert_eq!(matches, &[(0, 0, 0), (0, 1, 1), (0, 2, 2)]);
+        }
+
+        let pma_rev = CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(match_kind)
+            .build(&["ab", ""])
+            .unwrap();
+        let matches = get_match_triples(pma_rev.leftmost_find_iter_experimental("ab").collect());
+        assert_eq!(matches, &[(0, 0, 2)]);
+
+        // 3-char prefix with mismatch halfway
+        let pma_abc = CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(match_kind)
+            .build(&["", "abc"])
+            .unwrap();
+        let matches = get_match_triples(pma_abc.leftmost_find_iter_experimental("ab").collect());
+        assert_eq!(matches, &[(0, 0, 0), (0, 1, 1), (0, 2, 2)]);
+
+        // Multi-byte UTF-8 test
+        let pma_utf8 = CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(match_kind)
+            .build(&["", "你好"])
+            .unwrap();
+        let matches = get_match_triples(pma_utf8.leftmost_find_iter_experimental("你").collect());
+        assert_eq!(matches, &[(0, 0, 0), (0, 3, 3)]);
+    }
+}
+
