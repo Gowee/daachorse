@@ -640,7 +640,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             buf: Vec::new(),
             gate: PrefilterGate::new(),
             epsilon_emit_pos: self.states[usize::from_u32(ROOT_STATE_IDX)].output_pos(),
-            skip_empty: false,
             epsilon_cursor: 0,
         }
     }
