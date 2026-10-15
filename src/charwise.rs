@@ -1322,9 +1322,14 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     }
 
     /// Finds the child state transitioned from `state_id` on mapped character label `mapped_c`.
+    ///
+    /// # Safety
+    ///
+    /// `state_id` must be smaller than the length of `self.states`.
     #[inline(always)]
-    pub(crate) fn child_state(&self, state_id: u32, mapped_c: Option<u32>) -> Option<u32> {
+    pub(crate) unsafe fn child_state(&self, state_id: u32, mapped_c: Option<u32>) -> Option<u32> {
         let code = mapped_c?;
+        // SAFETY: caller guarantees state_id is smaller than self.states.len().
         let base = unsafe { self.states.get_unchecked(state_id as usize).base()? };
         let child_idx = (base.get() ^ code) as usize;
         let child = self.states.get(child_idx)?;
@@ -1337,8 +1342,36 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 
     /// Returns an iterator yielding matches from the reverse-linked [`Emit`] chain
     /// in reverse chronological order (head/latest to predecessor/earliest).
+    ///
+    /// # Architecture and Invariants
+    ///
+    /// During automaton construction, any prefix string $W$ that matches patterns
+    /// decomposes into a sequence of non-overlapping committed matches:
+    /// $M_1 \text{ (earliest)} \to M_2 \to \dots \to M_k \text{ (latest)}$,
+    /// followed by an active in-flight suffix represented by `state.fail()`.
+    ///
+    /// Because `state.output_pos()` stores matches occurring *before* the active suffix,
+    /// any mismatch or EOF condition must also drain `state.fail()` to flush pending
+    /// non-overlapping matches that reside inside the trailing active suffix.
+    ///
+    /// In the emit pool, these matches are stored in reverse chronological order:
+    /// `head` is $M_k$, which links via `pred` to $M_{k-1}$, and eventually to $M_1$ (`pred == None`).
+    ///
+    /// # Backward Inductive Recurrence
+    ///
+    /// Given the scan position $P = \text{pos}$ at mismatch:
+    ///
+    /// - **Base anchor**: $\text{anchor}_k = P$
+    /// - **Head match $M_k$**: $\text{end}(M_k) = \text{anchor}_k - M_k.\text{gap}$, $\text{start}(M_k) = \text{end}(M_k) - M_k.\text{length}$
+    /// - **Inductive step for $M_{i-1}$**: $\text{anchor}_{i-1} = \text{start}(M_i)$
+    /// - **Predecessor match $M_{i-1}$**: $\text{end}(M_{i-1}) = \text{anchor}_{i-1} - M_{i-1}.\text{gap}$, $\text{start}(M_{i-1}) = \text{end}(M_{i-1}) - M_{i-1}.\text{length}$
+    ///
+    /// # Safety
+    ///
+    /// - `head_pos` and all chained `pred` links must point to valid entries in `self.emits`.
+    /// - `anchor` must be greater than or equal to the total span length of the chain.
     #[inline(always)]
-    pub(crate) fn iter_emits(
+    pub(crate) unsafe fn iter_emits(
         &self,
         head_pos: NonZeroU32,
         mut anchor: usize,
@@ -1349,11 +1382,12 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         let mut curr = Some(head_pos);
         core::iter::from_fn(move || {
             let idx = curr?;
-            let em = unsafe { self.emits.get_unchecked(idx.get() as usize - 1) };
-            let end = anchor - em.gap as usize;
-            anchor = end - em.length as usize;
-            curr = em.pred;
-            Some(em.to_match(end))
+            // SAFETY: caller guarantees head_pos and all chained pred links are valid indices in self.emits.
+            let emit = unsafe { self.emits.get_unchecked(idx.get() as usize - 1) };
+            let end = anchor - emit.gap as usize;
+            anchor = end - emit.length as usize;
+            curr = emit.pred;
+            Some(emit.to_match(end))
         })
     }
 
