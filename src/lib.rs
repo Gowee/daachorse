@@ -540,14 +540,14 @@ pub enum MatchKind {
     ///
     /// This enables [`leftmost_find_iter_experimental()`](CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()),
     /// executing single-pass forward streaming matching in guaranteed $O(N)$ worst-case time without
-    /// text rewinding or backtracking. Note that empty patterns `""` are not supported.
+    /// text rewinding or backtracking.
     LeftmostLongestExperimental = 3,
 
     /// Experimental leftmost-first match semantics using a zero-rewind automaton with delta-encoded match chains.
     ///
     /// This enables [`leftmost_find_iter_experimental()`](CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()),
     /// executing single-pass forward streaming matching in guaranteed $O(N)$ worst-case time without
-    /// text rewinding or backtracking. Note that empty patterns `""` are not supported.
+    /// text rewinding or backtracking.
     LeftmostFirstExperimental = 4,
 }
 

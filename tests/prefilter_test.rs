@@ -374,3 +374,42 @@ fn bytewise_serialization_roundtrip_without_prefilter() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn charwise_serialization_roundtrip_experimental() {
+    for match_kind in [
+        MatchKind::LeftmostLongestExperimental,
+        MatchKind::LeftmostFirstExperimental,
+    ] {
+        let patterns = ["灯里", "アリス", "藍華", ""];
+        let haystack =
+            "ARIAカンパニーには灯里が、姫屋に藍華が、オレンジぷらねっとにはアリスがいる。";
+        let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(match_kind)
+            .build(patterns)
+            .unwrap();
+        let bytes = pma.serialize();
+
+        let expected: Vec<_> = pma
+            .leftmost_find_iter_experimental(haystack)
+            .map(|m| (m.start(), m.end(), m.value()))
+            .collect();
+        assert!(!expected.is_empty());
+
+        let (other, rest) = CharwiseDoubleArrayAhoCorasick::<u32>::deserialize(&bytes).unwrap();
+        assert!(rest.is_empty());
+        let actual: Vec<_> = other
+            .leftmost_find_iter_experimental(haystack)
+            .map(|m| (m.start(), m.end(), m.value()))
+            .collect();
+        assert_eq!(expected, actual);
+
+        let (other_unchecked, _) =
+            unsafe { CharwiseDoubleArrayAhoCorasick::<u32>::deserialize_unchecked(&bytes) };
+        let actual_unchecked: Vec<_> = other_unchecked
+            .leftmost_find_iter_experimental(haystack)
+            .map(|m| (m.start(), m.end(), m.value()))
+            .collect();
+        assert_eq!(expected, actual_unchecked);
+    }
+}

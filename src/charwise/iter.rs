@@ -722,10 +722,8 @@ where
     /// This function performs the core linear-time leftmost pattern matching over the
     /// automaton, completely free of zero-length / epsilon handling logic.
     #[inline(always)]
-    fn scan_core<const FILTERED: bool>(&mut self) {
-        if !self.buf.is_empty()
-            || (self.pos >= self.haystack.as_ref().len() && self.state_id == ROOT_STATE_IDX)
-        {
+    fn ensure_buffered_impl<const FILTERED: bool>(&mut self) {
+        if !self.buf.is_empty() {
             return;
         }
 
@@ -739,6 +737,7 @@ where
         };
 
         while self.pos < bytes.len() {
+            // try to advance `self.pos` with prefilter, if present
             if let Some(pf) = prefilter {
                 if self.state_id == ROOT_STATE_IDX {
                     let candidate_pos = pf.next_position_at_char_boundary(haystack, self.pos);
@@ -753,25 +752,41 @@ where
                 }
             }
 
+            // SAFETY: pos is always on a character boundary: it advances by
+            // whole characters, and the prefilter only reports positions at
+            // character boundaries.
             let (c, char_len) = unsafe { decode_char_unchecked(bytes, self.pos) };
             let mapped_c = self.pma.mapper.get(c);
 
             loop {
-                if let Some(child) = self.pma.child_state(self.state_id, mapped_c) {
+                // Walk down the current trie path whenever possible
+                if let Some(child) = unsafe {
+                    // SAFETY: self.state_id starts with ROOT_STATE_IDX, and
+                    // is set to either fail or child id, which are smaller than
+                    // self.pma.states.len() as guaranteed by builder or
+                    // deserializer
+                    self.pma.child_state(self.state_id, mapped_c)
+                } {
                     self.state_id = child;
                     break;
                 }
-
                 if self.state_id == ROOT_STATE_IDX {
                     break;
                 }
 
+                // Mismatch: buffer committed emits and step to fail with
+                // pending suffix as the new trie path
+                // SAFETY: self.state_id starts as ROOT_STATE_IDX, and is set to
+                // either fail or child id, which are smaller than self.pma.states.len()
+                // as guaranteed by builder or deserializer
                 let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
                 let emit_pos = state.output_pos();
                 self.state_id = state.fail();
-
                 if let Some(ep) = emit_pos {
-                    self.buf.extend(self.pma.iter_emits(ep, self.pos));
+                    // SAFETY: builder guaranteed that any linked list indicated
+                    // by state.output_pos is valid
+                    self.buf
+                        .extend(unsafe { self.pma.iter_emits(ep, self.pos) });
                     return;
                 }
             }
@@ -779,14 +794,19 @@ where
             self.pos += char_len;
         }
 
-        // EOF handling: Drain in-flight active suffixes along the failure chain.
+        // EOF handling: Drain pending suffixes along the failure chain.
         while self.state_id != ROOT_STATE_IDX {
+            // SAFETY: self.state_id starts as ROOT_STATE_IDX, and is set to
+            // either fail or child id, which are smaller than self.pma.states.len()
+            // as guaranteed by builder or deserializer
             let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
             let emit_pos = state.output_pos();
             self.state_id = state.fail();
-
             if let Some(ep) = emit_pos {
-                self.buf.extend(self.pma.iter_emits(ep, self.pos));
+                // SAFETY: builder guaranteed that any linked list indicated
+                // by state.output_pos is valid
+                self.buf
+                    .extend(unsafe { self.pma.iter_emits(ep, self.pos) });
                 return;
             }
         }
@@ -798,41 +818,14 @@ where
     fn ensure_buffered(&mut self) {
         if self.buf.is_empty() {
             if self.pma.prefilter.is_some() && self.gate.is_enabled() {
-                self.scan_core::<true>();
+                self.ensure_buffered_impl::<true>();
             } else {
-                self.scan_core::<false>();
+                self.ensure_buffered_impl::<false>();
             }
         }
     }
 }
 
-/// Reconstructs match spans from a reverse-linked chain of [`Emit`] nodes.
-///
-/// # Architecture and Invariants
-///
-/// During automaton construction, any prefix string $W$ that matches patterns
-/// decomposes into a sequence of non-overlapping committed matches:
-/// $M_1 \text{ (earliest)} \to M_2 \to \dots \to M_k \text{ (latest)}$,
-/// followed by an active in-flight suffix represented by `state.fail()`.
-///
-/// Because `state.output_pos()` stores matches occurring *before* the active suffix,
-/// any mismatch or EOF condition must also drain `state.fail()` to flush pending
-/// non-overlapping matches that reside inside the trailing active suffix.
-///
-/// In the emit pool, these matches are stored in reverse chronological order:
-/// `head` is $M_k$, which links via `pred` to $M_{k-1}$, and eventually to $M_1$ (`pred == None`).
-///
-/// # Backward Inductive Recurrence
-///
-/// Given the scan position $P = \text{pos}$ at mismatch:
-///
-/// - **Base anchor**: $\text{anchor}_k = P$
-/// - **Head match $M_k$**: $\text{end}(M_k) = \text{anchor}_k - M_k.\text{gap}$, $\text{start}(M_k) = \text{end}(M_k) - M_k.\text{length}$
-/// - **Inductive step for $M_{i-1}$**: $\text{anchor}_{i-1} = \text{start}(M_i)$
-/// - **Predecessor match $M_{i-1}$**: $\text{end}(M_{i-1}) = \text{anchor}_{i-1} - M_{i-1}.\text{gap}$, $\text{start}(M_{i-1}) = \text{end}(M_{i-1}) - M_{i-1}.\text{length}$
-///
-/// Matches are pushed in reverse chronological order ($M_k, M_{k-1}, \dots, M_1$),
-/// so the earliest match $M_1$ sits at the top of the LIFO stack in `buf` and is popped first.
 impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
 where
     P: AsRef<str>,
@@ -844,28 +837,40 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         self.ensure_buffered();
 
-        let Some(ep) = self.epsilon_emit_pos else {
-            return self.buf.pop();
+        let epsilon = match self.epsilon_emit_pos {
+            None => return self.buf.pop(),
+            // SAFETY: the emit for epsilon was populated by builder if "" is
+            // present in patterns
+            Some(ep) => unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) },
         };
+
+        // Instead of messing the core leftmost(-longest) matching flow,
+        // here, interpolate zero-length matches ("") into the unconsumed text
+        // gaps between consecutive non-empty matches and at text boundaries:
+
+        debug_assert_eq!(epsilon.length, 0);
+        debug_assert_eq!(epsilon.gap, 0);
+        debug_assert!(epsilon.pred.is_none());
 
         let bytes = self.haystack.as_ref().as_bytes();
         let target = self.buf.last().map_or(bytes.len(), |m| m.start());
 
         // Emit unconsumed boundaries before the non-empty match (or EOF)
         if self.epsilon_cursor < target {
-            let emit = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
-            debug_assert_eq!(emit.length, 0);
-            debug_assert_eq!(emit.gap, 0);
-            debug_assert!(emit.pred.is_none());
-            let end = self.epsilon_cursor;
+            let cursor = self.epsilon_cursor;
+            // SAFETY: epsilon_cursor < target <= match.start() < bytes.len();
+            //         epsilon_cursor is only advanced in this method, by char_len.
             let (_, char_len) = unsafe { decode_char_unchecked(bytes, self.epsilon_cursor) };
             self.epsilon_cursor += char_len;
-            return Some(emit.to_match(end));
+            return Some(epsilon.to_match(cursor));
         }
 
         // Cursor reached target: emit the ready non-empty match from the buffer
         if let Some(m) = self.buf.pop() {
             self.epsilon_cursor = if m.end() < bytes.len() {
+                // SAFETY: m.end() sits at a char boundary, guaranteed at
+                // construction time or deserialization, and is smaller than
+                // bytes.len() as checked above.
                 let (_, char_len) = unsafe { decode_char_unchecked(bytes, m.end()) };
                 m.end() + char_len
             } else {
@@ -877,11 +882,7 @@ where
         // Emit trailing boundary at EOF if not suppressed by an immediately preceding match
         if self.epsilon_cursor <= bytes.len() {
             self.epsilon_cursor = usize::MAX;
-            let emit = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
-            debug_assert_eq!(emit.length, 0);
-            debug_assert_eq!(emit.gap, 0);
-            debug_assert!(emit.pred.is_none());
-            return Some(emit.to_match(bytes.len()));
+            return Some(epsilon.to_match(bytes.len()));
         }
 
         self.epsilon_emit_pos = None;
