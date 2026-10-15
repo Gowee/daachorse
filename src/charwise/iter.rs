@@ -799,13 +799,16 @@ where
         }
     }
 
-    /// Dispatches the core search engine based on active prefilter status.
+    /// Ensures `self.buf` contains the next non-empty match(es), scanning forward
+    /// if the buffer is currently empty.
     #[inline(always)]
-    fn scan_core_maybe_prefiltered(&mut self) {
-        if self.pma.prefilter.is_some() && self.gate.is_enabled() {
-            self.scan_core::<true>()
-        } else {
-            self.scan_core::<false>()
+    fn ensure_buffered(&mut self) {
+        if self.buf.is_empty() {
+            if self.pma.prefilter.is_some() && self.gate.is_enabled() {
+                self.scan_core::<true>();
+            } else {
+                self.scan_core::<false>();
+            }
         }
     }
 
@@ -813,9 +816,7 @@ where
     /// between consecutive non-empty matches and at text boundaries.
     #[inline]
     fn next_with_epsilon(&mut self, ep: NonZeroU32) -> Option<Match<V>> {
-        if self.buf.is_empty() {
-            self.scan_core_maybe_prefiltered();
-        }
+        self.ensure_buffered();
 
         let bytes = self.haystack.as_ref().as_bytes();
         let target = self.buf.last().map_or(bytes.len(), |m| m.start());
@@ -898,9 +899,7 @@ where
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let Some(ep) = self.epsilon_emit_pos else {
-            if self.buf.is_empty() {
-                self.scan_core_maybe_prefiltered();
-            }
+            self.ensure_buffered();
             return self.buf.pop();
         };
 
