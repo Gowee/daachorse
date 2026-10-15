@@ -723,12 +723,12 @@ where
     P: AsRef<str>,
     V: Copy,
 {
-    /// Inner scanning engine for non-empty pattern matches.
+    /// Core scanning engine for non-empty pattern matches.
     ///
     /// This function performs the core linear-time leftmost pattern matching over the
     /// automaton, completely free of zero-length / epsilon handling logic.
     #[inline(always)]
-    fn next_non_empty<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
+    fn next_core<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
         // Yield ready matches from the stack in chronological order
         if let Some(m) = self.buf.pop() {
             return Some(m);
@@ -799,13 +799,13 @@ where
         None
     }
 
-    /// Dispatches non-empty matching based on active prefilter status.
+    /// Dispatches the core search engine based on active prefilter status.
     #[inline(always)]
-    fn next_non_empty_dispatch(&mut self) -> Option<Match<V>> {
+    fn next_core_maybe_prefiltered(&mut self) -> Option<Match<V>> {
         if self.pma.prefilter.is_some() && self.gate.is_enabled() {
-            self.next_non_empty::<true>()
+            self.next_core::<true>()
         } else {
-            self.next_non_empty::<false>()
+            self.next_core::<false>()
         }
     }
 
@@ -818,7 +818,7 @@ where
                 || !self.buf.is_empty()
                 || self.state_id != ROOT_STATE_IDX)
         {
-            self.pending = self.next_non_empty_dispatch();
+            self.pending = self.next_core_maybe_prefiltered();
         }
 
         let bytes = self.haystack.as_ref().as_bytes();
@@ -902,7 +902,7 @@ where
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let Some(ep) = self.epsilon_emit_pos else {
-            return self.next_non_empty_dispatch();
+            return self.next_core_maybe_prefiltered();
         };
 
         self.next_with_epsilon(ep)
