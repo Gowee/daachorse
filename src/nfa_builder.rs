@@ -1,6 +1,5 @@
 use core::cell::Cell;
 use core::cmp::Reverse;
-use core::hash::Hash;
 use core::num::NonZeroU32;
 
 use alloc::vec::Vec;
@@ -221,7 +220,7 @@ where
 impl<L, V> NfaBuilder<L, V>
 where
     L: EdgeLabel,
-    V: Copy + Eq + core::hash::Hash,
+    V: Copy,
 {
     /// Builds failure transitions and match emit chains for zero-rewind leftmost-longest matching.
     ///
@@ -322,6 +321,15 @@ where
     ///   3. **Head Gap Expansion**:
     ///      If no new matches were cons'd, the parent's head match gap simply expands by `|c|` bytes.
     pub(crate) fn build_fails_and_emits_leftmost_experimental(&mut self) {
+        self.build_fails_and_emits_leftmost_experimental_inner(true);
+    }
+
+    /// TEST-ONLY: same as above but with dedup disabled (always pushes).
+    pub(crate) fn build_fails_and_emits_leftmost_experimental_no_dedup(&mut self) {
+        self.build_fails_and_emits_leftmost_experimental_inner(false);
+    }
+
+    pub(crate) fn build_fails_and_emits_leftmost_experimental_inner(&mut self, use_dedup: bool) {
         let num_states = self.states.len();
         let mut q = Vec::with_capacity(num_states);
         let mut parents = vec![ROOT_STATE_ID; num_states];
@@ -348,14 +356,19 @@ where
         }
 
         // Construction-time store for deduplicating and indexing emit nodes.
-        let mut store = EmitStore::with_capacity(q.len());
+        let mut store = EmitStore::with_capacity_and_dedup(q.len(), use_dedup);
 
         // If ROOT has an output (empty pattern ""), register its emit node.
         if let Some(&pat) = self.states[usize::from_u32(ROOT_STATE_ID)].output.first() {
             let emit = Emit::from_output(pat, 0, None);
+            let key = DedupKey {
+                pat_state: ROOT_STATE_ID,
+                gap: 0,
+                pred: None,
+            };
             self.states[usize::from_u32(ROOT_STATE_ID)]
                 .output_pos
-                .set(Some(store.insert(emit)));
+                .set(Some(store.insert(emit, key)));
         }
 
         // Reusable scratch buffer for harvesting matches during failure fallback walks.
@@ -368,9 +381,14 @@ where
             // it supersedes any suffix fallback. `fail` is reset to ROOT and `gap` is 0.
             if let Some(&pat) = self.states[state_id as usize].output.first() {
                 let emit = Emit::from_output(pat, 0, None);
+                let key = DedupKey {
+                    pat_state: state_id,
+                    gap: 0,
+                    pred: None,
+                };
                 self.states[state_id as usize]
                     .output_pos
-                    .set(Some(store.insert(emit)));
+                    .set(Some(store.insert(emit, key)));
                 self.states[state_id as usize].fail.set(ROOT_STATE_ID);
                 continue;
             }
@@ -390,7 +408,12 @@ where
                 self.states[parent_id as usize]
                     .output_pos
                     .get()
-                    .map(|pos| store.get(pos).with_incremented_gap(ch.num_bytes()))
+                    .map(|pos| {
+                        (
+                            store.get(pos).with_incremented_gap(ch.num_bytes()),
+                            store.key_of(pos).pat_state,
+                        )
+                    })
             };
 
             let mut chain = EmitChain::new(initial_head);
@@ -406,7 +429,9 @@ where
                     scratch_buffer.clear();
                     scratch_buffer.extend(store.iter_chain(curr_head));
                     // Matches along curr's prefix ended at P; advance the head gap by |c| to align with S:
-                    scratch_buffer[0] = scratch_buffer[0].with_incremented_gap(ch.num_bytes());
+                    scratch_buffer[0].0 =
+                        scratch_buffer[0].0.with_incremented_gap(ch.num_bytes());
+                    scratch_buffer[0].1.gap += u32::try_from(ch.num_bytes()).unwrap();
                     chain.extend_from(&scratch_buffer, &mut store);
                 }
                 curr = self.states[curr as usize].fail.get();
@@ -423,7 +448,7 @@ where
                     } else {
                         // Suffix completes a leaf pattern at the very end of `state_id`.
                         let pat = self.states[child_id as usize].output[0];
-                        chain.push_leaf(pat, &mut store);
+                        chain.push_leaf(pat, child_id, &mut store);
                         fail_state = ROOT_STATE_ID;
                     }
                 }
@@ -609,9 +634,12 @@ where
 ///   state boundary, and updates the in-flight head.
 /// - `push_leaf(output, store)` commits a match ending directly at the state boundary (gap = 0).
 /// - `finish(store)` commits the in-flight head directly into `EmitStore` as-is.
+///
+/// The head carries its originating pattern state alongside the detached [`Emit`]
+/// so [`EmitStore`] can hash-cons by [`DedupKey`] without touching `V`.
 #[derive(Clone, Copy, Debug)]
 struct EmitChain<V> {
-    head: Option<Emit<V>>,
+    head: Option<(Emit<V>, u32)>,
 }
 
 impl<V> Default for EmitChain<V> {
@@ -621,10 +649,10 @@ impl<V> Default for EmitChain<V> {
     }
 }
 
-impl<V: Copy + Eq + Hash> EmitChain<V> {
+impl<V: Copy> EmitChain<V> {
     /// Initializes an active match chain with an optional in-flight head match.
     #[inline(always)]
-    const fn new(head: Option<Emit<V>>) -> Self {
+    const fn new(head: Option<(Emit<V>, u32)>) -> Self {
         Self { head }
     }
 
@@ -633,71 +661,135 @@ impl<V: Copy + Eq + Hash> EmitChain<V> {
     /// `emits` contains the matches in reverse chronological order `[M_k, ..., M_1]`,
     /// with `emits[0].gap` already adjusted relative to the current state.
     #[inline(always)]
-    fn extend_from(&mut self, emits: &[Emit<V>], store: &mut EmitStore<V>) {
+    fn extend_from(&mut self, emits: &[(Emit<V>, DedupKey)], store: &mut EmitStore<V>) {
         if emits.is_empty() {
             return;
         }
 
         // Link earliest match M_1 to the previous head:
-        let mut pred = if let Some(prev) = self.head {
-            let span: u32 = emits.iter().map(|em| em.gap + em.length).sum();
+        let mut pred = if let Some((prev, prev_state)) = self.head {
+            let span: u32 = emits.iter().map(|(em, _)| em.gap + em.length).sum();
             debug_assert!(
                 prev.gap >= span,
                 "candidate match cannot overlap with committed ancestor match"
             );
             let inter_gap = prev.gap - span;
-            Some(store.insert(prev.with_gap(inter_gap)))
+            Some(store.insert(
+                prev.with_gap(inter_gap),
+                DedupKey {
+                    pat_state: prev_state,
+                    gap: inter_gap,
+                    pred: prev.pred,
+                },
+            ))
         } else {
             None
         };
 
         // Chain intermediate matches M_1 .. M_{k-1}:
-        for em in emits[1..].iter().rev() {
-            pred = Some(store.insert(Emit::new(em.value, em.length, em.gap, pred)));
+        for (em, key) in emits[1..].iter().rev() {
+            pred = Some(store.insert(
+                Emit::new(em.value, em.length, em.gap, pred),
+                DedupKey {
+                    pat_state: key.pat_state,
+                    gap: em.gap,
+                    pred,
+                },
+            ));
         }
 
         // Install M_k as the new in-flight head:
-        self.head = Some(emits[0].with_pred(pred));
+        self.head = Some((emits[0].0.with_pred(pred), emits[0].1.pat_state));
     }
 
     /// Appends a newly completed leaf pattern ending at the current state.
     #[inline(always)]
-    fn push_leaf(&mut self, output: (V, u32), store: &mut EmitStore<V>) {
-        let pred = if let Some(prev) = self.head {
+    fn push_leaf(&mut self, output: (V, u32), pat_state: u32, store: &mut EmitStore<V>) {
+        let pred = if let Some((prev, prev_state)) = self.head {
             debug_assert!(
                 prev.gap >= output.1,
                 "leaf pattern cannot overlap with committed ancestor match"
             );
             let inter_gap = prev.gap - output.1;
-            Some(store.insert(prev.with_gap(inter_gap)))
+            Some(store.insert(
+                prev.with_gap(inter_gap),
+                DedupKey {
+                    pat_state: prev_state,
+                    gap: inter_gap,
+                    pred: prev.pred,
+                },
+            ))
         } else {
             None
         };
-        self.head = Some(Emit::from_output(output, 0, pred));
+        self.head = Some((Emit::from_output(output, 0, pred), pat_state));
     }
 
     /// Finalizes the match chain by committing the in-flight head to `store`.
     #[inline(always)]
     fn finish(self, store: &mut EmitStore<V>) -> Option<NonZeroU32> {
-        self.head.map(|h| store.insert(h))
+        self.head.map(|(h, pat_state)| {
+            store.insert(
+                h,
+                DedupKey {
+                    pat_state,
+                    gap: h.gap,
+                    pred: h.pred,
+                },
+            )
+        })
     }
+}
+
+/// Deduplication key for [`Emit`] nodes.
+///
+/// Identifies an emit node by its originating pattern state instead of its value,
+/// so hash-consing never touches `V` and the builder only requires `V: Copy`.
+/// Each pattern corresponds to exactly one terminal trie state, hence
+/// `pat_state` determines `(value, length)` and the key is canonical.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+struct DedupKey {
+    pat_state: u32,
+    gap: u32,
+    pred: Option<NonZeroU32>,
 }
 
 /// A construction-time store combining emit node storage with open-addressing deduplication.
 ///
 /// Encapsulates node allocation, hash-consing lookup, and chain traversal.
 /// When construction is complete, unwraps into the final [`Vec<Emit<V>>`].
+///
+/// `keys` runs parallel to `emits`: `keys[i]` is the [`DedupKey`] of `emits[i]`,
+/// recorded on every insert (even with dedup disabled) so ancestor lookups work.
+/// Hash-consing keys never touches `V`, hence only `V: Copy` is required.
+///
+/// TEST-ONLY: `use_dedup=false` disables hash-consing (always pushes) so benchmarks
+/// can compare emits count / conversion speed with and without dedup.
 struct EmitStore<V> {
     emits: Vec<Emit<V>>,
-    dedup: EmitDedup<V>,
+    keys: Vec<DedupKey>,
+    dedup: EmitDedup,
+    use_dedup: bool,
 }
 
-impl<V: Copy + Eq + Hash> EmitStore<V> {
+impl<V: Copy> EmitStore<V> {
     /// Creates an empty store with initial capacity.
     fn with_capacity(cap: usize) -> Self {
         Self {
             emits: Vec::with_capacity(cap),
+            keys: Vec::with_capacity(cap),
             dedup: EmitDedup::with_capacity(cap),
+            use_dedup: true,
+        }
+    }
+
+    /// TEST-ONLY: creates a store with dedup explicitly enabled/disabled.
+    fn with_capacity_and_dedup(cap: usize, use_dedup: bool) -> Self {
+        Self {
+            emits: Vec::with_capacity(cap),
+            keys: Vec::with_capacity(cap),
+            dedup: EmitDedup::with_capacity(cap),
+            use_dedup,
         }
     }
 
@@ -707,16 +799,28 @@ impl<V: Copy + Eq + Hash> EmitStore<V> {
         self.emits[usize::from_u32(pos.get() - 1)]
     }
 
+    /// Retrieves the [`DedupKey`] of the node at its 1-based index.
+    #[inline(always)]
+    fn key_of(&self, pos: NonZeroU32) -> DedupKey {
+        self.keys[usize::from_u32(pos.get() - 1)]
+    }
+
     /// Inserts an [`Emit`] node with deduplication, returning its canonical 1-based index.
     #[inline(always)]
-    fn insert(&mut self, emit: Emit<V>) -> NonZeroU32 {
-        if let Some(pos) = self.dedup.get(&emit) {
+    fn insert(&mut self, emit: Emit<V>, key: DedupKey) -> NonZeroU32 {
+        if self.use_dedup {
+            if let Some(pos) = self.dedup.get(&key) {
+                return pos;
+            }
+            self.emits.push(emit);
+            self.keys.push(key);
+            let pos = NonZeroU32::new(u32::try_from(self.emits.len()).unwrap()).unwrap();
+            self.dedup.insert(key, pos);
             pos
         } else {
             self.emits.push(emit);
-            let pos = NonZeroU32::new(u32::try_from(self.emits.len()).unwrap()).unwrap();
-            self.dedup.insert(emit, pos);
-            pos
+            self.keys.push(key);
+            NonZeroU32::new(u32::try_from(self.emits.len()).unwrap()).unwrap()
         }
     }
 
@@ -736,33 +840,36 @@ impl<V: Copy + Eq + Hash> EmitStore<V> {
     }
 }
 
-/// An iterator traversing an [`Emit`] chain from head to tail.
+/// An iterator traversing an [`Emit`] chain from head to tail,
+/// yielding each node with its [`DedupKey`] for re-insertion.
 struct ChainIter<'a, V> {
     store: &'a EmitStore<V>,
     pos: Option<NonZeroU32>,
 }
 
-impl<'a, V: Copy + Eq + Hash> Iterator for ChainIter<'a, V> {
-    type Item = Emit<V>;
+impl<'a, V: Copy> Iterator for ChainIter<'a, V> {
+    type Item = (Emit<V>, DedupKey);
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let pos = self.pos?;
         let em = self.store.get(pos);
+        let key = self.store.key_of(pos);
         self.pos = em.pred;
-        Some(em)
+        Some((em, key))
     }
 }
 
 /// A compact, open-addressing deduplication table for [`Emit`] nodes in `no_std`.
 ///
 /// In leftmost-longest matching, multiple states across divergent branches frequently produce
-/// identical [`Emit`] configurations. This deduplication table provides hash-consing directly
-/// over the value type `Emit<V>`, unifying identical `(value, length, gap, pred)` tuples into
-/// a single canonical index, saving ~35% node allocations.
+/// identical [`Emit`] configurations. This deduplication table provides hash-consing over
+/// [`DedupKey`] (`pat_state` identifies the pattern, hence `(value, length)`), unifying
+/// identical `(pattern, gap, pred)` tuples into a single canonical index.
 ///
 /// Deduplication is cleanly separated from emit list storage: [`EmitDedup`] acts as a lookup
-/// cache mapping `Emit<V> -> NonZeroU32`, while [`NfaBuilder::emits`] owns the underlying storage.
+/// cache mapping `DedupKey -> NonZeroU32`, while [`NfaBuilder::emits`] owns the underlying storage.
+/// Keys never touch `V`, so no `Eq`/`Hash` bound on values is required.
 ///
 /// # Where Do Duplicates Arise? (Concrete Examples)
 ///
@@ -804,13 +911,13 @@ impl<'a, V: Copy + Eq + Hash> Iterator for ChainIter<'a, V> {
 /// - **Suffix copying with divergent ancestor histories**: When two branches have different prior committed
 ///   matches ($P_A \neq P_B$), path copying forces the earliest copied match to link to $P_A$ and $P_B$
 ///   respectively. All downstream matches inherit this divergent `pred`, preventing node reuse.
-struct EmitDedup<V> {
-    entries: Vec<Option<(Emit<V>, NonZeroU32)>>,
+struct EmitDedup {
+    entries: Vec<Option<(DedupKey, NonZeroU32)>>,
     mask: usize,
     count: usize,
 }
 
-impl<V: Copy + Eq + Hash> EmitDedup<V> {
+impl EmitDedup {
     fn with_capacity(cap: usize) -> Self {
         let size = cap.next_power_of_two().max(1024);
         Self {
@@ -821,14 +928,14 @@ impl<V: Copy + Eq + Hash> EmitDedup<V> {
     }
 
     #[inline(always)]
-    fn get(&self, emit: &Emit<V>) -> Option<NonZeroU32> {
-        let h = hash_emit(emit);
+    fn get(&self, key: &DedupKey) -> Option<NonZeroU32> {
+        let h = hash_key(key);
         let mut idx = h & self.mask;
         loop {
             match self.entries[idx] {
                 None => return None,
                 Some((existing, pos)) => {
-                    if existing == *emit {
+                    if existing == *key {
                         return Some(pos);
                     }
                 }
@@ -837,21 +944,21 @@ impl<V: Copy + Eq + Hash> EmitDedup<V> {
         }
     }
 
-    fn insert(&mut self, emit: Emit<V>, pos: NonZeroU32) {
+    fn insert(&mut self, key: DedupKey, pos: NonZeroU32) {
         if self.count * 2 >= self.entries.len() {
             self.grow();
         }
-        let h = hash_emit(&emit);
+        let h = hash_key(&key);
         let mut idx = h & self.mask;
         loop {
             match self.entries[idx] {
                 None => {
-                    self.entries[idx] = Some((emit, pos));
+                    self.entries[idx] = Some((key, pos));
                     self.count += 1;
                     return;
                 }
                 Some((existing, _)) => {
-                    if existing == emit {
+                    if existing == key {
                         return;
                     }
                 }
@@ -864,13 +971,13 @@ impl<V: Copy + Eq + Hash> EmitDedup<V> {
         let new_size = self.entries.len() * 2;
         let new_mask = new_size - 1;
         let mut new_entries = vec![None; new_size];
-        for (emit, pos) in self.entries.drain(..).flatten() {
-            let h = hash_emit(&emit);
+        for (key, pos) in self.entries.drain(..).flatten() {
+            let h = hash_key(&key);
             let mut idx = h & new_mask;
             while new_entries[idx].is_some() {
                 idx = (idx + 1) & new_mask;
             }
-            new_entries[idx] = Some((emit, pos));
+            new_entries[idx] = Some((key, pos));
         }
         self.entries = new_entries;
         self.mask = new_mask;
@@ -878,33 +985,12 @@ impl<V: Copy + Eq + Hash> EmitDedup<V> {
 }
 
 #[inline(always)]
-fn hash_emit<V: Copy + core::hash::Hash>(emit: &Emit<V>) -> usize {
-    struct FxHasher(u64);
-    impl core::hash::Hasher for FxHasher {
-        #[inline(always)]
-        fn finish(&self) -> u64 {
-            self.0
-        }
-        #[inline(always)]
-        fn write(&mut self, bytes: &[u8]) {
-            for &b in bytes {
-                self.0 = (self.0.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
-            }
-        }
-        #[inline(always)]
-        fn write_u32(&mut self, i: u32) {
-            self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
-        }
-        #[inline(always)]
-        fn write_usize(&mut self, i: usize) {
-            self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
-        }
-    }
-
-    let mut hasher = FxHasher(0);
-    emit.value.hash(&mut hasher);
-    emit.length.hash(&mut hasher);
-    emit.gap.hash(&mut hasher);
-    emit.pred.hash(&mut hasher);
-    hasher.0 as usize
+fn hash_key(key: &DedupKey) -> usize {
+    // FxHash-style mixer over plain u32 fields; no `V` involved.
+    const SEED: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h: u64 = 0;
+    h = (h.rotate_left(5) ^ u64::from(key.pat_state)).wrapping_mul(SEED);
+    h = (h.rotate_left(5) ^ u64::from(key.gap)).wrapping_mul(SEED);
+    h = (h.rotate_left(5) ^ u64::from(key.pred.map_or(0, NonZeroU32::get))).wrapping_mul(SEED);
+    h as usize
 }

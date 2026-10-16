@@ -20,6 +20,8 @@ pub struct CharwiseDoubleArrayAhoCorasickBuilder {
     match_kind: MatchKind,
     corpus: Vec<String>,
     use_prefilter: bool,
+    /// TEST-ONLY: disable emit dedup for experimental builds.
+    test_no_dedup: bool,
 }
 
 impl Default for CharwiseDoubleArrayAhoCorasickBuilder {
@@ -59,7 +61,16 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
             match_kind: MatchKind::Standard,
             corpus: vec![],
             use_prefilter: true,
+            test_no_dedup: false,
         }
+    }
+
+    /// TEST-ONLY: disable emit dedup for experimental leftmost builds.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __test_no_dedup(mut self, yes: bool) -> Self {
+        self.test_no_dedup = yes;
+        self
     }
 
     /// Specifies [`MatchKind`] to build.
@@ -196,7 +207,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
     where
         I: IntoIterator<Item = P>,
         P: AsRef<str>,
-        V: Copy + TryFrom<usize> + Eq + core::hash::Hash,
+        V: Copy + TryFrom<usize>,
     {
         // The following code implicitly replaces large indices with 0,
         // but build_with_values() returns an error variant for such iterators.
@@ -248,7 +259,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
     where
         I: IntoIterator<Item = (P, V)>,
         P: AsRef<str>,
-        V: Copy + Eq + core::hash::Hash,
+        V: Copy,
     {
         let (nfa, prefilter) = self.build_original_nfa_and_mapper(patvals)?;
 
@@ -282,7 +293,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
     where
         I: IntoIterator<Item = (P, V)>,
         P: AsRef<str>,
-        V: Copy + Eq + core::hash::Hash,
+        V: Copy,
     {
         let mut nfa = CharwiseNfaBuilder::new(self.match_kind);
         let mut prefilter_builder = self.use_prefilter.then(PrefilterBuilder::new);
@@ -314,7 +325,11 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
                 nfa.build_outputs(&nfa.build_fails_leftmost())
             }
             MatchKind::LeftmostLongestExperimental | MatchKind::LeftmostFirstExperimental => {
-                nfa.build_fails_and_emits_leftmost_experimental()
+                if self.test_no_dedup {
+                    nfa.build_fails_and_emits_leftmost_experimental_no_dedup()
+                } else {
+                    nfa.build_fails_and_emits_leftmost_experimental()
+                }
             }
         };
         Ok((nfa, prefilter_builder.and_then(PrefilterBuilder::build)))

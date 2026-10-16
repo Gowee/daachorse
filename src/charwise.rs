@@ -102,7 +102,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     where
         I: IntoIterator<Item = P>,
         P: AsRef<str>,
-        V: Copy + TryFrom<usize> + Eq + core::hash::Hash,
+        V: Copy + TryFrom<usize>,
     {
         CharwiseDoubleArrayAhoCorasickBuilder::new().build(patterns)
     }
@@ -141,7 +141,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     where
         I: IntoIterator<Item = (P, V)>,
         P: AsRef<str>,
-        V: Copy + Eq + core::hash::Hash,
+        V: Copy,
     {
         CharwiseDoubleArrayAhoCorasickBuilder::new().build_with_values(patvals)
     }
@@ -638,7 +638,10 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             haystack,
             pos: 0,
             state_id: ROOT_STATE_IDX,
-            buf: Vec::new(),
+            // TEST-ONLY capacity probe: most mismatch buffers hold 1-2 matches;
+            // 4 avoids all reallocs for k<=4 at ~96B per iterator (one alloc per
+            // `leftmost_find_iter_experimental` call, amortized over the scan).
+            buf: Vec::with_capacity(4),
             gate: PrefilterGate::new(),
             epsilon_emit_pos: self.states[usize::from_u32(ROOT_STATE_IDX)].output_pos(),
             epsilon_cursor: 0,
@@ -1048,6 +1051,20 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             + self.depths.len() * mem::size_of::<u32>()
     }
 
+    /// TEST-ONLY: number of emit nodes (deduped vs raw).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __test_only_emits_len(&self) -> usize {
+        self.emits.len()
+    }
+
+    /// TEST-ONLY: number of output nodes (legacy path).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __test_only_outputs_len(&self) -> usize {
+        self.outputs.len()
+    }
+
     /// Serializes the automaton into a [`Vec`].
     ///
     /// # Examples
@@ -1321,25 +1338,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         }
     }
 
-    /// Finds the child state transitioned from `state_id` on mapped character label `mapped_c`.
-    ///
-    /// # Safety
-    ///
-    /// `state_id` must be smaller than the length of `self.states`.
-    #[inline(always)]
-    pub(crate) unsafe fn child_state(&self, state_id: u32, mapped_c: Option<u32>) -> Option<u32> {
-        let code = mapped_c?;
-        // SAFETY: caller guarantees state_id is smaller than self.states.len().
-        let base = unsafe { self.states.get_unchecked(state_id as usize).base()? };
-        let child_idx = (base.get() ^ code) as usize;
-        let child = self.states.get(child_idx)?;
-        if child.check() == state_id {
-            Some(child_idx as u32)
-        } else {
-            None
-        }
-    }
-
     /// Returns an iterator yielding matches from the reverse-linked [`Emit`] chain
     /// in reverse chronological order (head/latest to predecessor/earliest).
     ///
@@ -1390,6 +1388,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             Some(emit.to_match(end))
         })
     }
+
 
     /// # Safety
     ///
