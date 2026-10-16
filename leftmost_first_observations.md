@@ -180,3 +180,46 @@ fusion commented out, everything folded into the inner loop. Full suite green.
 Official: wins words15k (1.150) but loses words100k (0.969) and unidic (0.896)
 vs `full`; sparse rootmiss improves (0.764→0.929) while real/failwalk worsen.
 Net: **mixed, not adopted.**
+
+## Appendix B — Callgrind profiling of the hot match loop (local box, -O3, LTO off)
+
+Instrument: `valgrind --tool=callgrind --cache-sim=yes`, comparing `cg_legacy` vs `cg_exp`
+on 400 sherlock lines (words_100, prefilter off), ~16M instructions total each.
+
+Whole-program:
+- Legacy: 15,813,809 Ir ; Dr 3,210,167 ; Dw 1,161,753.
+- Experimental: 16,243,958 Ir (+2.7%) ; Dr 3,822,382 (+19.1%) ; Dw 1,648,698 (+41.9%).
+- L1/LL cache miss rates **identical** (LL miss 0.2%, L1-d 1.3-1.6%) — so it is not
+  memory **capacity**, it is memory **traffic** + branch density.
+
+Per-line hot spots in `src/charwise/iter.rs` (experimental):
+
+| cost | line |
+|---|---|
+| 533,094 Ir / 327,376 Dr (3.28/8.56%) | `states.get_unchecked(child_idx).check() == expect` (inside `step_child`) |
+| 308,474 (1.90%) | `if let (Some(code), Some(base)) = ...` (step_child entry) |
+| 293,722 (1.81%) | `while pos < bytes.len()` |
+| 287,392 (1.77%) | Fast Root probe entry `if state_id == ROOT_STATE_IDX` |
+| 250,212 (1.54%) | post-fail ROOT check `if state_id == ROOT_STATE_IDX` |
+| 199,088 (1.23%) | `if let Some(ep) = emit_pos` |
+| 180,194 (1.11%) | `let state = states.get_unchecked(state_id as usize)` |
+
+Versus legacy (`src/charwise.rs:next_state_id_leftmost_unchecked`):
+- 355,396 Ir / 177,698 Dr per `child_idx = base.get() ^ mapped_c` + check.
+- legacy calls the transition function ONCE per character; experimental wraps the
+  same XOR+load+check in `step_child` and calls it 3× per outer iteration
+  (fast-root, inner probe, fusion) plus the redundant ROOT re-probe on a
+  no-harvest fail-to-ROOT.
+- The locals-hoist already deleted the loop-carried `pos`/`state_id` load/store
+  traffic; the remaining cost (~10% on English) is mostly branch density from
+  the double-`Option` match in `step_child` and the redundant root reprobe.
+
+Promising experiments still worth running (gate by correctness tests):
+1. **Inline `step_child` to legacy form** (manual `if let Some(base) { ... }`,
+   eliminating the double-`Option` destructure) — expected a few %, matches the
+   `355k+355k+355k+177k` legacy 4-line form.
+2. The root-reprobe merge (root-consume on no-harvest fail-to-root) requires
+   returning-or-advancing without consuming the current byte twice; attempt only
+   when perf attributes the probe concretely on tyo2.
+3. Per `perf` on tyo2 (preferred over local — single-vCPU, matches production
+   target): branch-misses per `state_id` / `mapped_c` predictability.
