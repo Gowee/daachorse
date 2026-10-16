@@ -769,18 +769,13 @@ where
             None
         };
 
+        let states = &self.pma.states;
         // Hoisted ROOT transition base: the fast ROOT path below probes ROOT once
         // per character while at ROOT (the common case), so the base is loaded
         // once per scan instead of once per probe.
+        // TODO: const root_base
         // SAFETY: `states` is never empty, so ROOT_STATE_IDX is always valid.
-        let (states, root_base) = unsafe {
-            // FIXME as_slice is pure language semantics, it does not affect asm anyway? Do not mess it with the hoisting? 
-            let states = self.pma.states.as_slice(); 
-            let root_base = states.get_unchecked(usize::from_u32(ROOT_STATE_IDX)).base();
-            (states, root_base)
-        };
-        // FIXME: can child state and step root can be merged with no cost?
-        //        and understand why base could be none
+        let root_base = unsafe { states.get_unchecked(usize::from_u32(ROOT_STATE_IDX)).base() };
         while self.pos < bytes.len() {
             // try to advance `self.pos` with prefilter, if present
             if let Some(pf) = prefilter {
@@ -803,17 +798,16 @@ where
             let (c, char_len) = unsafe { decode_char_unchecked(bytes, self.pos) };
             let mapped_c = self.pma.mapper.get(c);
 
-            // Fast Root Path: at ROOT a single probe decides everything; no
-            // fail/output bookkeeping can trigger here.
-            if self.state_id == ROOT_STATE_IDX {
-                // SAFETY: `root_base` is ROOT's base and the double-array
-                // invariant holds by construction.
-                self.state_id =
-                    unsafe { step_child(states, root_base, ROOT_STATE_IDX, mapped_c) }
-                        .unwrap_or(ROOT_STATE_IDX);
-                self.pos += char_len;
-                continue;
-            }
+            // // Fast Root Path: at ROOT a single probe decides everything; no
+            // // fail/output bookkeeping can trigger here.
+            // if self.state_id == ROOT_STATE_IDX {
+            //     // SAFETY: `root_base` is ROOT's base and the double-array
+            //     // invariant holds by construction.
+            //     self.state_id = unsafe { step_child(states, root_base, ROOT_STATE_IDX, mapped_c) }
+            //         .unwrap_or(ROOT_STATE_IDX);
+            //     self.pos += char_len;
+            //     continue;
+            // }
 
             loop {
                 // Hoisted single load of the current state: feeds the
@@ -828,34 +822,44 @@ where
                 // Walk down the current trie path whenever possible.
                 // SAFETY: `base` comes from the hoisted load above and the
                 // double-array invariant holds by construction.
-                if let Some(child) = unsafe {
-                    step_child(states, state.base(), self.state_id, mapped_c)
-                } {
-                    self.state_id = child;
+                if let Some(child_id) =
+                    unsafe { step_child(states, state.base(), self.state_id, mapped_c) }
+                {
+                    self.state_id = child_id;
                     break;
                 }
+                // Mismatch at root: skip to next char
                 if self.state_id == ROOT_STATE_IDX {
                     break;
                 }
 
-                // Mismatch: buffer committed emits and step to fail with
-                // pending suffix as the new trie path. `state` is reused
-                // from the hoisted load above.
-                let emit_pos = state.output_pos();
+                // Mismatch elsewhere: buffer committed emits and step to fail
+                // with pending suffix as the new trie path.
                 self.state_id = state.fail();
-                if let Some(ep) = emit_pos {
+                if let Some(ep) = state.output_pos() {
                     // SAFETY: builder guaranteed that any linked list indicated
                     // by state.output_pos is valid
                     self.buf
                         .extend(unsafe { self.pma.iter_emits(ep, self.pos) });
-                    // Fusion: the fail landed on ROOT, so consume the current
-                    // character from ROOT now instead of re-decoding it on the
-                    // next call (standard AC fallback, same result).
-                    if self.state_id == ROOT_STATE_IDX {
-                        // SAFETY: same contract as the fast path above.
-                        self.state_id =
-                            unsafe { step_child(states, root_base, ROOT_STATE_IDX, mapped_c) }
-                                .unwrap_or(ROOT_STATE_IDX);
+                    // // Fusion: the fail landed on ROOT, so consume the current
+                    // // character from ROOT now instead of re-decoding it on the
+                    // // next call (standard AC fallback, same result).
+                    // if self.state_id == ROOT_STATE_IDX {
+                    //     // SAFETY: same contract as the fast path above.
+                    //     self.state_id =
+                    //         unsafe { step_child(states, root_base, ROOT_STATE_IDX, mapped_c) }
+                    //             .unwrap_or(ROOT_STATE_IDX);
+                    //     self.pos += char_len;
+                    // }
+                    if let Some(child_id) = unsafe {
+                        step_child(
+                            states,
+                            states.get_unchecked(self.state_id as usize).base(),
+                            self.state_id,
+                            mapped_c,
+                        )
+                    } {
+                        self.state_id = child_id;
                         self.pos += char_len;
                     }
                     return;
