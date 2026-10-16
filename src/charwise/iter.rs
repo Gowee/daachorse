@@ -763,6 +763,9 @@ where
         let haystack = self.haystack.as_ref();
         let bytes = haystack.as_bytes();
 
+        let mut pos = self.pos;
+        let mut state_id = self.state_id;
+
         let mut prefilter = if FILTERED {
             self.pma.prefilter.as_ref()
         } else {
@@ -775,18 +778,19 @@ where
         // once per scan instead of once per probe.
         // TODO: const root_base
         // SAFETY: `states` is never empty, so ROOT_STATE_IDX is always valid.
-        let root_base = unsafe { states.get_unchecked(usize::from_u32(ROOT_STATE_IDX)).base() };
-        while self.pos < bytes.len() {
-            // try to advance `self.pos` with prefilter, if present
+        // root_base: unused while fast-ROOT path is disabled in user experiments
+        // let root_base = unsafe { states.get_unchecked(usize::from_u32(ROOT_STATE_IDX)).base() };
+        while pos < bytes.len() {
+            // try to advance `pos` with prefilter, if present
             if let Some(pf) = prefilter {
-                if self.state_id == ROOT_STATE_IDX {
-                    let candidate_pos = pf.next_position_at_char_boundary(haystack, self.pos);
-                    self.gate.record(candidate_pos - self.pos);
-                    self.pos = candidate_pos;
+                if state_id == ROOT_STATE_IDX {
+                    let candidate_pos = pf.next_position_at_char_boundary(haystack, pos);
+                    self.gate.record(candidate_pos - pos);
+                    pos = candidate_pos;
                     if !self.gate.is_enabled() {
                         prefilter = None;
                     }
-                    if self.pos >= bytes.len() {
+                    if pos >= bytes.len() {
                         break;
                     }
                 }
@@ -795,17 +799,17 @@ where
             // SAFETY: pos is always on a character boundary: it advances by
             // whole characters, and the prefilter only reports positions at
             // character boundaries.
-            let (c, char_len) = unsafe { decode_char_unchecked(bytes, self.pos) };
+            let (c, char_len) = unsafe { decode_char_unchecked(bytes, pos) };
             let mapped_c = self.pma.mapper.get(c);
 
             // // Fast Root Path: at ROOT a single probe decides everything; no
             // // fail/output bookkeeping can trigger here.
-            // if self.state_id == ROOT_STATE_IDX {
+            // if state_id == ROOT_STATE_IDX {
             //     // SAFETY: `root_base` is ROOT's base and the double-array
             //     // invariant holds by construction.
-            //     self.state_id = unsafe { step_child(states, root_base, ROOT_STATE_IDX, mapped_c) }
+            //     state_id = unsafe { step_child(states, root_base, ROOT_STATE_IDX, mapped_c) }
             //         .unwrap_or(ROOT_STATE_IDX);
-            //     self.pos += char_len;
+            //     pos += char_len;
             //     continue;
             // }
 
@@ -813,84 +817,88 @@ where
                 // Hoisted single load of the current state: feeds the
                 // transition probe below and the mismatch fail/output
                 // reads, instead of loading the same line twice.
-                // SAFETY: self.state_id starts with ROOT_STATE_IDX, and
+                // SAFETY: state_id starts with ROOT_STATE_IDX, and
                 // is set to either fail or child id, which are smaller than
                 // the length of states as guaranteed by builder or
                 // deserializer.
-                let state = unsafe { states.get_unchecked(self.state_id as usize) };
+                let state = unsafe { states.get_unchecked(state_id as usize) };
 
                 // Walk down the current trie path whenever possible.
                 // SAFETY: `base` comes from the hoisted load above and the
                 // double-array invariant holds by construction.
                 if let Some(child_id) =
-                    unsafe { step_child(states, state.base(), self.state_id, mapped_c) }
+                    unsafe { step_child(states, state.base(), state_id, mapped_c) }
                 {
-                    self.state_id = child_id;
+                    state_id = child_id;
                     break;
                 }
                 // Mismatch at root: skip to next char
-                if self.state_id == ROOT_STATE_IDX {
+                if state_id == ROOT_STATE_IDX {
                     break;
                 }
 
                 // Mismatch elsewhere: buffer committed emits and step to fail
                 // with pending suffix as the new trie path.
-                self.state_id = state.fail();
+                state_id = state.fail();
                 if let Some(ep) = state.output_pos() {
                     // SAFETY: builder guaranteed that any linked list indicated
                     // by state.output_pos is valid
                     self.buf
-                        .extend(unsafe { self.pma.iter_emits(ep, self.pos) });
+                        .extend(unsafe { self.pma.iter_emits(ep, pos) });
                     // // Fusion: the fail landed on ROOT, so consume the current
                     // // character from ROOT now instead of re-decoding it on the
                     // // next call (standard AC fallback, same result).
-                    // if self.state_id == ROOT_STATE_IDX {
+                    // if state_id == ROOT_STATE_IDX {
                     //     // SAFETY: same contract as the fast path above.
-                    //     self.state_id =
+                    //     state_id =
                     //         unsafe { step_child(states, root_base, ROOT_STATE_IDX, mapped_c) }
                     //             .unwrap_or(ROOT_STATE_IDX);
-                    //     self.pos += char_len;
+                    //     pos += char_len;
                     // }
                     if let Some(child_id) = unsafe {
                         step_child(
                             states,
-                            states.get_unchecked(self.state_id as usize).base(),
-                            self.state_id,
+                            states.get_unchecked(state_id as usize).base(),
+                            state_id,
                             mapped_c,
                         )
                     } {
-                        self.state_id = child_id;
-                        self.pos += char_len;
+                        state_id = child_id;
+                        pos += char_len;
                     }
+            self.pos = pos;
+            self.state_id = state_id;
                     return;
                 }
             }
 
-            self.pos += char_len;
+            pos += char_len;
         }
 
+        self.pos = pos;
+
         // EOF handling: Drain pending suffixes along the failure chain.
-        while self.state_id != ROOT_STATE_IDX {
-            // SAFETY: self.state_id starts as ROOT_STATE_IDX, and is set to
+        while state_id != ROOT_STATE_IDX {
+            // SAFETY: state_id starts as ROOT_STATE_IDX, and is set to
             // either fail or child id, which are smaller than self.pma.states.len()
             // as guaranteed by builder or deserializer
-            let state = unsafe { self.pma.states.get_unchecked(self.state_id as usize) };
+            let state = unsafe { self.pma.states.get_unchecked(state_id as usize) };
             let emit_pos = state.output_pos();
-            self.state_id = state.fail();
+            state_id = state.fail();
             if let Some(ep) = emit_pos {
                 // SAFETY: builder guaranteed that any linked list indicated
                 // by state.output_pos is valid
                 self.buf
-                    .extend(unsafe { self.pma.iter_emits(ep, self.pos) });
+                    .extend(unsafe { self.pma.iter_emits(ep, pos) });
+            self.pos = pos;
+            self.state_id = state_id;
                 return;
             }
         }
+        self.pos = pos;
+        self.state_id = state_id;
     }
-
-    /// Ensures `self.buf` contains the next non-empty match(es), scanning forward
-    /// if the buffer is currently empty.
-    #[inline(always)]
-    fn ensure_buffered(&mut self) {
+fn ensure_buffered(&mut self) {
         if self.buf.is_empty() {
             if self.pma.prefilter.is_some() && self.gate.is_enabled() {
                 self.ensure_buffered_impl::<true>();
