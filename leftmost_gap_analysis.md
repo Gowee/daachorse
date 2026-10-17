@@ -79,8 +79,8 @@ Wall clock, alternating arms, medians, `taskset -c 0`:
 | words100 (920 states, 16 KB — fits L1) | 1.26 |
 | words5k (32k states) | 1.40 |
 | words15k | 1.41 |
-| words100k (645k states, 11.5 MB) | 1.18–1.33 |
-| unidic (1.02M states, 0.0% unmapped) | **0.94–0.97** |
+| words100k (645k states, 11.5 MB) | 1.16–1.18 |
+| unidic (1.02M states, 0.0% unmapped) | **0.94–0.96** |
 
 The gap scales with automaton size, because each flush load is more likely to
 miss cache in a bigger array. unidic is the counter-example that confirms the
@@ -115,6 +115,7 @@ Appendix C with numbers.
 | fast-ROOT path + fusion | breaks 7 fuzz tests — a correctness fix, not a perf option |
 | prefetch, ROOT re-probe merge, `Vec::new()` | all neutral-to-worse |
 | flush at arrival instead of at failure | impossible for leftmost-longest: would emit `ab` before seeing `abc`. Deferral is the semantics |
+| consume the unmapped character once (whole-chain flush) | 20,010 repeated decodes found (12.9% of unmapped events), but the ceiling is 3.4% of char visits and it breaks the epsilon buffer invariant |
 
 The recurring lesson: **the cost is dependent random loads, and adding a
 dependent random load to avoid other dependent random loads is a wash.**
@@ -188,14 +189,32 @@ Two facts constrain the design:
 2. The deferral is required by leftmost-longest semantics — it cannot be
    hoisted to arrival time.
 
-So the flush walk is close to irreducible for this semantics. The only
-remaining angle would be to make the walk's *loads* cheaper rather than fewer,
-e.g. co-locating a state's fail target with the state so that a hop is a
-same-line access. `State` is exactly 16 bytes and `fail` already sits in it, so
-consecutive hops touch unrelated lines; a layout where `fail`-chain successors
-are nearby would need a reordering pass in the builder and would fight the
-double-array layout that makes transitions fast. Not attempted; no evidence it
-pays, and it would complicate the builder substantially.
+**Candidate 3: consume the character once (flush the whole chain).** The
+current code emits *one* match and returns without advancing `pos`, so the same
+unmapped character is decoded and re-walked once per pending emit. Measured:
+**20,010 repeated decodes out of 155,346 unmapped-character events (12.9%)** —
+exactly one per emit-producing reset.
+
+This is a real inefficiency, and a whole-chain flush was made to pass all nine
+fuzz differentials. It still broke two epsilon tests, because `next()`'s
+zero-length-pattern interpolation depends on `buf.last()` being the pending
+match for the *current* position, which bulk-filling the buffer changes. The
+`epsilon_emit_pos` guard that would gate it is unreliable mid-scan (the field is
+`take()`n to `None` after the first `next()`).
+
+Even if finished, the ceiling is small: 20,010 re-decodes out of 589,087
+character visits = **3.4% of visits**, and each re-decode is only a decode plus
+loop re-entry (the walk state is already advanced). That is roughly 1.5% of the
+experimental matcher's excess over legacy, in exchange for a special case in
+the hottest loop plus a subtle epsilon interaction. Not pursued.
+
+**Candidate 4: co-locate fail-chain successors** so a hop is a same-line access.
+This is a *memory layout* change, not PGO. It is infeasible: `states[base ^ c]`
+must be a direct index (the double-array invariant), so reordering states for
+fail-chain locality would destroy O(1) transition lookup — the property that
+makes the automaton fast in the first place. Not attempted.
+
+So the flush walk is close to irreducible for this semantics.
 
 ## Bottom line
 
