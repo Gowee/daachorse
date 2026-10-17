@@ -368,6 +368,59 @@ the fail loads are dependent random accesses into an 11.5 MB state array. The
 trade is unfavourable for exp on prose, and favourable on dense fully-mapped
 text (unidic), which is exactly what the measurements show.
 
+## Exact load accounting: rewind also does random access
+
+An earlier note claimed rewind "repeats cheap work". That is too glib — the
+repeated work includes real random state loads. Instrumented counts, words100k,
+one pass:
+
+| | legacy | experimental |
+|---|---|---|
+| text bytes | 568,811 | 568,811 |
+| character visits (incl. rewind) | 622,130 | 589,087 |
+| — rewind overhead | **53,319 (+9.4%)** | 0 |
+| **state loads (random access)** | **485,851** | **888,270** |
+| — per byte | 0.854 | 1.562 |
+| transition probes | 485,535 | 453,212 |
+
+So legacy does pay random accesses for re-scanned characters. The asymmetry is
+still 1.83× in total state loads, and it decomposes exactly:
+
+    exp loads 888,270
+      − 437,218  iterations on unmapped characters
+      = 451,052  iterations on mapped characters
+
+On **mapped** characters exp loads *fewer* states than legacy (451,052 vs
+485,851 = 0.93×). The entire excess is the 437,218 unmapped-character
+iterations — 110,792 non-ROOT resets averaging 3.95 loop iterations each, where
+every iteration loads a fresh state to look for `output_pos`. Legacy never
+enters the loop for those characters at all.
+
+So the residual cost is: *one random state load per hop for characters that are
+not in the alphabet, and legacy pays zero.* That is the whole remaining
+difference.
+
+## How legacy overwrites `last_output_pos` (no comparison at all)
+
+There is no start/end comparison. The update is unconditional:
+
+    } else if let Some(output_pos) = self.pma.output_pos_unchecked(state_id) {
+        last_output_pos.replace(output_pos);   // unconditional
+        self.pos += skips;
+        skips = 0;
+    }
+
+Correctness comes from the automaton, not from a runtime test: the state machine
+only visits states reachable along the current path, and a state's `output_pos`
+is by construction the longest match ending at the current position. Each newly
+found output is therefore later than the previous one, and for the same start it
+is longer, so `replace` is always correct. `self.pos += skips` records where the
+new match ends, which is exactly where a later rewind resumes.
+
+The DEAD terminator enforces leftmost: once a match is committed at position E,
+every fail link under it is DEAD, so nothing starting before E can be reported
+afterwards.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
