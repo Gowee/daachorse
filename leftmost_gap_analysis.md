@@ -249,6 +249,65 @@ malloc+free of 96 B. On words100 the same removal recovers 4.7 ms, i.e.
 is not overlapped with cache-missing work. The optimisation is therefore
 largest exactly where the automaton is small and the per-line work is small.
 
+## Is the 32% probe instruction caused by the unmapped-char walk? No.
+
+This is worth stating flatly because it was asserted wrongly at one point.
+
+The instruction is `cmp expect, 0x4(states + (base ^ code))` — offset 4 in
+`State` is `check`, so it is `step_child`'s transition probe and nothing else.
+`step_child` begins with `if let (Some(code), Some(base)) = (mapped_c, base)`,
+so for an **unmapped** character it returns before touching memory. The probe
+therefore does not execute on the unmapped path at all.
+
+Measured two ways:
+
+| variant | probe share of cycles |
+|---|---|
+| current | 31.9% |
+| unmapped chars handled entirely outside the loop | 32.0% |
+
+Removing every unmapped execution of that instruction moves its share by 0.1
+points. And compared with legacy, the same instruction accounts for **37.5%**
+of legacy's cycles — *higher* than exp's. It is the shared, irreducible cost of
+a random access into an 11.5 MB double array, and it cancels out of the *gap*.
+
+That is the general lesson this document kept missing: a large share of total
+cycles tells you nothing about a difference between two implementations.
+
+## What the remaining gap actually is (after the inline buffer)
+
+`perf stat`, words100k, 100 reps, current code:
+
+| metric | legacy | experimental | delta |
+|---|---|---|---|
+| cycles | 4,757,158,317 | 5,386,181,136 | **+13.2%** |
+| instructions | 3,467,308,412 | 3,309,207,357 | **−4.6%** |
+| branch-misses | 29,675,693 | 37,619,103 | +26.8% |
+| L1 load-misses | 31,285,873 | 38,692,458 | +23.7% |
+| IPC | 0.729 | 0.614 | −15.8% |
+
+The experimental matcher now executes **fewer** instructions and still takes
+more cycles: the gap is pure throughput, not work. The exclusive hot spots in
+`perf annotate` are
+
+| share | instruction | meaning |
+|---|---|---|
+| 7.54% | `mov 0x8(%rsi,%r8,1)` | load `state.fail` |
+| 3.77% | `test %r12d,%r12d` | test `fail != 0` |
+| 2.05% | `mov %r12d,%r8d` | move fail into `state_id` |
+
+None of these appear in legacy's top list. The reason is the DEAD terminator:
+legacy loads `fail` once per *fail hop* (19,089/pass), while exp loads it once
+per *mismatch* (321,626/pass) — **16.8× more**. At ~14 cycles per dependent
+load that is 4.24 M cycles against a measured delta of 6.29 M, i.e. **~67% of
+the remaining gap**.
+
+So the correct statement of the residual gap is: exp must follow the real
+suffix link on every mismatch, where legacy's DEAD terminator collapses the
+walk to one step. That is the price of not rewinding, and it is what the
+earlier "unmapped-char walk" framing was reaching for — except that the walk's
+*length* (2.54 hops) was never the issue; the *number of times it starts* is.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
