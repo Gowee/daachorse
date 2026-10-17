@@ -316,6 +316,54 @@ haystacks interleave words with separators that never appear in any pattern.
 It passes on the baseline and fails the shortcut at round 71. That test is the
 durable outcome of this candidate.
 
+### Why `output_pos` looks like it should be enough (and is not)
+
+A natural reading of the code is: "`anyo` ends with the pattern `yo`, so
+`S_anyo.output_pos` should point at the `yo` emit with `gap == 0`, and one read
+would replace the walk." Measured against words100000, that model does not
+match the experimental automaton:
+
+| state | legacy `output_pos` chain | experimental `output_pos` |
+|---|---|---|
+| `any` (515580) | — | **none** |
+| `anyo` (515621) | `["yo"]` | **none** |
+| `nyo` (189351) | `["yo"]` | **none** |
+| `yo` (6149) | `["yo"]` | `["yo"]`, `gap == 0` |
+
+The model *does* hold for legacy, which stores outputs as a **dictionary-suffix
+chain**: every state whose path ends with a pattern carries that pattern.
+
+The experimental automaton stores the chain at the state where the pattern was
+**committed**, reached through the *suffix transition*, not through "is a suffix
+of my path". For `anyo` the active suffix is `nyo` (a trie node because
+`nyoogroop` exists), so the chain lives two fail hops away: `anyo -> nyo -> yo`.
+`anyo` itself has no `output_pos` at all. That is precisely why the walk exists,
+and why a flag describing trie-path ancestors cannot replace it.
+
+### Candidate 6: propagate `output_pos` along the failure chain at build time
+
+If `output_pos[s] = own(s) ?? output_pos[fail(s)]`, then a single read at an
+unmapped character would suffice — no hops. This is the right *set* (the failure
+chain, not the trie path), the gaps stay valid (all suffixes of a prefix end at
+the same text position), and the DP is O(1) per state in BFS order, the same
+recurrence as the rejected bitmap. Crucially it needs **no side array**: the
+pointer goes in the existing field.
+
+Implemented and tested. It fails:
+
+    patterns ["abcd", "bce", "b"], haystack "abce"
+    expected [(2,1,2), (1,1,4)]        actual [(1,1,4)]   // "b"@[1,2) lost
+
+The reason is that `output_pos` is not a spare slot — it is the **ordering
+primitive**. The runtime walks the failure chain and expects each state to
+contribute exactly its *own* pending chain, once, in order. Overwriting it with
+an inherited chain either duplicates a chain (the walk still reaches the
+ancestor) or masks the state's own emits.
+
+Storing both would need a second per-state field: 4 bytes × 645,120 = 2.5 MB,
+i.e. the path-compression table already rejected as worse than the 78 KB bitmap
+that measured as a wash.
+
 ## What was tried and rejected
 
 Each of these either broke correctness or was a wash. All are documented in
@@ -334,6 +382,7 @@ Appendix C with numbers.
 | prefetch, ROOT re-probe merge, `Vec::new()` | all neutral-to-worse |
 | flush at arrival instead of at failure | impossible for leftmost-longest: would emit `ab` before seeing `abc`. Deferral is the semantics |
 | trie-path "definitely no emit" flag | covers 84.5–100% of unmapped resets but is unsound: `fail(s)` can hold an emit while the whole trie path is clean. Loses 2,795 matches (11.7%) on words100k |
+| propagate `output_pos` along the fail chain at build time | right set, O(1) DP, no side array — but `output_pos` is the ordering primitive, not a spare slot; overwriting it loses matches (`abce`) |
 | consume the unmapped character once (whole-chain flush) | implemented correctly (full suite + 9 fuzz green) but **much slower everywhere** (words100k 1.17 → 1.57). One-emit-per-call is lazy, not wasteful |
 
 The recurring lesson: **the cost is dependent random loads, and adding a
