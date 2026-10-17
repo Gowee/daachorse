@@ -8,9 +8,17 @@ full experimental history. This file is the short, self-contained answer to
 ## TL;DR
 
 The residual per-character overhead of the zero-rewind experimental matcher on
-English prose is **almost entirely one thing**: when a character is not in the
-mapper, the experimental matcher must walk the failure chain to harvest
-pre-committed emits, while the legacy matcher returns to ROOT in O(1).
+English prose is **entirely** in the handling of characters absent from the
+mapper — but *not*, as an earlier revision of this note claimed, primarily in
+the failure-chain walk. Measured by ablation on the experimental arm alone
+(words100k): removing the walk buys 3.5%; handling unmapped characters with
+zero state-array access would buy **20.8%**, which would roughly tie legacy.
+
+So the walk is ~1/6 of the effect. The rest is the *iterations themselves*:
+every unmapped character enters the inner loop, which loads
+`states[state_id]`, and the state changes at every hop, so each hop is a fresh
+random load into the 11.5 MB array. Legacy touches no state at all for these
+characters.
 
 On characters that *are* in the alphabet the two matchers are at parity
 (19,745 vs 19,089 failure hops over 568,811 characters — a 3.4% difference).
@@ -420,6 +428,36 @@ which regime a caller is in, and since the fast path also adds a bit-borrowing
 scheme that must be enforced and serialized, this is **not adopted**. It is
 recorded because it is the first sound version and because it quantifies the
 ceiling: even with a perfect O(1) test, the remaining gap is ~1.20 → ~1.15.
+
+### Ablation of the unmapped-character cost (this is the load-bearing table)
+
+All measurements are the experimental arm alone, separate processes, medians of
+5 × 9 reps on `zin`, words100k (645k states, 27.3% unmapped characters).
+
+| variant | ms | vs baseline | sound? |
+|---|---|---|---|
+| baseline | 15.72 | — | yes |
+| `check` bit 31: replaces the walk with one AND | 15.17 | **−3.5%** | yes |
+| dense `fail`/`output_pos` arrays for the walk | 23.87 | **+51.8%** | yes |
+| skip unmapped characters entirely (no harvest) | 12.45 | **−20.8%** | **no** — an upper bound |
+
+Reading of the table:
+
+1. **The walk is not the main cost.** A sound, complete elimination of it
+   (candidate 7) buys 3.5%.
+2. **The extra iterations are.** The unsound upper bound shows 20.8% is
+   available if unmapped characters could be handled without touching
+   `states[]` at all. At 12.45 ms the experimental matcher would roughly tie
+   legacy (12.84–13.16 ms) on this dataset.
+3. **Dense side arrays are actively harmful.** Mirroring `fail` and
+   `output_pos` into 2.5 MB each makes the walk 52% slower: the two extra
+   arrays evict the double-array from cache. Any design that adds a parallel
+   per-state structure is fighting the same 11.5 MB working set.
+
+So the correct statement of the gap is: *exp pays a random `states[]` load per
+hop for every unmapped character, and legacy pays none.* The walk length (2.54
+hops) is what turns one load into 2.54 loads, but even a 1-hop version costs,
+because the first load is already there and it is the load that misses.
 
 ## What was tried and rejected
 
