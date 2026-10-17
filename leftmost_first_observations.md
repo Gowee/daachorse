@@ -223,3 +223,90 @@ Promising experiments still worth running (gate by correctness tests):
    when perf attributes the probe concretely on tyo2.
 3. Per `perf` on tyo2 (preferred over local — single-vCPU, matches production
    target): branch-misses per `state_id` / `mapped_c` predictability.
+
+## Appendix C — Root cause of the residual per-character gap (measured on `zin`)
+
+Setup: `zin` (4-core, idle, `perf` available), statically-linked musl binaries,
+`taskset -c 0`, alternating arms, medians. Both matchers built from the same
+source tree; only `MatchKind` differs. Harness scans sherlock line-by-line
+(official shape).
+
+### C.1 The gap is real and reproducible on `zin`
+
+| dataset | exp/leg (ns/char) | matches |
+|---|---|---|
+| words100 | 1.360 | 10 |
+| words5k | 1.423 | 567 |
+| words15k | 1.430 | 2,100 |
+| words100k | 1.328 | 23,826 |
+| unidic | **0.936** | 236,442 |
+
+Earlier local-box numbers (which showed parity or exp winning) were noise-
+contaminated; the single-vCPU-ish idle `zin` result is consistent across runs.
+Note exp is *faster* on unidic — the gap is not universal.
+
+### C.2 What it is NOT
+
+Measured and rejected, each with a full test-suite pass:
+
+- **The `output_pos()` read.** Ablation removing it from the hot loop moves
+  `real` by 0.8% (within code-layout noise).
+- **Unmapped-character fail-walking.** ~25% of English chars are unmapped
+  (spaces/punctuation). A correct fast path that skips the guaranteed-fail
+  probes and preserves the per-hop harvest (`U3`) removes **49% of inner-loop
+  iterations** (888,270 -> 451,052 on words100k) yet changes wall clock by
+  **+0.13%**. Those iterations never touched memory.
+- **Per-iterator allocation.** `Vec::with_capacity(4)` per iterator ->
+  `Vec::new()` was *worse* (+0.5%).
+- **Prefetching the child slot** (`_mm_prefetch`, T0): -0.08%.
+- **Inlining the ROOT re-probe** (probe ROOT instead of break-and-reprobe):
+  +0.3%, and it *increases* probe count.
+- **Re-enabling the fast-ROOT path + fusion**: breaks 7 fuzz tests
+  (correctness bug, not a perf option).
+- **UTF-8 decode**: manual `decode_char_unchecked` vs `chars()` is a wash.
+
+### C.3 What it IS: 2.11x more state-array touches per character
+
+Instrumented `states[]` accesses per character (sherlock, words100k):
+
+| | state loads/char | probes/char | fail loads/char | **total touches/char** |
+|---|---|---|---|---|
+| legacy | 0.854 | 0.853 | 0.038 | **1.746** |
+| experimental | 1.562 | 1.562 | 0.566 | **3.689** |
+
+Corroborating hardware counters (`perf stat`, words100k, 20 reps):
+
+| | cycles | instructions | L1 load-misses | LLC loads |
+|---|---|---|---|---|
+| legacy | 2,180,241,392 | 1,341,407,588 | 11,885,599 | 25,082,390 |
+| experimental | 2,685,281,656 (+23%) | 1,485,194,671 (+11%) | 14,882,971 (+25%) | 31,591,974 (+26%) |
+
+`perf annotate` puts **36.5% of all cycles on the single instruction**
+`cmp %ebp, 0x4(%rdx,%r10,1)` — the `states[base ^ c].check == expect` load. The
+instruction is cheap; the load it depends on is a random access into a
+644,363-state array (11.5 MB, far past L2/L3), so it stalls on a miss.
+
+### C.4 Why legacy touches less
+
+Legacy's `next_state_id_leftmost_unchecked` terminates the fail chain at
+`DEAD_STATE_IDX` once a match has been committed:
+
+    let fail_id = state.fail();
+    if fail_id == DEAD_STATE_IDX { return ROOT_STATE_IDX; }
+
+The experimental builder never emits a DEAD terminator — `fail_state` is only
+ever `ROOT_STATE_ID` or a real suffix state (see
+`build_fails_and_emits_leftmost_experimental_inner`, stage 2 step 2/3). So every
+mismatch walks the full chain to ROOT: 1.562 iterations/char vs legacy's 0.854.
+
+### C.5 Consequences
+
+- The gap **scales with automaton size**, not with matches or text length:
+  words100 (920 states, 16 KB — fits L1) shows the smallest absolute cost,
+  words100k (644,363 states, 11.5 MB) the largest. This is why microbenchmarks
+  on tiny automata or single-character texts showed no gap.
+- Fixing it is a **builder change** (introduce an equivalent early termination
+  in the experimental fail chain so a committed match can stop the walk), not a
+  loop-level tweak. All six loop-level attempts above failed for that reason.
+- unidic (dense Japanese, 236k matches, short fail chains) is unaffected and
+  the experimental matcher already wins there.
