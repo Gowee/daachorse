@@ -223,6 +223,32 @@ to `Vec::new()` measured as *worse*. Both allocate once per line, so that
 experiment never tested the actual cost — which is the allocation and the
 pointer indirection, not the initial capacity.
 
+### Follow-up experiments after the inline buffer
+
+**ROOT + unmapped fast skip (rejected).** After inlining the buffer, adding a
+branch that skips unmapped characters while sitting at ROOT made everything
+worse: words100 9.95 → 11.05 ms (−11%), words5k 10.2 → 11.3, words15k 11.1 →
+12.0, words100k 13.5 → 14.5. The branch costs more than the loop entry it
+avoids, because at ROOT the probe fails immediately and the loop is cheap. This
+reverses the earlier `v1` result measured *before* the buffer was inlined: the
+two changes interact, and once the allocation is gone the branch is no longer
+worth it.
+
+**fast-ROOT re-enable (rejected again, now with numbers).** Combining the
+inline buffer with the previously-disabled fast-ROOT path: words100 14.7 → 15.5,
+words5k 15.0 → 15.6, words15k 16.1 → 16.5, words100k 15.8 → 16.5, unidic 30.1 →
+31.1. Uniformly 3–6% worse. The path stays disabled.
+
+**Workload dependence of the win, measured honestly.** With the new code, one
+single large haystack (one iterator) costs 13.6 ms and 13,052 per-line
+iterators cost 13.9 ms — only 2% apart, confirming that the allocation is
+genuinely gone. Under the old code the per-line cost was 15.7 ms, so the
+1.8 ms recovered on words100k is 138 ns per iterator, which is a plausible
+malloc+free of 96 B. On words100 the same removal recovers 4.7 ms, i.e.
+360 ns per iterator, because there the scan is so cheap that the allocator cost
+is not overlapped with cache-missing work. The optimisation is therefore
+largest exactly where the automaton is small and the per-line work is small.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
