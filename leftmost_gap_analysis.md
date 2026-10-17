@@ -41,6 +41,69 @@ On characters that *are* in the alphabet the two matchers are at parity
 (19,745 vs 19,089 failure hops over 568,811 characters — a 3.4% difference).
 Everything else measured is noise, layout, or a wash.
 
+## Why legacy's O(1) test works, and what it does not imply
+
+A natural objection: *`last_output_pos` is a single register, so how can legacy
+know whether a match is pending on the failure chain? Surely it must walk too?*
+
+It does not, and the reason is a structural invariant rather than a lookup:
+
+**A match cannot straddle an unmapped character.** Patterns define the mapper,
+so every character in a pattern is mapped. An unmapped character therefore
+cannot belong to any match. If a match had started before the unmapped
+character and had not ended yet, that character would have to be part of it —
+a contradiction. Verified: patterns `["ab"]` with text `"aXb"` yield no match in
+*either* implementation; the `b` after `X` cannot resume the partial `a`.
+
+So at an unmapped character the only pending match is one that has **already
+ended**, and legacy keeps exactly one of those in `last_output_pos`. It never
+needs a chain, because it advances `self.pos` to each match's end as it goes —
+"at most one un-emitted match" is an invariant maintained by that advance.
+
+The experimental matcher defers commitment and does not advance `self.pos`
+during the scan, so it can accumulate several un-emitted matches and must store
+them as a chain. Measured: 99.5% of those chains have length 1, so the two
+matchers are *usually* in the same situation — but exp cannot prove it without
+looking, and looking is the walk.
+
+## Where the gap actually is (cycle accounting)
+
+`perf stat`, words100k, 20 reps, same binary, only `MatchKind` differs:
+
+| metric | legacy | experimental | delta |
+|---|---|---|---|
+| cycles | 2,179,138,196 | 2,638,595,692 | **+21.1%** |
+| instructions | 1,339,401,731 | 1,473,662,732 | +10.0% |
+| branch-misses | 9,621,468 | 12,479,891 | +29.7% |
+| cache-misses | 19,788,934 | 24,169,265 | +22.1% |
+| cache-references | 61,084,894 | 75,343,930 | +23.3% |
+
+Per rep the delta is 22,972,874 cycles, and it decomposes roughly as:
+
+| source | cycles | share |
+|---|---|---|
+| +6.71 M instructions (at the measured IPC) | ~10.1 M | ~44% |
+| +219 k cache misses | ~8.8 M | ~38% |
+| +143 k branch misses | ~2.6 M | ~11% |
+| overlap / remainder | ~1.5 M | ~7% |
+
+**There is no single cause.** The gap is ~10% more work, ~23% more cache
+misses, and ~30% more branch misses, compounding. This is why every single-axis
+optimisation (walk elimination, bitmap, cache, LTO, PGO, inlining) came back
+between −4% and +3%: each one attacks at most one of the three terms, and the
+largest single term is "more instructions", which is what the design inherently
+executes.
+
+Two specifics worth recording:
+
+- The `if let Some(ep) = state.output_pos()` branch on the mismatch path runs
+  321,626 times per pass and is taken only **7.0%** of the time. A 7/93 branch
+  with no correlation is close to worst case for a TAGE predictor, and it is
+  one of the top two branch-miss sites in `perf annotate`.
+- The top cache-miss site is the transition probe's
+  `cmp %ebx, 0x4(%rax,%r8,1)` — a random index into the 11.5 MB state array,
+  at 33.2% of all cycles.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
