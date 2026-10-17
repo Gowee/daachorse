@@ -364,6 +364,63 @@ Storing both would need a second per-state field: 4 bytes × 645,120 = 2.5 MB,
 i.e. the path-compression table already rejected as worse than the 78 KB bitmap
 that measured as a wash.
 
+## Candidate 7: borrow bit 31 of `check` (correct, but not worth it)
+
+`base` and `output_pos` are `Option<NonZeroU32>`, so they are `None` for 15.2%
+/ 66.4% (base) and 48.0% / 11.4% (output_pos) of states — a flag stored there
+would be unavailable exactly where it is needed. `check` and `fail` are always
+present. Of those two, `check` is the better host: it is already loaded by the
+transition probe on every inner-loop iteration, whereas `fail` is only read once
+the walk starts.
+
+`check` holds a parent id, which is always `< states.len()` (max observed
+644,367 for words100k, 1,023,880 for unidic), so bit 31 is free in practice.
+This is a **capability reduction**, not a free bit: the builder must enforce
+`states.len() <= 2^31`, halving the maximum automaton size. Unlike the
+`output_pos` proposal (which would halve the *emit* capacity at 0.34–0.77
+emits per state), halving the *state* limit is the same limit the field already
+has for `base`/`fail`, so it is consistent rather than a new constraint.
+
+Implementation: BFS one-pass DP
+`has_emit[s] = own(s) || has_emit[fail(s)]`, stored in bit 31 of `check`;
+`State::check()` masks it for the equality tests.
+
+Correctness: **passes the full suite, all 10 fuzz differentials (including the
+new unmapped-character fuzzer), and matches the baseline exactly on all five
+corpora** (23,826 / 236,442 matches, identical sequences). This is the first
+variant in this document that is both sound and non-trivial.
+
+Performance (experimental arm only, separate processes, medians of 5 × 9
+reps, `zin`):
+
+| dataset | baseline | with flag | delta | unmapped chars |
+|---|---|---|---|---|
+| words100 | 14.71 ms | 15.21 ms | **+3.4%** | 27.3% |
+| words5k | 15.01 ms | 14.78 ms | −1.5% | 21.5% |
+| words15k | 15.92 ms | 15.48 ms | −2.8% | 21.6% |
+| words100k | 15.77 ms | 15.17 ms | **−3.8%** | 27.3% |
+| unidic | 30.06 ms | 31.12 ms | **+3.5%** | 0.0% |
+
+The pattern is diagnostic:
+
+- **Where the flag pays off, it pays ~1.5–3.8%.** The saving is real: it
+  replaces ~1.54 dependent loads per unmapped character with one AND on a value
+  that is already in a register.
+- **Where it cannot pay off, it still costs ~3.4–3.5%.** unidic has 20
+  unmapped characters in 1.1 MB and regresses 3.5%; words100 has the same
+  unmapped fraction as words100k but regresses, because its automaton is tiny
+  and the walk it skips was already cheap.
+- The tax is **universal** (the extra branch and the flag test on every
+  unmapped character, plus the masked `check` on every probe), while the
+  benefit exists only when the walk is both frequent and expensive.
+
+So it is a genuine improvement for large automata on prose (−3.8% at 645k
+states) and a genuine regression everywhere else. Since the library cannot know
+which regime a caller is in, and since the fast path also adds a bit-borrowing
+scheme that must be enforced and serialized, this is **not adopted**. It is
+recorded because it is the first sound version and because it quantifies the
+ceiling: even with a perfect O(1) test, the remaining gap is ~1.20 → ~1.15.
+
 ## What was tried and rejected
 
 Each of these either broke correctness or was a wash. All are documented in
@@ -383,6 +440,7 @@ Appendix C with numbers.
 | flush at arrival instead of at failure | impossible for leftmost-longest: would emit `ab` before seeing `abc`. Deferral is the semantics |
 | trie-path "definitely no emit" flag | covers 84.5–100% of unmapped resets but is unsound: `fail(s)` can hold an emit while the whole trie path is clean. Loses 2,795 matches (11.7%) on words100k |
 | propagate `output_pos` along the fail chain at build time | right set, O(1) DP, no side array — but `output_pos` is the ordering primitive, not a spare slot; overwriting it loses matches (`abce`) |
+| borrow bit 31 of `check` for a "fail chain has emit" flag | **sound and correct** (full suite + 10 fuzz + identical matches), and −3.8% at words100k — but +3.4% on small automata and +3.5% on unidic, because the tax is universal and the benefit is not. Not adopted |
 | consume the unmapped character once (whole-chain flush) | implemented correctly (full suite + 9 fuzz green) but **much slower everywhere** (words100k 1.17 → 1.57). One-emit-per-call is lazy, not wasteful |
 
 The recurring lesson: **the cost is dependent random loads, and adding a
