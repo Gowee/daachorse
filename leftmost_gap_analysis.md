@@ -143,10 +143,60 @@ exp/leg ratio therefore looks better (1.20 → 1.15) purely because the
 denominator grew. Since both matchers are built from the same crate, LTO cannot
 be applied to one arm only, so this is not an available improvement.
 
-The one loop-level idea from Appendix B that was never implemented is inlining
-`step_child` into the legacy four-line form to remove the double-`Option`
-destructure. It was listed as "promising, expected a few %" but never measured.
-That is the honest remaining gap in coverage.
+Three further directions were measured this round, all negative:
+
+- **`step_child` inlined to the legacy four-line form** (two `if let`s instead
+  of a tuple destructure): no change at any dataset (words100k 1.178–1.212 vs
+  baseline 1.175–1.218; unidic 0.946–0.952 vs 0.945–0.957). LLVM was already
+  emitting the straight-line xor/load/compare.
+- **LTO** (`fat` / `thin` + `codegen-units = 1`): experimental absolute time
+  unchanged; legacy ~4.3% slower. The ratio only improves because the
+  denominator grows.
+- **PGO** (`-C profile-generate` trained on all five datasets, then
+  `-C profile-use`): both arms get *slower* (legacy 10.7 → 12.2 ms,
+  experimental 13.6 → 14.6 ms on words100). Harmful on this workload.
+
+With that, every direction identified so far has been measured. Eleven were
+neutral or negative; two are structurally impossible.
+
+### Why nothing helps: the first probe is free
+
+A detail that explains all of the above. The inner loop already loads
+`states[state_id]` at the top of every iteration to read `base`. When the
+transition fails, the code reads `output_pos` from that **already-loaded**
+state. So the first check in the flush walk costs nothing.
+
+The walk averages 2.54 hops, so the number of *paid* random loads is about
+**1.54 per unmapped character**, not 2.54. Any scheme that replaces those
+1.54 loads with "one probe into a side table" is trading one dependent load
+for another — which is exactly what the bitmap, the cache, and path
+compression all do, and why all three measured as a wash or worse.
+
+Path compression (`skip[s]` = first ancestor with an emit) is the same idea
+with 32-bit entries instead of 1-bit: 2.5 MB instead of 78 KB, so it is worse
+than the bitmap that already failed. Not implemented.
+
+### What the structure does and does not preserve
+
+`State` keeps `base`, `check`, `fail`, `output_pos` and nothing else — exactly
+16 bytes. The NFA's `output` vector (which is non-empty iff a pattern *ends*
+at that state) is **discarded** in `set_fails_and_outputs`; only `output_pos`
+is copied.
+
+That distinction matters, and it is why a legacy-style register cannot be
+transplanted directly:
+
+| | legacy | experimental |
+|---|---|---|
+| `output_pos.is_some()` means | a pattern ends here | an in-flight committed chain exists (inherited from the parent) |
+| fraction of states with it | only word-end states | **52.0%** (words100k) |
+| of those, `Emit.gap == 0` | n/a | **31.9%** only |
+
+So neither `output_pos.is_some()` nor `gap == 0` identifies "a match ends at
+this state" in the experimental automaton. A word-end bit *could* be recovered
+for free (bit 31 of the 1-based `output_pos` index), but it would not help: the
+flush walk needs the first emit on the fail chain, not the word-end flag, and
+computing that is what the walk already does.
 
 ## What was tried and rejected
 
