@@ -165,6 +165,64 @@ Two specifics worth recording:
   `cmp %ebx, 0x4(%rax,%r8,1)` — a random index into the 11.5 MB state array,
   at 33.2% of all cycles.
 
+## The fix that worked: inline the pending-match buffer
+
+Every other attempt in this document attacked the *scan*. The largest remaining
+cost was not in the scan at all: `LeftmostFindIteratorExperimental` owned a
+`Vec<Match<V>>` for pending matches, allocated with `with_capacity(4)` at
+iterator construction. The common usage pattern creates one iterator per
+haystack — in the benchmark, one per line of `sherlock.txt`, i.e. **13,052
+iterators per pass**.
+
+Measured allocation counts (counting global allocator, one pass over sherlock):
+
+| | allocations | bytes |
+|---|---|---|
+| baseline | **13,052** | 1,252,992 |
+| inline buffer | **0** | 0 |
+
+Meanwhile the buffer almost never holds more than one element: emit chains are
+length 1 in 99.5% of cases (max observed 3), and 99.7% of `next()` calls find
+the buffer empty and scan. So the allocation bought nothing.
+
+The fix replaces the `Vec` with `MatchBuf<V, 4>`: four `Option<Match<V>>` slots
+inline in the iterator, plus a `Vec` used only as a spill for chains longer
+than four (which never occurred on these corpora but must be supported).
+
+Results, experimental arm only, medians of 5 × 9 reps on `zin`:
+
+| dataset | before | after | delta |
+|---|---|---|---|
+| words100 | 14.72 ms | **10.00 ms** | **−32.1%** |
+| words5k | 15.03 ms | **10.19 ms** | **−32.2%** |
+| words15k | 16.10 ms | **11.02 ms** | **−31.6%** |
+| words100k | 15.71 ms | **13.69 ms** | **−12.9%** |
+| unidic | 30.92 ms | 30.66 ms | −0.8% |
+
+And the head-to-head ratio against legacy, same binary, alternating arms:
+
+| dataset | exp/leg before | exp/leg after |
+|---|---|---|
+| words100 | 1.27 | **0.96** (exp wins) |
+| words5k | 1.40 | **1.02** |
+| words15k | 1.41 | **1.02** |
+| words100k | 1.17 | **1.07** |
+| unidic | 0.95 | 1.00 |
+
+Correctness: full suite, all 10 fuzz differentials, and byte-identical match
+sequences on all five corpora (10 / 567 / 2,100 / 23,826 / 236,442 matches).
+
+Why the gain scales inversely with automaton size: the allocation is a **fixed
+per-line cost**, so it dominates when the per-line scan is cheap. On words100
+(920 states, all in L1) the scan is nearly free and the allocation was most of
+the time; on words100k (645k states, 11.5 MB) cache misses dominate and removing
+the allocation only recovers 13%.
+
+This also explains a previously puzzling result: switching `with_capacity(4)`
+to `Vec::new()` measured as *worse*. Both allocate once per line, so that
+experiment never tested the actual cost — which is the allocation and the
+pointer indirection, not the initial capacity.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on

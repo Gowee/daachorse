@@ -628,6 +628,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     ) -> LeftmostFindIteratorExperimental<'_, P, V>
     where
         P: AsRef<str>,
+        V: Copy,
     {
         assert!(
             self.match_kind.is_experimental(),
@@ -641,7 +642,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             // TEST-ONLY capacity probe: most mismatch buffers hold 1-2 matches;
             // 4 avoids all reallocs for k<=4 at ~96B per iterator (one alloc per
             // `leftmost_find_iter_experimental` call, amortized over the scan).
-            buf: Vec::with_capacity(4),
+            buf: crate::charwise::iter::MatchBuf::new(),
             gate: PrefilterGate::new(),
             epsilon_emit_pos: self.states[usize::from_u32(ROOT_STATE_IDX)].output_pos(),
             epsilon_cursor: 0,
