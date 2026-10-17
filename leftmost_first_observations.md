@@ -387,6 +387,51 @@ This is why the gap scales with automaton size (see C.6) and why it is absent
 on Japanese: a bigger array makes each flush load more likely to miss cache,
 and Japanese text has essentially no unmapped characters.
 
+### C.5.1 Attempted fix: per-state "emit below" bitmap (rejected, no gain)
+
+Since 81.9% of the unmapped-character walks find no emit at all (90,783 of
+110,792), a boolean per state — "does my failure chain hold an `output_pos`?" —
+can prove those walks fruitless and skip them. The bit is computable in one BFS
+pass (failure links always point to strictly shallower states) and stored as a
+78 KB bitmap for 645k states, small enough to stay in L2.
+
+Implementation, correctness, and result:
+
+- The shortcut fires exactly as predicted: **90,783 hits**, 20,009 bypasses,
+  44,554 characters already at ROOT. So the optimisation does what it claims.
+- Full test suite plus all 9 fuzz differentials pass. Match counts are
+  identical.
+- **Wall clock does not improve** — 1.195–1.224 vs 1.173–1.181 exp/leg on
+  words100k, i.e. very slightly *worse*. On words100 noisier but also worse
+  (1.367 vs 1.263). unidic unchanged.
+- Hardware counters explain it: cycles −3.0% and instructions −1.5%, but
+  **L1 load-misses +8.5%**.
+
+The bitmap lookup is itself a random access into a 78 KB structure that is not
+guaranteed resident, so it introduces roughly as many misses as the hops it
+removes. Net effect zero. Reverted; the tree is unchanged.
+
+This is the third independent confirmation of the same lesson: **the cost is
+dependent random loads, and any fix that adds a dependent random load to save
+other dependent random loads is a wash.**
+
+### C.5.2 `decode_char_unchecked` (rejected, no gain)
+
+`decode_char_unchecked` branches on UTF-8 length. Ablating it to a plain
+one-byte read measured 17.1 ms -> 14.3 ms (−16%) on sherlock, which looked like
+a large win. It is not: a control variant with **identical semantics** (an
+ASCII fast branch that is always taken, so the same instruction sequence on
+ASCII text) measured the same 14.3–16.0 ms. The gain is code-layout noise, not
+the decode logic.
+
+A genuine rewrite (early-return ASCII fast path) is neutral on English
+(1.147–1.303 vs 1.185–1.241) and **measurably worse on unidic** (0.975–0.985 vs
+0.942–0.965), because 91.9% of unidic's bytes are multi-byte and pay the extra
+branch. Rejected.
+
+Conclusion: UTF-8 decoding is not a meaningful cost on this workload. The
+earlier note in C.2 ("a wash") stands, and the −16% figure was an artifact.
+
 ### C.6 Consequences
 
 - The English-prose deficit is **fully explained** by the unmapped-character
@@ -395,8 +440,9 @@ and Japanese text has essentially no unmapped characters.
 - A fix would have to eliminate the flush walk without reintroducing rewind —
   i.e. keep the pending-emit head in the iterator (as legacy does) while still
   pre-committing chains on states. That is a **design change**, not a tweak.
-  Every loop-level attempt (C.2, plus UM0/UM1/UM2/UM3) either broke correctness
-  or changed nothing.
+  Every attempt so far either broke correctness or changed nothing: UM0/UM1/UM2
+  (C.4), UM3 (C.4), the `emit_below` bitmap (C.5.1), and UTF-8 decode
+  restructuring (C.5.2).
 - The gap **scales with automaton size**, not with matches or text length:
   words100 (920 states, 16 KB — fits L1) shows the smallest cost, words100k
   (644,363 states, 11.5 MB) the largest. This is why microbenchmarks on tiny
