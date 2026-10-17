@@ -14,11 +14,28 @@ the failure-chain walk. Measured by ablation on the experimental arm alone
 (words100k): removing the walk buys 3.5%; handling unmapped characters with
 zero state-array access would buy **20.8%**, which would roughly tie legacy.
 
-So the walk is ~1/6 of the effect. The rest is the *iterations themselves*:
-every unmapped character enters the inner loop, which loads
-`states[state_id]`, and the state changes at every hop, so each hop is a fresh
-random load into the 11.5 MB array. Legacy touches no state at all for these
-characters.
+So the walk is ~1/6 of the effect. The rest is the unmapped characters
+themselves — but **not** the extra inner-loop iterations, as an earlier revision
+of this paragraph claimed. Two sound variants that remove the walk while keeping
+every match give only 3.5–6%:
+
+| dataset | baseline | `check` bit 31 | 1-byte side table |
+|---|---|---|---|
+| words100 | 14.73 | — | **14.16 (−3.9%)** |
+| words5k | 15.00 | 14.78 (−1.5%) | **14.09 (−6.1%)** |
+| words15k | 15.96 | 15.48 (−2.8%) | **15.21 (−4.7%)** |
+| words100k | 15.85 | **15.17 (−3.5%)** | 16.24 (+2.5%) |
+| unidic | 30.12 | 31.12 (+3.5%) | 30.24 (+0.4%) |
+
+The two carriers trade places with automaton size, exactly as the cache
+argument predicts: a 1-byte side table (645 KB) is cheap when the automaton is
+small and actively harmful at 645k states, where it competes with the 11.5 MB
+double-array; the bit inside `State::check` costs nothing extra but pays a
+mask on every probe.
+
+**So a sound O(1) test for "does my fail chain hold an emit" is worth ~4–6%.**
+The remaining 11–17 points of the gap are *not* the walk and are not addressed
+by any of these.
 
 On characters that *are* in the alphabet the two matchers are at parity
 (19,745 vs 19,089 failure hops over 568,811 characters — a 3.4% difference).
@@ -439,16 +456,22 @@ All measurements are the experimental arm alone, separate processes, medians of
 | baseline | 15.72 | — | yes |
 | `check` bit 31: replaces the walk with one AND | 15.17 | **−3.5%** | yes |
 | dense `fail`/`output_pos` arrays for the walk | 23.87 | **+51.8%** | yes |
-| skip unmapped characters entirely (no harvest) | 12.45 | **−20.8%** | **no** — an upper bound |
+| skip unmapped characters entirely (no harvest) | 12.45 | −20.8% | **no — and not an upper bound** |
 
 Reading of the table:
 
 1. **The walk is not the main cost.** A sound, complete elimination of it
    (candidate 7) buys 3.5%.
-2. **The extra iterations are.** The unsound upper bound shows 20.8% is
-   available if unmapped characters could be handled without touching
-   `states[]` at all. At 12.45 ms the experimental matcher would roughly tie
-   legacy (12.84–13.16 ms) on this dataset.
+2. ~~**The extra iterations are.**~~ **Retracted.** That variant emits only
+   3,716 of 23,826 matches (it loses 84%), so it was timed doing far less
+   emission and far fewer `next()` round trips. It is not an upper bound for
+   any sound change. The honest sound ceiling is the 3.5–6% above.
+
+   Isolating the emission path directly is not possible in this harness:
+   removing `buf.extend` lets LLVM delete the whole scan (unidic 30 ms →
+   0.13 ms), and even a `black_box` accumulator loses the dependency because
+   the harness only counts matches. So the remainder of the gap is measured
+   only as "the whole minus the walk", not decomposed further.
 3. **Dense side arrays are actively harmful.** Mirroring `fail` and
    `output_pos` into 2.5 MB each makes the walk 52% slower: the two extra
    arrays evict the double-array from cache. Any design that adds a parallel
