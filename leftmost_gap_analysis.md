@@ -193,10 +193,65 @@ transplanted directly:
 | of those, `Emit.gap == 0` | n/a | **31.9%** only |
 
 So neither `output_pos.is_some()` nor `gap == 0` identifies "a match ends at
-this state" in the experimental automaton. A word-end bit *could* be recovered
-for free (bit 31 of the 1-based `output_pos` index), but it would not help: the
-flush walk needs the first emit on the fail chain, not the word-end flag, and
-computing that is what the walk already does.
+this state" in the experimental automaton.
+
+### Correction: bit 31 of `output_pos` is NOT free
+
+An earlier revision of this note claimed a word-end bit could be recovered for
+free from bit 31 of the 1-based `output_pos` index. That is wrong, and the
+reason matters:
+
+- `output_pos` is `Option<NonZeroU32>`, niche-optimised: 0 means `None` and the
+  value indexes `emits[pos - 1]`. Its real range is **1..=u32::MAX**.
+- The builder enforces exactly that and nothing tighter:
+  `NonZeroU32::new(u32::try_from(self.emits.len()).unwrap()).unwrap()` — it
+  panics only past `u32::MAX`. There is no `2^31` bound anywhere.
+- `emits` is the same order of magnitude as `states`: 222,366 emits for 645,120
+  states (words100k), 785,533 for 1,024,000 (unidic), i.e. 0.34 and 0.77 per
+  state. So the pool genuinely can grow into the billions.
+
+Borrowing bit 31 would therefore silently halve the supported emit capacity
+from 4.29e9 to 2.15e9. It saves no memory (the field is already there) and it
+costs range. Not acceptable, and not needed — see the next point.
+
+### `gap == 0` semantics, measured
+
+`Emit.gap` is the distance from the state's path end back to the head match's
+end, and `iter_emits` computes `end = pos - gap`. Two separate questions:
+
+**(a) Structurally, is `gap == 0` equivalent to "a pattern ends at this state"?**
+No. It is a strict superset. Measured over all states:
+
+| dataset | word-end states | `gap == 0` states | word-end but `gap != 0` | `gap == 0` but not word-end |
+|---|---|---|---|---|
+| words5k | 5,000 | 5,015 | **0** | 15 |
+| words100k | 100,001 | 107,038 | **0** | **7,037** |
+| unidic | 674,927 | 685,059 | **0** | **10,132** |
+
+So `word-end => gap == 0` always (it is a necessary condition), but the
+converse fails for ~6.6% of `gap == 0` states. The extra cases come from
+`push_leaf` and the root-covered fast path: when the *active suffix* completes
+a leaf pattern, that match ends at the same text position as the current
+state's boundary, so `gap == 0` fires even though the pattern does not end at
+this trie state.
+
+**(b) At runtime, does `gap == 0` mean the last match ends at the mismatch
+point?** By definition yes (`end = pos - gap`), but it is *not* always the case,
+and that is the interesting part:
+
+| dataset | harvests | head `gap == 0` | head `gap > 0` |
+|---|---|---|---|
+| words100k | 23,717 | 9,559 (40.3%) | **14,158 (59.7%)** |
+| unidic | 235,983 | 218,808 (92.7%) | 17,175 (7.3%) |
+
+In 59.7% of English harvests the head match ends *before* the mismatch
+position, i.e. characters were consumed after the match without being matched.
+That is expected for leftmost-longest over prose (the scan extends past a
+committed match looking for a longer one, then fails).
+
+So `gap == 0` is a usable test for "the head match ends exactly here", but it is
+neither equivalent to "this state is a pattern end" nor a constant property of
+harvests.
 
 ## What was tried and rejected
 
