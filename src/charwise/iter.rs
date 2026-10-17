@@ -843,8 +843,7 @@ where
                 if let Some(ep) = state.output_pos() {
                     // SAFETY: builder guaranteed that any linked list indicated
                     // by state.output_pos is valid
-                    self.buf
-                        .extend(unsafe { self.pma.iter_emits(ep, pos) });
+                    self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
                     // // Fusion: the fail landed on ROOT, so consume the current
                     // // character from ROOT now instead of re-decoding it on the
                     // // next call (standard AC fallback, same result).
@@ -866,8 +865,8 @@ where
                         state_id = child_id;
                         pos += char_len;
                     }
-            self.pos = pos;
-            self.state_id = state_id;
+                    self.pos = pos;
+                    self.state_id = state_id;
                     return;
                 }
             }
@@ -888,17 +887,20 @@ where
             if let Some(ep) = emit_pos {
                 // SAFETY: builder guaranteed that any linked list indicated
                 // by state.output_pos is valid
-                self.buf
-                    .extend(unsafe { self.pma.iter_emits(ep, pos) });
-            self.pos = pos;
-            self.state_id = state_id;
+                self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
+                self.pos = pos;
+                self.state_id = state_id;
                 return;
             }
         }
         self.pos = pos;
         self.state_id = state_id;
     }
-fn ensure_buffered(&mut self) {
+
+    /// Ensures `self.buf` contains the next non-empty match(es), scanning forward
+    /// if the buffer is currently empty.
+    #[inline(always)]
+    fn ensure_buffered(&mut self) {
         if self.buf.is_empty() {
             if self.pma.prefilter.is_some() && self.gate.is_enabled() {
                 self.ensure_buffered_impl::<true>();
