@@ -16,6 +16,27 @@ On characters that *are* in the alphabet the two matchers are at parity
 (19,745 vs 19,089 failure hops over 568,811 characters — a 3.4% difference).
 Everything else measured is noise, layout, or a wash.
 
+## Why an earlier note said "~10%"
+
+Appendix B records a callgrind run that reported the remaining cost as "~10% on
+English". That number is not comparable with the table below and should not be
+quoted as the current gap. It was measured on:
+
+- **words_100 (920 states, 16 KB — fits in L1)**, not words100k;
+- **400 sherlock lines**, not the whole book;
+- instruction/data-reference counts under cache simulation, with the note that
+  L1/LL miss rates were *identical* — i.e. it deliberately excluded the
+  memory-hierarchy effect that dominates at larger automaton sizes.
+
+At 920 states the fail-chain flush walk is nearly free (every state is in L1),
+so that run measured the *residual* gap with the main effect removed. The
+current 17–41% figures come from full-haystack wall clock on a quiet 4-core
+box across five automaton sizes, and they include the flush walk.
+
+Both numbers are correct for what they measured; they are not the same
+quantity. The honest summary is the table below, plus the causal experiment:
+remove the unmapped characters and the sign flips.
+
 ## The measurement
 
 words100k (100,001 patterns, 645k states, 11.5 MB) over `sherlock.txt`
@@ -98,6 +119,35 @@ Same automaton, same text, only the unmapped fraction changed.
 The sign flip on a single-variable change is the strongest evidence available
 here, and it rules out "the experimental design is just slower".
 
+## What is actually applied today
+
+Applied and measured as wins (all in HEAD):
+
+- **locals-hoist** (`aaf4f21`): `pos` / `state_id` live in registers inside
+  `ensure_buffered_impl` and are written back at exits. +8–19% on `zin`.
+- **fast-ROOT removal** (`c5f503e`): a correctness fix (it broke 7 fuzz tests),
+  kept because it is correct, not because it is faster.
+- The current scan shape otherwise: one `states[state_id]` load per inner
+  iteration feeding both the probe and the fail/output reads.
+
+Not applied, because each measured neutral or negative (see the table below):
+`U3` unmapped probe skip, `Vec::new()` buffers, `_mm_prefetch`, ROOT re-probe
+merge, `emit_below` bitmap, direct-mapped flush cache, whole-chain flush,
+UTF-8 decode restructuring, and the fast-ROOT re-enable.
+
+**LTO was never part of the numbers above.** It was measured separately and
+does not help the experimental matcher: with `lto = "fat"` + `codegen-units = 1`
+the experimental arm's absolute time is unchanged (words100k 15.3–15.6 ms both
+ways; words15k 15.6–16.0 both ways), while *legacy* gets ~4.3% slower. The
+exp/leg ratio therefore looks better (1.20 → 1.15) purely because the
+denominator grew. Since both matchers are built from the same crate, LTO cannot
+be applied to one arm only, so this is not an available improvement.
+
+The one loop-level idea from Appendix B that was never implemented is inlining
+`step_child` into the legacy four-line form to remove the double-`Option`
+destructure. It was listed as "promising, expected a few %" but never measured.
+That is the honest remaining gap in coverage.
+
 ## What was tried and rejected
 
 Each of these either broke correctness or was a wash. All are documented in
@@ -115,7 +165,7 @@ Appendix C with numbers.
 | fast-ROOT path + fusion | breaks 7 fuzz tests — a correctness fix, not a perf option |
 | prefetch, ROOT re-probe merge, `Vec::new()` | all neutral-to-worse |
 | flush at arrival instead of at failure | impossible for leftmost-longest: would emit `ab` before seeing `abc`. Deferral is the semantics |
-| consume the unmapped character once (whole-chain flush) | 20,010 repeated decodes found (12.9% of unmapped events), but the ceiling is 3.4% of char visits and it breaks the epsilon buffer invariant |
+| consume the unmapped character once (whole-chain flush) | implemented correctly (full suite + 9 fuzz green) but **much slower everywhere** (words100k 1.17 → 1.57). One-emit-per-call is lazy, not wasteful |
 
 The recurring lesson: **the cost is dependent random loads, and adding a
 dependent random load to avoid other dependent random loads is a wash.**
@@ -191,22 +241,33 @@ Two facts constrain the design:
 
 **Candidate 3: consume the character once (flush the whole chain).** The
 current code emits *one* match and returns without advancing `pos`, so the same
-unmapped character is decoded and re-walked once per pending emit. Measured:
-**20,010 repeated decodes out of 155,346 unmapped-character events (12.9%)** —
-exactly one per emit-producing reset.
+unmapped character is decoded and re-entered once per pending emit. Measured:
+**20,010 repeated decodes out of 155,346 unmapped-character events (12.9%)**.
 
-This is a real inefficiency, and a whole-chain flush was made to pass all nine
-fuzz differentials. It still broke two epsilon tests, because `next()`'s
-zero-length-pattern interpolation depends on `buf.last()` being the pending
-match for the *current* position, which bulk-filling the buffer changes. The
-`epsilon_emit_pos` guard that would gate it is unreliable mid-scan (the field is
-`take()`n to `None` after the first `next()`).
+A correct whole-chain flush was implemented and it passes the full suite **and
+all 9 fuzz differentials** (the earlier 8/9 attempts failed on chain-ordering
+and then on a fixed-size head buffer overflowing; the working version reverses
+only the *order of chains*, not the contents of each chain). Result:
 
-Even if finished, the ceiling is small: 20,010 re-decodes out of 589,087
-character visits = **3.4% of visits**, and each re-decode is only a decode plus
-loop re-entry (the walk state is already advanced). That is roughly 1.5% of the
-experimental matcher's excess over legacy, in exchange for a special case in
-the hottest loop plus a subtle epsilon interaction. Not pursued.
+| dataset | baseline exp/leg | whole-chain flush |
+|---|---|---|
+| words100 | 1.261–1.271 | **1.508–1.511** |
+| words5k | 1.387–1.480 | **1.649–1.664** |
+| words15k | 1.395–1.411 | **1.661–1.696** |
+| words100k | 1.173–1.207 | **1.574–1.683** |
+| unidic | 0.952–0.964 | **1.030–1.037** |
+
+It is **much slower everywhere**. The reason is instructive: the original
+one-emit-per-call design is not waste, it is *lazy*. Emitting one match and
+returning lets `next()` hand it to the caller immediately; the caller often
+stops iterating right there (`.count()`, `.take()`, a first-match query), and
+the remaining chain is never walked. Bulk-flushing walks and materialises the
+entire chain even when the caller will never ask for it, and it adds the
+scratch-vector bookkeeping on every unmapped character. The 12.9% of repeated
+decodes is cheaper than the work it would save.
+
+This is the fifth loop-level attempt, and the same lesson again: the apparent
+inefficiency is load-bearing.
 
 **Candidate 4: co-locate fail-chain successors** so a hop is a same-line access.
 This is a *memory layout* change, not PGO. It is infeasible: `states[base ^ c]`
