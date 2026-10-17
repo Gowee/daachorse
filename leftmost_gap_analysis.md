@@ -308,6 +308,66 @@ walk to one step. That is the price of not rewinding, and it is what the
 earlier "unmapped-char walk" framing was reaching for — except that the walk's
 *length* (2.54 hops) was never the issue; the *number of times it starts* is.
 
+## Corrections to three claims made earlier in this investigation
+
+### 1. The "delete unmapped characters" experiment does not show what it seemed
+
+It reported exp/leg flipping from 1.42 to 0.88 and was presented as causal
+proof that unmapped characters are the cost. Re-running the identical
+experiment on the current code:
+
+| variant | matches | legacy | experimental | ratio |
+|---|---|---|---|---|
+| prose as-is | 23,826 | 5.91 ms | 7.19 ms | 1.217 |
+| non-`a-z` deleted | **35,808** | **15.55 ms** | **15.90 ms** | 1.023 |
+
+Deleting the separators makes **both** implementations 2.2–2.6× *slower*,
+because it merges words and produces 50% more matches. The ratio moves only
+because legacy slows down more (2.6× vs 2.2×) — that is rewind cost growing
+with match density, not unmapped characters costing exp anything.
+
+So the experiment never isolated the unmapped fraction. It is a clean
+demonstration that dense matches punish legacy's rewind, and nothing more.
+The direction of the earlier claim was not wrong, but its magnitude was an
+artifact.
+
+### 2. The probe instruction is not on the unmapped path, but that was the wrong point
+
+`step_child` does return before loading when `mapped_c` is `None`, so the hot
+`cmp ... 0x4(states + base^code)` never executes for an unmapped character.
+That is true and was verified (31.9% of cycles with the current code, 32.0%
+with unmapped handling moved out of the loop).
+
+But it does not address the fail-walk question. The expensive access on the
+unmapped path is the **next** state load:
+
+    load states[s]            <- base/check/fail/output_pos, one line
+    step_child -> None        <- no probe, as stated
+    read states[s].fail       <- same line, free
+    read states[s].output_pos <- same line, free
+    state_id = fail(s)
+    load states[fail(s)]      <- NEW random access: this is the cost
+    ... repeat
+
+So the cost is one fresh random load per hop, exactly as the objection said.
+Saying "not step_child" answered a question nobody asked.
+
+### 3. Why DEAD + rewind beats following the real suffix chain
+
+Rewind does re-do work: legacy visits 1.094 characters per byte against exp's
+1.036, i.e. 5.6% *more*. It still wins on prose because the work it avoids is
+more expensive than the work it repeats:
+
+| | per mismatch |
+|---|---|
+| legacy | one loop iteration (DEAD terminates it), ~19 k fail loads per pass |
+| experimental | 2.54 iterations, 322 k fail loads per pass (16.8×) |
+
+The extra character visits are sequential over a 569 KB text that stays in L2;
+the fail loads are dependent random accesses into an 11.5 MB state array. The
+trade is unfavourable for exp on prose, and favourable on dense fully-mapped
+text (unidic), which is exactly what the measurements show.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
