@@ -45,26 +45,51 @@ Everything else measured is noise, layout, or a wash.
 
 A natural objection: *`last_output_pos` is a single register, so how can legacy
 know whether a match is pending on the failure chain? Surely it must walk too?*
+Concretely: patterns `abcdef, bc, de`, input `abcdeZ`. At state `abcde` the `Z`
+is unmapped — does legacy not have to walk?
 
-It does not, and the reason is a structural invariant rather than a lookup:
+It does not walk, and the trace shows why. Legacy on `abcdeZ`:
 
-**A match cannot straddle an unmapped character.** Patterns define the mapper,
-so every character in a pattern is mapped. An unmapped character therefore
-cannot belong to any match. If a match had started before the unmapped
-character and had not ended yet, that character would have to be part of it —
-a contradiction. Verified: patterns `["ab"]` with text `"aXb"` yield no match in
-*either* implementation; the `b` after `X` cannot resume the partial `a`.
+| char | state | `last_output_pos` | `self.pos` | skips |
+|---|---|---|---|---|
+| `a` | 0→2 | None | 0 | 1 |
+| `b` | 2→7 | None | 0 | 2 |
+| `c` | 7→8 | None | 0 | 3 |
+| `d` | 8→9 | **Some(1) = `bc`** | **0→3** | 1 |
+| `e` | 9→10 | Some(1) | 3 | 2 |
+| `Z` | 10→0 | Some(1) | 3 | 3 → emits `bc` |
 
-So at an unmapped character the only pending match is one that has **already
-ended**, and legacy keeps exactly one of those in `last_output_pos`. It never
-needs a chain, because it advances `self.pos` to each match's end as it goes —
-"at most one un-emitted match" is an invariant maintained by that advance.
+Two corrections to the intuitive picture:
 
-The experimental matcher defers commitment and does not advance `self.pos`
-during the scan, so it can accumulate several un-emitted matches and must store
-them as a chain. Measured: 99.5% of those chains have length 1, so the two
-matchers are *usually* in the same situation — but exp cannot prove it without
-looking, and looking is the walk.
+1. **The pending match is discovered at the mapped character that completes it,
+   not at the unmapped one.** `bc` is committed at `d` (state 8→9), and
+   `self.pos` jumps to 3 right there. By the time `Z` arrives, the register
+   already holds it; there is nothing to search for.
+2. **The match that starts after the commit point is found by re-scanning.**
+   After `Z` emits `bc` with `end = self.pos = 3`, the next call resumes at
+   position 3 — so `d`, `e`, `Z` are processed *again*. The trace shows this
+   literally: the second pass is `d e Z`, and `de` is committed at the second
+   `e`. That is the rewind.
+
+So the trade in this example is exact:
+
+- **legacy**: no walk at `Z`, but re-scans `d e Z` (the text is read twice).
+- **experimental**: walks the failure chain at `Z`, but never re-scans. Its
+  inner loop runs 7 iterations for this input versus 5 for `abcde`.
+
+Note that exp also processes `Z` twice (the trace shows `pos=5` twice): the
+first `Z` emits and advances to the next link, the second finds ROOT and
+resets. That re-entry is the 20,010-per-pass effect measured on sherlock.
+
+Why legacy can rely on a single register at all: **a match cannot straddle an
+unmapped character**, because patterns define the mapper, so every character of
+a match is mapped. Any match that had started before `Z` and not yet ended
+would have to contain `Z` — impossible. Hence the only pending match is one
+that already ended, and legacy keeps exactly one of those, advancing
+`self.pos` as it goes. The experimental matcher defers commitment *without*
+advancing `self.pos`, so it can accumulate several un-emitted matches and must
+store a chain (99.5% of which turn out to be length 1 — but it cannot prove
+that without looking, and looking is the walk).
 
 ## Where the gap actually is (cycle accounting)
 
