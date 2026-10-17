@@ -253,6 +253,69 @@ So `gap == 0` is a usable test for "the head match ends exactly here", but it is
 neither equivalent to "this state is a pattern end" nor a constant property of
 harvests.
 
+## Candidate 5: trie-path "definitely no emit" flag (unsound)
+
+Proposal: maintain one bool while scanning — `path_clean`, meaning "no state on
+the trie path since ROOT has `output_pos` with `Emit.gap == 0`". Set it false on
+any such state, reset it true at ROOT, and force it false permanently once any
+fail step happens. At an unmapped character, if `path_clean` is still true, jump
+straight to ROOT instead of walking the failure chain.
+
+It covers a lot: measured on real corpora, `path_clean` is true for **84.5%**
+(words100k), **99.7%** (words15k), **99.9%** (words5k) and **100%** (words100) of
+unmapped-character resets. unidic never triggers it (0.0% unmapped).
+
+It is nevertheless **unsound**, and the counterexample is small:
+
+    patterns = ["yo"]  (as part of words_100000)
+    text     = "anyo "
+
+Tracing the trie path for `anyo`:
+
+| position | state | `output_pos` | gap |
+|---|---|---|---|
+| `a` | 94 | none | – |
+| `an` | 505054 | none | – |
+| `any` | 515580 | none | – |
+| `anyo` | 515621 | none | – |
+
+No fail step occurred, and no state on the path carries an emit, so
+`path_clean` is genuinely true. But `fail("anyo")` is state 189351, which *does*
+hold the `yo` emit. The walk would find it; the shortcut skips it.
+
+The guard does not help: it only fires when a fail step happens *during* the
+scan, and here the scan is a pure descent.
+
+Measured behaviourally (baseline vs short-circuit enabled, full corpora):
+
+| dataset | baseline matches | with shortcut | lost |
+|---|---|---|---|
+| words100 | 10 | 10 | 0 |
+| words5k | 567 | 567 | 0 |
+| words15k | 2,100 | 2,100 | 0 |
+| words100k | 23,826 | **21,031** | **2,795 (11.7%)** |
+| unidic | 236,442 | 236,442 | 0 |
+
+**The root cause is a set mismatch**: the flag describes the *trie path*
+(prefixes of the current state), while the flush walk needs the *failure chain*
+(suffixes). A suffix can be a pattern even when no prefix is, and no amount of
+"abandon on fail step" tracking changes that, because the descent itself is
+clean.
+
+### A real gap this exposed in the test suite
+
+All nine existing fuzzers draw patterns *and* haystacks from the same alphabet,
+so **every haystack character is mapped** and the unmapped path is never
+exercised — even though unmapped characters are the entire subject of this
+investigation. The hand-written corpus tests are too small to hit the shape
+above, which is why the shortcut passed the full suite and all 9 fuzz
+differentials before the behavioural comparison caught it.
+
+`test_fuzz_unmapped_characters` was added: patterns come from a small alphabet,
+haystacks interleave words with separators that never appear in any pattern.
+It passes on the baseline and fails the shortcut at round 71. That test is the
+durable outcome of this candidate.
+
 ## What was tried and rejected
 
 Each of these either broke correctness or was a wash. All are documented in
@@ -270,6 +333,7 @@ Appendix C with numbers.
 | fast-ROOT path + fusion | breaks 7 fuzz tests — a correctness fix, not a perf option |
 | prefetch, ROOT re-probe merge, `Vec::new()` | all neutral-to-worse |
 | flush at arrival instead of at failure | impossible for leftmost-longest: would emit `ab` before seeing `abc`. Deferral is the semantics |
+| trie-path "definitely no emit" flag | covers 84.5–100% of unmapped resets but is unsound: `fail(s)` can hold an emit while the whole trie path is clean. Loses 2,795 matches (11.7%) on words100k |
 | consume the unmapped character once (whole-chain flush) | implemented correctly (full suite + 9 fuzz green) but **much slower everywhere** (words100k 1.17 → 1.57). One-emit-per-call is lazy, not wasteful |
 
 The recurring lesson: **the cost is dependent random loads, and adding a

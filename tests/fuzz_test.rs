@@ -322,3 +322,44 @@ fn test_fuzz_leftmost_first_equivalence() {
         differential_fuzz_round_leftmost_first(&patterns, &haystack, round);
     }
 }
+
+/// Patterns are built from a *sub*alphabet while the haystack uses a larger
+/// one, so a controlled fraction of haystack characters are absent from the
+/// mapper. The experimental matcher treats unmapped characters specially (it
+/// must still flush pending emits), and the other fuzzers never generate this
+/// case: they draw patterns and haystacks from the same alphabet, so every
+/// character is mapped.
+#[test]
+fn test_fuzz_unmapped_characters() {
+    let mut rng = Rng::new(0x5eed_1234);
+
+    // Separators appear only in the haystack, never in patterns.
+    let sep = [' ', '.', '-', '/', '\n', '\t', 'X', 'Z', '0', '9'];
+    let word = ['a', 'b', 'c', 'd', 'e'];
+
+    for round in 0..400 {
+        let num_pats = rng.gen_range(1, 40);
+        let mut patterns = Vec::new();
+        for _ in 0..num_pats {
+            let p = rng.gen_string(&word, 1, 5);
+            patterns.push(p);
+        }
+        patterns.sort();
+        patterns.dedup();
+
+        // Haystack interleaves words with separators (unmapped characters).
+        let mut haystack = String::new();
+        let parts = rng.gen_range(5, 60);
+        for _ in 0..parts {
+            haystack.push_str(&rng.gen_string(&word, 0, 6));
+            let s = sep[rng.gen_range(0, sep.len())];
+            haystack.push(s);
+            if rng.gen_range(0, 4) == 0 {
+                haystack.push(s);
+            }
+        }
+
+        differential_fuzz_round(&patterns, &haystack, round);
+        differential_fuzz_round_leftmost_first(&patterns, &haystack, round);
+    }
+}
