@@ -265,26 +265,47 @@ Measured and rejected, each with a full test-suite pass:
   (correctness bug, not a perf option).
 - **UTF-8 decode**: manual `decode_char_unchecked` vs `chars()` is a wash.
 
-### C.3 What it IS: 2.11x more state-array touches per character
+### C.3 What it IS: 83% more inner-loop iterations (state-header loads)
 
-Instrumented `states[]` accesses per character (sherlock, words100k):
+Counter placement matters: an earlier attempt counted legacy's accesses only
+inside its `if let Some(mapped_c)` branch, while counting every character for
+the experimental path. That inflated the ratio and is retracted. With
+comparable counters (all characters counted for both):
 
-| | state loads/char | probes/char | fail loads/char | **total touches/char** |
-|---|---|---|---|---|
-| legacy | 0.854 | 0.853 | 0.038 | **1.746** |
-| experimental | 1.562 | 1.562 | 0.566 | **3.689** |
+| words100k, per byte | legacy | experimental | ratio |
+|---|---|---|---|
+| character visits (incl. rewind) | 1.094 | 1.036 | exp 5% fewer |
+| inner-loop iterations | 0.854 | 1.562 | **exp 83% more** |
+| `states[state_id]` header loads | 0.854 | 1.562 | exp 83% more |
+| `states[base ^ c]` probe loads | 0.854 | 0.797 | exp 7% fewer |
+| total array accesses | 1.708 | 2.358 | exp 38% more |
 
-Corroborating hardware counters (`perf stat`, words100k, 20 reps):
+Important correction: legacy **does rewind** — it visits 1.094 chars/byte vs the
+experimental matcher's 1.036, i.e. legacy re-scans ~5.6% more characters
+(`next_plain` advances `self.pos` only when a match is recorded and otherwise
+keeps scanning forward). So legacy is not "doing less work overall"; it trades a
+longer fail chain for text re-scanning.
 
-| | cycles | instructions | L1 load-misses | LLC loads |
-|---|---|---|---|---|
-| legacy | 2,180,241,392 | 1,341,407,588 | 11,885,599 | 25,082,390 |
-| experimental | 2,685,281,656 (+23%) | 1,485,194,671 (+11%) | 14,882,971 (+25%) | 31,591,974 (+26%) |
+Crucially, the experimental matcher issues slightly **fewer** random
+`states[base ^ c]` probe loads (0.797 vs 0.854 per byte), because it only probes
+when both `mapped_c` and `base` are `Some`. Therefore the 36.5% cycle
+attribution on the probe instruction is **not** explained by probe count, and the
+earlier "more cache-missing random accesses" framing is wrong.
 
-`perf annotate` puts **36.5% of all cycles on the single instruction**
-`cmp %ebp, 0x4(%rdx,%r10,1)` — the `states[base ^ c].check == expect` load. The
-instruction is cheap; the load it depends on is a random access into a
-644,363-state array (11.5 MB, far past L2/L3), so it stalls on a miss.
+What the experimental matcher genuinely does more of is **inner-loop
+iterations** (1.562 vs 0.854 per byte). Each iteration costs a state-header
+load, a `base` read, a fail read, and the loop branch. That accounts for the
++11% instructions and +23% cycles measured below; the +25% L1 misses are a
+consequence of touching more distinct state headers, not of a worse probe
+pattern.
+
+Hardware counters (`perf stat`, words100k, 20 reps, same binary, only
+`MatchKind` differs):
+
+| | cycles | instructions | L1 load-misses |
+|---|---|---|---|
+| legacy | 2,153,085,929 | 1,337,916,856 | 11,922,180 |
+| experimental | 2,664,423,419 (+24%) | 1,484,624,361 (+11%) | 14,988,316 (+26%) |
 
 ### C.4 Why legacy touches less
 
@@ -298,6 +319,11 @@ The experimental builder never emits a DEAD terminator — `fail_state` is only
 ever `ROOT_STATE_ID` or a real suffix state (see
 `build_fails_and_emits_leftmost_experimental_inner`, stage 2 step 2/3). So every
 mismatch walks the full chain to ROOT: 1.562 iterations/char vs legacy's 0.854.
+
+This is a genuine trade: legacy's shorter fail chain is bought with text
+rewinding (1.094 vs 1.036 char visits/byte). The experimental design's whole
+point is to eliminate rewinding, so some extra fail-chain walking is expected.
+The net measured cost is +23% cycles on English prose at 644k states.
 
 ### C.5 Consequences
 
