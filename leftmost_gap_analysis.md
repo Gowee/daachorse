@@ -91,6 +91,42 @@ advancing `self.pos`, so it can accumulate several un-emitted matches and must
 store a chain (99.5% of which turn out to be length 1 — but it cannot prove
 that without looking, and looking is the walk).
 
+### Why the fail chain never has to be walked for a suffix match
+
+The sharpest form of the objection: with patterns `abcdef, bc, bcdef, de` and
+input `abcdeZ`, must legacy not walk from state `abcde` to state `bcdef` and
+compare? Traced answer: **no, for two independent reasons.**
+
+1. **`Z` is unmapped, so the walk never starts.** `next_state_id_leftmost_unchecked`
+   tests `mapper.get(c)` on its first line and returns ROOT immediately. No
+   state is touched. The trace shows no fail-walk step at all for any
+   unmapped-character input.
+
+2. **Even for a mapped failing character the walk terminates in one step,
+   at `DEAD`.** The builder sets `fail = DEAD_STATE_IDX` on every state that
+   carries an output and propagates DEAD to all descendants
+   (`nfa_builder.rs`, "Sets the output state to the dead fail" / "If the parent
+   has the dead fail, the child also has the dead fail"). The runtime then does
+
+       let fail_id = state.fail();
+       if fail_id == DEAD_STATE_IDX { return ROOT_STATE_IDX; }
+
+   so once a match has been committed, the whole subtree under it collapses the
+   walk to zero hops. This is the actual source of legacy's O(1), not the
+   register.
+
+That DEAD termination is also *correct*, and it is what makes `bcdef` behave
+properly: in `abcdef` the pattern `bcdef` must **not** be emitted, because
+leftmost-longest prefers the match starting at 0. Measured — both matchers emit
+only `abcdef` for `abcdef`, and only `bcdef` for `xbcdef`.
+
+**Is `last_output_pos` still valid after a fail walk?** Yes, necessarily: the
+walk reads only `base`, `check` and `fail` from the state array, and
+`last_output_pos` is a local in `next_plain`. It is neither read nor written by
+`next_state_id_leftmost_unchecked`. The traces confirm the register keeps its
+value across multi-hop fail walks (`[failwalk] 12 -> 8 -> 3 -> 0` with
+`last_out` unchanged).
+
 ## Where the gap actually is (cycle accounting)
 
 `perf stat`, words100k, 20 reps, same binary, only `MatchKind` differs:
