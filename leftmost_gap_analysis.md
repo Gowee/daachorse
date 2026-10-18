@@ -855,6 +855,50 @@ repeated 13,052 times per pass. The conclusion is unchanged: the push/pop the
 proposal removes are not the cost, and carrying `Option<Match>` across the
 epsilon branch costs more than it saves.
 
+## Real-world workload: zhconv OpenCC table on Chinese text
+
+A second domain, to test whether the English result generalises. Patterns are
+the first column of `npx @zhconv/cli-opencc zh-tw --dump-table` (56,075 entries,
+length 1–12 characters, 3,963 of them single characters). Haystacks are
+`zhconv-rs/benches/data{54k,689k,3185k}.txt`, scanned as one haystack each
+(one iterator), 5 × 9 reps, one automaton per process, `zin`.
+
+| dataset | chars | legacy | experimental | ratio | ns/char (leg) | ns/char (exp) |
+|---|---|---|---|---|---|---|
+| data54k | 21,767 | 0.94 ms | 0.91 ms | **0.968** | 43.2 | 41.8 |
+| data689k | 238,583 | 11.33 ms | 10.57 ms | **0.933** | 47.5 | 44.3 |
+| data3185k | 1,188,261 | 76.59 ms | 74.85 ms | **0.977** | 64.5 | 63.0 |
+
+**The experimental matcher is 2–7% faster on every Chinese dataset**, with
+identical match counts (2,578 / 3,549 / 270,213). Build cost is +8.4%
+(206 ms vs 190 ms for 56,075 patterns, 93,886 states).
+
+### The picture across domains (long-text search, one iterator)
+
+| workload | patterns | states | exp/leg |
+|---|---|---|---|
+| English words100 | 100,001 | 928 | 1.013 |
+| English words5k | 5,000 | 32,192 | 1.078 |
+| English words15k | 15,000 | 75,392 | 1.092 |
+| English words100k | 100,000 | 645,120 | **1.102** |
+| Japanese unidic | 1,023,998 | 1,024,000 | **0.975** |
+| Chinese zhconv (54k) | 56,075 | 93,886 | **0.968** |
+| Chinese zhconv (689k) | 56,075 | 93,886 | **0.933** |
+| Chinese zhconv (3185k) | 56,075 | 93,886 | **0.977** |
+
+**exp wins on Chinese and Japanese, loses on English prose**, and the split
+follows the mechanism established earlier: the cost is one random `states[]`
+load per hop for characters absent from the mapper. CJK text has essentially no
+unmapped characters (Chinese haystacks here: 0% ASCII separators dominate only
+at line breaks, and the scans are over joined text), while English prose is
+~27% spaces, punctuation and capitals.
+
+So the honest performance summary is domain-dependent, not a single number:
+
+- **CJK text: experimental is 2–7% faster** (and the zero-rewind guarantee
+  comes for free).
+- **English prose: experimental is 1–10% slower**, worst at large automata.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
