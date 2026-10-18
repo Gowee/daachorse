@@ -794,6 +794,67 @@ the per-line harness: words100/5k/15k/100k timings are per-line scans, so the
 fixed per-iterator costs (allocation, iterator setup) are amortised over only
 one line each. Only the single-haystack measurements above isolate the scan.
 
+## Long-text search: the numbers that actually matter
+
+Every exp/leg ratio reported earlier in this document came from the harness
+shape
+
+    let hay = std::fs::read_to_string(path).lines().map(String::from).collect();
+    for h in &hay { for m in pma.find_iter(h) { ... } }
+
+`str::lines()` splits the file into **13,052 separate `&str` slices** and the
+newlines are discarded, so this performs 13,052 independent scans per pass, each
+with its own iterator. That measures the *per-line* idiom (allocation, iterator
+setup, epsilon state, and a short scan), not long-text search.
+
+Re-measured with **one haystack** (all lines joined with `\n`, one iterator per
+pass, one automaton per process, medians of 5 × 9 reps):
+
+| dataset | haystack | legacy | exp (current) | ratio |
+|---|---|---|---|---|
+| words100 | 581,862 B | 10.94 | 11.08 | **1.013** |
+| words5k | 581,862 B | 10.25 | 11.05 | **1.078** |
+| words15k | 581,862 B | 10.69 | 11.67 | **1.092** |
+| words100k | 581,862 B | 12.52 | 13.80 | **1.102** |
+| unidic | 1,118,390 B | 32.56 | 31.76 | **0.975** |
+
+Compare with the per-line numbers for the same builds (words100 0.96, words5k
+1.02, words15k 1.02, words100k 1.07, unidic 1.00). The differences are real and
+go in both directions:
+
+- **words100**: per-line 0.96 (exp wins) but long-text **1.013** (exp loses
+  slightly). The per-line advantage was the removed allocation; with one
+  iterator there is nothing to remove, and exp's per-character work is a hair
+  higher.
+- **words100k**: 1.07 per-line becomes **1.102** long-text — the gap is *larger*
+  when the scan dominates, consistent with the fail-load analysis.
+- **unidic**: 1.00 per-line becomes **0.975** — exp is genuinely faster on
+  dense, fully-mapped text, and more clearly so when the scan is not diluted by
+  per-line overhead.
+
+**The honest summary for long-text search: exp is 1.3–10% slower on English
+prose and ~2.5% faster on Japanese.** The per-line idiom additionally pays
+exp's iterator-construction cost, which is why the earlier table looked better
+for exp on small automata.
+
+### `ensure_buffered` returning `Option<Match>` (candidate 9), long-text
+
+Measured on the same single-haystack harness:
+
+| dataset | exp current | exp with r1 | delta |
+|---|---|---|---|
+| words100 | 11.08 | 11.20 | +1.1% |
+| words5k | 11.05 | 11.27 | +2.0% |
+| words15k | 11.67 | 11.96 | +2.5% |
+| words100k | 13.80 | 14.55 | **+5.4%** |
+| unidic | 31.76 | 32.48 | +2.3% |
+
+Still uniformly slower, though the penalty is smaller than under the per-line
+harness (+9…20%) because the per-iterator part of the cost is no longer
+repeated 13,052 times per pass. The conclusion is unchanged: the push/pop the
+proposal removes are not the cost, and carrying `Option<Match>` across the
+epsilon branch costs more than it saves.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
