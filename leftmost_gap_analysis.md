@@ -613,6 +613,54 @@ by work performed.
 
 **The current single-path `next()` is already the right shape.** Leave it.
 
+## Shrinking `Match` (rejected: smaller is slower)
+
+`Match<V>` is `{ length: usize, end: usize, value: V }` = 24 bytes for `V = u32`,
+so `Option<Match<u32>>` is 32 and the iterator is 224 bytes. Changing `length`
+to `u32` (it is already `u32` everywhere internally, and a match can never
+exceed a pattern's length) keeps `end` as `usize` so texts over 4 GiB still
+work:
+
+| | before | after |
+|---|---|---|
+| `Match<u32>` | 24 B | **16 B** |
+| `Option<Match<u32>>` | 32 B | **24 B** |
+| iterator (INLINE=4) | 224 B | **192 B** |
+
+Correctness: full suite and all 10 fuzz differentials pass.
+
+Performance: **0 to +4% worse**, never better.
+
+| dataset | `Match` = 24 B | `Match` = 16 B | delta |
+|---|---|---|---|
+| words100 | 9.98 | 10.38 | **+4.0%** |
+| words5k | 10.24 | 10.53 | +2.8% |
+| words15k | 11.12 | 11.33 | +1.9% |
+| words100k | 13.76 | 13.74 | −0.1% |
+| unidic | 31.09 | 31.08 | 0.0% |
+
+Not adopted. 32 bytes of stack are not worth 4% on small automata, and the
+change touches a public type.
+
+## The pattern across every size reduction
+
+Four attempts to make the hot data smaller were measured, and none helped:
+
+| change | size | time |
+|---|---|---|
+| `INLINE = 2` (vs 4) | −64 B | 0% |
+| `INLINE = 1` | −96 B | **+4…12%** |
+| `MaybeUninit` slots | −32 B | **+6…13%** |
+| `Match` 24 → 16 B | −32 B | **0…+4%** |
+| field reordering | 0 | 0% |
+
+The two that were free (`INLINE = 2`) or harmful the rest. The consistent
+mechanism is not cache footprint — the working set is the state array, not the
+iterator — but the compiler's freedom: plain `Copy` values it can keep in
+registers and reorder, versus `unsafe` reads, live `Vec` fields, or split
+branches that force spills. **Reducing bytes is not the lever; keeping the hot
+path as plain, unconditional data flow is.**
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
