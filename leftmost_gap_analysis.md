@@ -712,6 +712,49 @@ produces 25, and the same shape with a 1000-character alphabet produces 999.
 - Both `INLINE = 2` and `INLINE = 4` measured performance-identical on real
   corpora, so 4 costs nothing while covering more of the short-pattern range.
 
+## Why "just moving the buffer to the stack" is worth 25%
+
+It looks like it should not be. An isolated microbenchmark of
+`Vec::with_capacity(4)` + push + drop, 13,052 times, costs **0.14 ms** — while
+the real change saves **4.7 ms** on words100. That 35× gap was the puzzle, and
+the microbenchmark was the thing that was wrong: with the allocator warm and no
+surrounding work, malloc/free latency is hidden. In the real loop it is not.
+
+A clean A/B settles it: both crates linked into one binary, the *same* scan loop
+written once, one automaton per process, medians of 6 runs.
+
+| words100 | `Vec<Match>` | inline `[Option<Match>; 4]` | delta |
+|---|---|---|---|
+| wall clock | 13.95 ms | **10.52 ms** | **−24.6%** |
+| cycles (9 passes) | 326,496,199 | 250,920,248 | −75,575,951 |
+| instructions | 322,323,536 | 232,480,413 | −89,843,123 |
+| L1 misses | 402,051 | 219,471 | −182,580 |
+
+117,468 iterators are created (9 passes × 13,052 lines), so the deltas are
+
+- **764 instructions per iterator**
+- **643 cycles per iterator**
+- 1.55 L1 misses per iterator
+
+764 instructions is exactly the shape of `malloc` + `free`: the allocator's
+fast-path bookkeeping, the `Vec` capacity/len setup in `with_capacity`, and the
+drop glue. At the measured IPC of 1.9 that is ~340 cycles, and 8.4 M cycles per
+pass at ~2.5 GHz is 3.36 ms — matching the 3.43 ms wall-clock delta.
+
+So the answer to "it is only a stack-to-heap move, why 25%?" is: **because it is
+not one operation per program, it is one malloc/free pair per iterator, and on
+this workload there are 13,052 iterators per pass over a 569 KB text.** The
+allocator cost is a fixed per-iterator tax; on words100 the scan itself is so
+cheap (920 states, all L1) that the tax was 30% of all instructions executed.
+
+This also explains why the win shrinks to ~13% on words100k: there the scan is
+dominated by cache misses in an 11.5 MB state array, so the same fixed tax is a
+smaller share of a much larger total.
+
+And it explains why `Vec::new()` measured "worse" than `with_capacity(4)` in an
+early experiment: both allocate once per iterator, so that comparison never
+touched the actual cost.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
