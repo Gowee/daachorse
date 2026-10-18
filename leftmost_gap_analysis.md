@@ -757,6 +757,12 @@ touched the actual cost.
 
 ## The 25% inline-buffer win is a per-line artifact
 
+> **Superseded.** The −24.6% below is real for the comparison it makes, but the
+> baseline was `Vec::with_capacity(4)`, which allocates for every iterator. Against
+> `Vec::new()` (lazy allocation) the inline buffer is *slower* on the same
+> workload — see "Correction: the ~25% per-line win was against a preallocating
+> `Vec`" below.
+
 The headline number (−24.6% on words100) came from the benchmark shape
 `for h in &hay { for m in pma.find_iter(h) }` with `hay` = 13,052 lines, i.e.
 **13,052 iterators per pass**. On that shape the inline buffer is worth a lot,
@@ -788,6 +794,12 @@ single-haystack case.
 Both are real, but they answer different questions. Any statement about "the
 inline buffer is worth 25%" must be qualified with the workload shape, and for
 long-text search the number is a few percent.
+
+**Correction (later measurement):** even the per-line figure is only true
+against a preallocating `Vec`. `Vec::new()` allocates lazily, so on a sparse
+workload it allocates ~10 times per pass instead of 13,052 and beats the inline
+buffer. See "Correction: the ~25% per-line win was against a preallocating
+`Vec`" below.
 
 The same caveat applies to every number in this document that was measured with
 the per-line harness: words100/5k/15k/100k timings are per-line scans, so the
@@ -1006,10 +1018,34 @@ to remove, so the inline buffer's benefit disappears, while its two extra
 branches per push/pop (`len < INLINE`, `spill.pop()`) remain — and at high match
 density those branches are hot. unidic is 21% match density; zh data54k is 12%.
 
-The inline buffer's real win remains the **per-line** idiom (one iterator per
-line, 13,052 allocations per pass on `sherlock.txt`), where it is worth ~25% by
-removing one malloc/free pair per line. That is a different workload from
-long-text search and should be stated as such.
+### Correction: the "~25% per-line win" was against a preallocating `Vec`
+
+An earlier section of this document claims the inline buffer is worth ~25% on
+the per-line idiom by removing one malloc/free pair per line. That A/B compared
+the inline buffer against `Vec::with_capacity(4)`, i.e. a `Vec` that **allocates
+on construction for every iterator**, including the ~99.9% that never push a
+match. Re-measured against `Vec::new()`, which allocates lazily on the first
+`push`, per-line (single-crate binaries, each variant against its own legacy):
+
+| dataset | lines | matches | lines that push | `Vec::new()` | inline `MatchBuf` |
+|---|---|---|---|---|---|
+| words100 | 13,052 | 10 | 0.1% | **0.901** | 0.979 |
+| words100k | 13,052 | 23,826 | 100% | 1.142 | **1.098** |
+| unidic | 2,376 | 236,442 | 100% | **0.897** | 0.945 |
+
+(ratios to same-binary legacy; lower is faster)
+
+`Vec::new()` wins by 8.7% on words100 and 5.4% on unidic, and loses by 3.9% on
+words100k. The mechanism is allocation count, not buffer shape: `Vec::new()`
+allocates only when a match is actually produced, so on words100 it performs
+**10 allocations per pass instead of 13,052** — a 1300x reduction in allocator
+traffic. Where every line produces a match (words100k) that advantage vanishes
+and the inline buffer's fixed slots win slightly, because it never calls the
+allocator at all.
+
+So the accurate statement is: **`Vec::new()` dominates the inline buffer on
+both long-text and sparse-per-line workloads, and loses only on dense-per-line
+workloads (every line yielding matches), by ~4%.**
 
 ## Retraction: every earlier exp/leg ratio was confounded by harness codegen
 

@@ -639,10 +639,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             haystack,
             pos: 0,
             state_id: ROOT_STATE_IDX,
-            // TEST-ONLY capacity probe: most mismatch buffers hold 1-2 matches;
-            // 4 avoids all reallocs for k<=4 at ~96B per iterator (one alloc per
-            // `leftmost_find_iter_experimental` call, amortized over the scan).
-            buf: crate::charwise::iter::MatchBuf::new(),
+            buf: Vec::new(),
             gate: PrefilterGate::new(),
             epsilon_emit_pos: self.states[usize::from_u32(ROOT_STATE_IDX)].output_pos(),
             epsilon_cursor: 0,
