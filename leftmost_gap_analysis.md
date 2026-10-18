@@ -755,6 +755,45 @@ And it explains why `Vec::new()` measured "worse" than `with_capacity(4)` in an
 early experiment: both allocate once per iterator, so that comparison never
 touched the actual cost.
 
+## The 25% inline-buffer win is a per-line artifact
+
+The headline number (−24.6% on words100) came from the benchmark shape
+`for h in &hay { for m in pma.find_iter(h) }` with `hay` = 13,052 lines, i.e.
+**13,052 iterators per pass**. On that shape the inline buffer is worth a lot,
+because one malloc/free pair per iterator is a fixed tax on a scan that is
+otherwise nearly free.
+
+For a **single long haystack** — one iterator — the same change is worth almost
+nothing:
+
+| dataset | haystack | `Vec` | inline | delta |
+|---|---|---|---|---|
+| words100 | 581,862 B, 1 iterator | 10.94 ms | 10.48 ms | **−4.2%** |
+| words100k | 581,862 B, 1 iterator | 14.00 ms | 13.46 ms | **−3.9%** |
+| unidic | 1,118,390 B, 1 iterator | 30.78 ms | 30.05 ms | **−2.4%** |
+
+Compare words100: −24.6% per-line versus **−4.2% single-haystack**. The
+difference is entirely the 13,052 malloc/free pairs, which do not exist in the
+single-haystack case.
+
+**So the honest summary of the inline buffer is:**
+
+- **−2 to −4%** for long-text scanning, which is the case that matters for
+  search performance. The residual is not the allocator at all; it is that a
+  stack buffer lets `push`/`pop` avoid pointer indirection through a heap
+  pointer, and (on some shapes) that the compiler can keep more in registers.
+- **−25%** for the per-line iteration idiom, purely from removing one
+  allocation per line.
+
+Both are real, but they answer different questions. Any statement about "the
+inline buffer is worth 25%" must be qualified with the workload shape, and for
+long-text search the number is a few percent.
+
+The same caveat applies to every number in this document that was measured with
+the per-line harness: words100/5k/15k/100k timings are per-line scans, so the
+fixed per-iterator costs (allocation, iterator setup) are amortised over only
+one line each. Only the single-haystack measurements above isolate the scan.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
