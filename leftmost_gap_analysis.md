@@ -421,6 +421,46 @@ The DEAD terminator enforces leftmost: once a match is committed at position E,
 every fail link under it is DEAD, so nothing starting before E can be reported
 afterwards.
 
+## Candidate 8: borrow bit 31 of `fail` (sound, mixed results)
+
+`fail` is a plain `u32` (not an `Option`), and it is the natural host for the
+"failure chain holds an emit" flag: it is read only on the fail path, so the
+mask never touches the hot transition probe (unlike `check`, which is read on
+every probe). Only four read sites exist, and the bit is set **only for the
+experimental match kinds**, so legacy automata are bit-for-bit unchanged.
+
+Scale cost: automata are limited to 2^31 states, which is the same limit
+`check` and `base` already imply. Measured maxima are 644,357 (words100k) and
+1,020,267 (unidic), far below.
+
+Correctness: full suite, all 10 fuzz differentials, and byte-identical match
+sequences on all five corpora.
+
+Three placements were tried, because the cost is entirely in where the test
+sits:
+
+| placement | words100 | words5k | words15k | words100k | unidic |
+|---|---|---|---|---|---|
+| v7: pre-loop test with its own load | +8.2% | +1.8% | −0.4% | −4.4% | — |
+| v8: test inside the loop (every iteration) | +15.8% | +7.1% | +3.8% | −2.7% | — |
+| **v9: pre-loop test + hoisted state load** | **+5.1%** | **−1.6%** | **−2.8%** | **−5.0%** | **−2.6%** |
+
+v9 is the best of the three: it removes the duplicate load that v7 paid and
+keeps the test off the per-iteration path that v8 paid for. It improves four of
+five datasets, including unidic (which has 0% unmapped characters — the gain
+there is the loop restructure, not the flag).
+
+**The remaining `words100` regression is the loop restructure, not the flag.**
+Hoisting `state` out of the loop and refreshing it in the fail branch costs more
+on a 920-state automaton (14.7 KB, entirely L1-resident) than the walk it saves,
+because on that automaton a skipped hop is a free L1 hit. On words100k each
+skipped hop avoids an L3/DRAM access, so the same change is worth −5.0%.
+
+No single placement wins on all five datasets. This is the same regime
+dependence that has recurred throughout: the optimisation pays exactly when the
+skipped accesses are expensive, and the library cannot know that at compile
+time.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
