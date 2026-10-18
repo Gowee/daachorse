@@ -450,16 +450,30 @@ keeps the test off the per-iteration path that v8 paid for. It improves four of
 five datasets, including unidic (which has 0% unmapped characters — the gain
 there is the loop restructure, not the flag).
 
-**The remaining `words100` regression is the loop restructure, not the flag.**
-Hoisting `state` out of the loop and refreshing it in the fail branch costs more
-on a 920-state automaton (14.7 KB, entirely L1-resident) than the walk it saves,
-because on that automaton a skipped hop is a free L1 hit. On words100k each
-skipped hop avoids an L3/DRAM access, so the same change is worth −5.0%.
+**The `words100` regression is real and reproducible.** It is not measurement
+noise, and an earlier −2.8% reading for the same configuration was an artifact
+of linking both crates into one binary (that binary's HEAD arm measured 11.35 ms
+against 9.99 ms for the single-crate build — a 14% layout difference in the
+*same* code). Single-crate binaries, identical harness source, alternated,
+medians of 5–10 rounds:
 
-No single placement wins on all five datasets. This is the same regime
-dependence that has recurred throughout: the optimisation pays exactly when the
-skipped accesses are expensive, and the library cannot know that at compile
-time.
+| dataset | HEAD | v9 | delta |
+|---|---|---|---|
+| words100 | 9.99 | 10.50 | **+5.2%** |
+| words5k | 10.29 | 10.15 | −1.4% |
+| words15k | 11.06 | 10.78 | −2.5% |
+| words100k | 13.86 | 12.99 | **−6.3%** |
+| unidic | 30.22 | 30.08 | −0.5% |
+
+So the trade is: −6.3% at 645k states, +5.2% at 920 states, and roughly neutral
+in between. The cause is that on a 920-state automaton (14.7 KB, entirely
+L1-resident) a skipped hop costs nothing, while the flag test and the loop
+restructure cost a little on every character; at 645k states each skipped hop
+avoids an L3/DRAM access and the same code wins.
+
+A regime-adaptive build (only set the bit when `states.len()` is large) is
+possible since the builder knows the size, but it doubles the scan code paths
+and has not been measured.
 
 ## Why an earlier note said "~10%"
 
