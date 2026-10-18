@@ -931,6 +931,86 @@ irrelevant to the experimental matcher's advantage over legacy — that advantag
 (1.5–5% on Chinese, ~2.5% on Japanese, −1 to −10% on English) comes from the
 matcher design, not from the buffer.
 
+## Pure `Vec::new()` (no preallocation) beats `Vec::with_capacity(4)`
+
+The earlier three-way A/B compared the inline `MatchBuf` against
+`Vec::with_capacity(4)` and `Vec::new()`, but `Vec::new()` was only measured
+before the harness confound was understood, so the comparison was not
+trustworthy. Re-run under the corrected protocol: one binary, eight
+`#[inline(never)]` arms (four buffer variants × two match kinds), medians of
+5 × 9 reps, ratios to the legacy arm in the same binary. Noise floor is the
+spread of the four byte-identical legacy arms (0.15–2.16%).
+
+| dataset | matches | cur (inline) | va `Vec` cap4 | **vb `Vec::new()`** | vc `Vec`+Option | noise |
+|---|---|---|---|---|---|---|
+| words100 | 10 | 0.946 | 0.970 | **0.957** | 0.969 | 0.15% |
+| words5k | 567 | 1.018 | 1.050 | **1.025** | 1.050 | 0.20% |
+| words15k | 2,100 | 1.055 | 1.083 | **1.060** | 1.084 | 0.63% |
+| words100k | 23,826 | 1.057 | 1.102 | **1.064** | 1.095 | 1.89% |
+| unidic | 236,442 | 0.939 | 0.922 | **0.895** | 0.895 | 0.83% |
+| zh data54k | 2,578 | 0.967 | **0.936** | 0.941 | 0.962 | 1.83% |
+| zh data689k | 3,549 | 0.941 | 0.954 | **0.937** | 0.974 | 2.16% |
+| zh data3185k | 270,213 | 0.949 | 0.943 | **0.934** | 0.952 | 0.79% |
+
+`vb` is the best or joint-best variant on seven of eight datasets and never
+materially worse than the best one.
+
+### `vb` vs `va`: preallocating 4 slots is a pessimisation
+
+The only difference between the two is `Vec::new()` versus
+`Vec::with_capacity(4)` at iterator construction:
+
+| dataset | `vb − va` |
+|---|---|
+| words100 | −1.3% |
+| words5k | −2.4% |
+| words15k | −2.1% |
+| words100k | **−3.4%** |
+| unidic | −2.9% |
+| zh data54k | +0.5% (noise) |
+| zh data689k | −1.8% (noise) |
+| zh data3185k | −1.0% |
+
+`Vec::new()` is faster in seven of eight, by up to 3.4%. This is the expected
+result once the earlier finding is taken seriously: **the emit chain has length
+1 in the overwhelming majority of cases** (the measurement that motivated the
+inline buffer put it at 99.5%, max 3). A `Vec` that never grows past one element
+still allocates on first `push` either way, so `with_capacity(4)` buys nothing
+for the common case — it only makes the allocation *larger* (4 × 24 B instead of
+a growth-doubled 1 → 2 slots), paying more for memory that is never used. On
+words100k the extra 96 B per live iterator is what shows up as −3.4%.
+
+`Vec::new()` also keeps the iterator small (24 B for the `Vec` triple versus
+96 B of inline slots in `MatchBuf`), which matters because the per-line idiom
+creates one iterator per line.
+
+### What this means for the shipped choice
+
+The inline `MatchBuf` is **not** the best buffer. Against `vb`:
+
+| dataset | cur vs vb |
+|---|---|
+| words100 | −1.2% (cur slower) |
+| words5k | −0.7% |
+| words15k | −0.5% (noise) |
+| words100k | −0.7% (noise) |
+| unidic | **+4.7% (cur slower)** |
+| zh data54k | +2.7% (cur slower) |
+| zh data689k | +0.4% (noise) |
+| zh data3185k | +1.6% (cur slower) |
+
+So on a single long haystack `Vec::new()` is at least as good everywhere and
+clearly better on unidic (+4.7%) and zh data54k (+2.7%). The reason is the one
+established earlier: with one iterator per pass there is exactly one allocation
+to remove, so the inline buffer's benefit disappears, while its two extra
+branches per push/pop (`len < INLINE`, `spill.pop()`) remain — and at high match
+density those branches are hot. unidic is 21% match density; zh data54k is 12%.
+
+The inline buffer's real win remains the **per-line** idiom (one iterator per
+line, 13,052 allocations per pass on `sherlock.txt`), where it is worth ~25% by
+removing one malloc/free pair per line. That is a different workload from
+long-text search and should be stated as such.
+
 ## Retraction: every earlier exp/leg ratio was confounded by harness codegen
 
 While extending the buffer A/B to `ensure_buffered -> Option<Match>` on a pure
