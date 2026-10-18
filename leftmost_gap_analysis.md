@@ -943,6 +943,60 @@ irrelevant to the experimental matcher's advantage over legacy — that advantag
 (1.5–5% on Chinese, ~2.5% on Japanese, −1 to −10% on English) comes from the
 matcher design, not from the buffer.
 
+## Re-testing 16-byte `Match` after the buffer became a `Vec`
+
+`Match` was shrunk from 24 B to 16 B once before (`length: usize` -> `u32`) and
+rejected as 0 to +4% worse. That measurement was made when the pending-match
+buffer was the inline `MatchBuf`, where a smaller `Match` only shrank stack
+slots. Now the buffer is a heap `Vec`, so element size also changes the
+allocation size and the amount copied per push/pop, which could reverse the
+result. Re-measured.
+
+Correctness: all 216 tests pass and the match streams are **byte-identical** on
+all eight corpora for both match kinds.
+
+### Method note: single-binary ratios were still contaminated
+
+The first attempt used the one-binary/four-arm protocol. It produced a
+contradiction that exposed a remaining flaw: on words100k the two *legacy* arms
+have identical code and identical per-pass instruction counts (26,315,943 vs
+26,291,109, a 0.1% difference) yet differed by **18.6% in cycles**. Instruction
+counts agreeing to 0.1% while cycles differ by 18.6% can only be a code/data
+layout effect, not an algorithmic one.
+
+So the measurement was redone as a **layout sweep**: 8 (then 16) separately
+built binaries per variant, each with a different number of out-of-line padding
+functions whose results are fed to `black_box` so they cannot be deleted
+(`.text` grows monotonically from 415,489 to 416,081 bytes, confirming the pads
+survive). Within each binary the ratio is taken against that binary's own
+legacy arm, so layout cancels inside the pair; then the 16 paired ratios are
+compared across variants.
+
+### Result: no measurable benefit
+
+Paired per-variant deltas, 16B relative to 24B (negative = 16B faster), 16
+layout variants each, 15 reps:
+
+| dataset | 24B median ratio | 16B median ratio | median delta | mean delta | 16B better | stdev of paired delta |
+|---|---|---|---|---|---|---|
+| words15k | 1.051 | 1.054 | **+0.3%** | +0.1% | 7/16 | 1.4% |
+| words100k | 1.081 | 1.073 | **−0.7%** | −0.3% | 10/16 | 3.1% |
+| unidic | 0.896 | 0.890 | **−0.9%** | −1.0% | 10/16 | 2.0% |
+
+The median effect is −0.9% to +0.3%, while the standard deviation of the paired
+delta is 1.4–3.1%. **The effect is smaller than the layout noise it must be
+distinguished from**, and the win/loss counts (7/16, 10/16, 10/16) are
+consistent with a coin flip. There is no defensible claim that 16 B is faster.
+
+### Decision: not adopted
+
+Shrinking `Match` changes a **public type** (users pattern-match and construct
+`Match`), and it buys nothing measurable. The 24 B layout is kept.
+
+The one thing the smaller type does buy is `Option<Match<u32>>` dropping from
+32 B to 24 B, which only mattered for the inline `MatchBuf` that no longer
+exists.
+
 ## Pure `Vec::new()` (no preallocation) beats `Vec::with_capacity(4)`
 
 The earlier three-way A/B compared the inline `MatchBuf` against
