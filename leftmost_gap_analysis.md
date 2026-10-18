@@ -515,6 +515,55 @@ This is the same lesson as the allocation finding, one level down: what matters
 is not how often the heap path runs, but whether the compiler can prove it
 never runs.
 
+## Is `INLINE = 4` the right choice? (yes, and smaller is worse)
+
+The iterator is 224 bytes. That sounds large, so three reductions were measured:
+
+**Field reordering** (moving the 160-byte buffer after the hot fields so
+`pos`/`state_id`/`gate` share the first cache lines): no change. All five
+datasets land within noise (words100 9.99 → 9.99, words100k 13.76 → 13.65,
+unidic 30.47 → 30.25). The hot fields were already in the first lines; the
+224 bytes are stack, not cache-resident working set.
+
+**`INLINE = 2`**: indistinguishable from 4 on every dataset. So the buffer
+costs nothing beyond 2 slots, and 4 is free insurance against longer chains
+(max observed is 3).
+
+**Compact slots (`MaybeUninit` instead of `Option<Match>`)**: this is what
+SmallVec does, and it shrinks the struct from 224 to 192 bytes (24 bytes per
+slot instead of 32). It is **6–13% slower everywhere**:
+
+| dataset | `Option<Match>` slots | `MaybeUninit` slots |
+|---|---|---|
+| words100 | 9.97 | 11.25 (**+12.8%**) |
+| words5k | 10.25 | 11.47 (+11.9%) |
+| words15k | 11.12 | 12.31 (+10.7%) |
+| words100k | 13.76 | 14.49 (+5.3%) |
+| unidic | 30.35 | 31.45 (+3.6%) |
+
+`Option<Match>` is a plain value that LLVM can copy and reorder freely;
+`MaybeUninit` + `assume_init_read` is an unsafe read it must treat
+conservatively. Saving 32 bytes costs more than it buys.
+
+### Comparison with `SmallVec`
+
+| | this `MatchBuf<V, 4>` | `SmallVec<[Match<V>; 4]>` |
+|---|---|---|
+| layout | `[Option<Match>; 4]` + `len` + `Vec` (two separate stores) | `union { [MaybeUninit<Match>; 4], (ptr, cap) }` + `len` |
+| size | 160 B buffer (+ other fields = 224 B iterator) | ~104 B |
+| per-slot | 32 B | 24 B |
+| after spill | inline slots stay live (wasted but harmless) | inline storage is reused for the pointer |
+| unsafe | none | `MaybeUninit`, union, manual drop |
+| measured | **baseline** | the `MaybeUninit` variant above, −6 to −13% |
+
+So SmallVec would be smaller and more memory-efficient, and on this workload it
+would be **slower**. The plain `Option` array is not an oversight; it is the
+faster representation, and it needs no `unsafe`.
+
+**Verdict: keep `INLINE = 4` with `Option<Match>` slots.** The 224-byte stack
+footprint is irrelevant (one per iterator, non-recursive, dwarfed by any thread
+stack), field order does not matter, and both available reductions cost 6–13%.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
