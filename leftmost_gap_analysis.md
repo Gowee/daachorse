@@ -931,6 +931,116 @@ irrelevant to the experimental matcher's advantage over legacy — that advantag
 (1.5–5% on Chinese, ~2.5% on Japanese, −1 to −10% on English) comes from the
 matcher design, not from the buffer.
 
+## Retraction: every earlier exp/leg ratio was confounded by harness codegen
+
+While extending the buffer A/B to `ensure_buffered -> Option<Match>` on a pure
+`Vec`, the new arms disagreed with the earlier table by far more than the
+effects being measured. Investigating that produced a methodological
+retraction that invalidates the numbers reported earlier in this document.
+
+### What was wrong
+
+`scan` is `#[inline(always)]`, so the hot loop is compiled **into the user's
+crate**. Its machine code therefore depends on the shape of the benchmark
+harness, not only on the library. Three harnesses were measured with the
+*same* library revision:
+
+| harness | words100 exp | instructions/pass |
+|---|---|---|
+| `final_lh` (macro-folded constant arm) | 11.08 ms | 234,353,727 |
+| `lh_cur` (runtime `if` selecting the arm inside `main`) | 12.54 ms | 264,473,155 |
+| `ded_*` / `six` (one `#[inline(never)]` fn per arm) | 10.68–10.93 ms | 229,311,767 |
+
+Same source, same `ARM`, 13% spread in both time and instruction count. The
+runtime-`if` harness in particular prevented the optimiser from producing the
+same code, inflating the experimental arm.
+
+A second error compounded it: the first attempt at a layout sweep injected
+`#[inline(never)]` padding functions that were never called, so LLVM deleted
+them (`.text` size identical across all twelve "variants", 0 symbols). Those
+twelve runs were therefore the *same binary* twelve times, which is why they
+agreed to 0.5–1.0% and appeared to prove layout insensitivity. They proved
+nothing of the kind. A later attempt passed the pad count as a **runtime**
+`PAD` variable, which also cannot change code layout.
+
+### The measurement that is now used
+
+One binary, six `#[inline(never)]` functions, one per (variant, match kind),
+all sharing the same code and data layout. The three legacy arms are
+byte-identical code, so their spread is the noise floor:
+
+| dataset | legacy spread (identical code) |
+|---|---|
+| words100 | 0.13% |
+| words5k | 0.11% |
+| words15k | 0.57% |
+| words100k | 1.92% |
+| unidic | 0.26% |
+
+Everything below is a ratio to the legacy arm **in the same binary**, so the
+harness codegen cancels.
+
+### Results (long text, one iterator per pass, medians of 5 × 9)
+
+Ratios to legacy; <1 means the experimental matcher is faster.
+
+| dataset | cur (inline `MatchBuf`) | va (pure `Vec::with_capacity(4)`) | vc (pure `Vec` + `ensure_buffered -> Option`) |
+|---|---|---|---|
+| words100 | 0.960 | 0.971 | 0.973 |
+| words5k | 1.023 | 1.052 | 1.053 |
+| words15k | 1.046 | 1.077 | 1.084 |
+| words100k | 1.078 | 1.100 | 1.070 |
+| unidic | 0.952 | 0.909 | 0.904 |
+| zhconv data54k | 0.921 | 0.938 | 0.952 |
+| zhconv data689k | 0.934 | 0.947 | 0.961 |
+| zhconv data3185k | 0.947 | 0.943 | 0.946 |
+
+All three experimental variants produce **byte-identical match sequences** on
+all eight corpora (verified by hashing `(start, end, value)` streams: the
+digests agree exactly).
+
+### What this changes
+
+1. **The "English prose is 1.3–10% slower" conclusion was partly harness
+   artefact.** With a clean harness, words100 is **0.960** (experimental
+   *faster*), not 1.013. words5k/15k/100k remain slower (1.02–1.10), so the
+   English penalty is real but smaller and not present at small automata.
+2. **The CJK advantage is real and slightly larger than reported**: 0.92–0.95
+   on Chinese, 0.90–0.95 on Japanese.
+3. **The buffer choice is a wash on English and Chinese** (differences sit at or
+   near the noise floor), but on `unidic` — 21% match density, so the buffer is
+   genuinely hot — the pure `Vec` variants are ~4.3% faster than the inline
+   buffer. The inline `MatchBuf` pays two extra branches (`len < INLINE` on
+   push, `spill.pop()` on pop) per buffer operation, and at 21% density those
+   branches are executed often enough to matter. At ≤4% density they are not.
+4. **`ensure_buffered -> Option<Match>` is not a win anywhere.** On a pure `Vec`
+   it is within noise of plain `Vec` on Chinese and English, and *worse* on
+   words100k (1.070 vs 1.100 is noise, but unidic 0.904 vs 0.909 is also
+   noise). Combined with the earlier `MatchBuf` measurement, where it was
+   uniformly slower, the candidate is closed.
+
+### Per-pass instruction counts (build subtracted)
+
+`perf stat` over the whole process is dominated by automaton construction
+(96.6% on unidic), so per-pass figures come from `(REPS=9 − REPS=1)/8`:
+
+| dataset | legacy | cur | va |
+|---|---|---|---|
+| words100k | 26,379,673 | 24,161,019 | 25,762,176 |
+| unidic | 47,869,940 | 41,048,098 | 39,642,029 |
+
+On words100k the experimental matcher executes **6.5% fewer instructions but
+takes 7.8% longer** — the deficit is stalls, not work. Per-pass IPC:
+
+| dataset | legacy | cur | va |
+|---|---|---|---|
+| words100 | 1.038 | 0.941 | 0.996 |
+| words100k | 0.856 | 0.748 | 0.805 |
+| unidic | 0.620 | 0.530 | 0.557 |
+
+The experimental matcher is consistently lower-IPC, which is the signature of
+the extra dependent load per mismatch hop documented earlier.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
