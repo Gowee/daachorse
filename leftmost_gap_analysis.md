@@ -475,6 +475,46 @@ A regime-adaptive build (only set the bit when `states.len()` is large) is
 possible since the builder knows the size, but it doubles the scan code paths
 and has not been measured.
 
+## Buffer sizing: `INLINE = 1` is worse than `INLINE = 4`
+
+Since 99.5% of emit chains have length 1 (max observed 3), shrinking the inline
+buffer to a single slot looks attractive: the iterator drops from 224 to 128
+bytes. Measured, it is a clear regression.
+
+| dataset | INLINE=4 | INLINE=1 | INLINE=2 |
+|---|---|---|---|
+| words100 | 9.99 | 11.15 (**+11.6%**) | 9.95 (−0.4%) |
+| words5k | 10.20 | 11.20 (**+9.8%**) | 10.23 (+0.4%) |
+| words15k | 11.05 | 12.06 (**+9.1%**) | 11.03 (−0.2%) |
+| words100k | 13.60 | 14.54 (**+7.0%**) | 13.54 (−0.4%) |
+| unidic | 30.27 | 31.50 (**+4.1%**) | 30.24 (−0.1%) |
+
+`INLINE = 2` is indistinguishable from `INLINE = 4`, so 4 costs nothing. But
+`INLINE = 1` costs 4–12%.
+
+**The cause is the spill path, not the size.** Instrumented: with `INLINE = 1`,
+109 of 23,826 pushes (0.46%) overflow to the `Vec`. A probe that removes the
+spill entirely — dropping the overflow, which is unsound and only used for
+measurement — restores the time:
+
+| words100k | median |
+|---|---|
+| INLINE=4 | 13.52 ms |
+| INLINE=1 with spill | 14.77 ms (+9.2%) |
+| INLINE=1 without spill (unsound) | 13.73 ms (+1.6%) |
+
+Yet `perf` reports essentially identical instruction counts (1.843 B vs
+1.846 B) and branch misses (11.998 M vs 12.060 M) for INLINE=1 and INLINE=4.
+So the cost is not extra work: it is the presence of a live `Vec` field in the
+hot struct. Once `spill` can actually be written, the compiler can no longer
+treat `MatchBuf` as plain data — the `Vec` may alias the state array — and the
+hot loop loses the scheduling freedom it had when `spill` was provably
+untouched.
+
+This is the same lesson as the allocation finding, one level down: what matters
+is not how often the heap path runs, but whether the compiler can prove it
+never runs.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
