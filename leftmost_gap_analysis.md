@@ -899,6 +899,38 @@ So the honest performance summary is domain-dependent, not a single number:
   comes for free).
 - **English prose: experimental is 1–10% slower**, worst at large automata.
 
+### Does the inline buffer matter on Chinese long text? No
+
+The zhconv test above used the current tree (inline buffer). To separate the
+buffer from the design, the same workload was run against three experimental
+variants, all with identical match counts:
+
+| dataset | legacy | exp inline | exp pure `Vec::with_capacity(4)` | exp pure `Vec::new()` |
+|---|---|---|---|---|
+| data54k | 0.94 | 0.91 | 0.95 | 0.91 |
+| data689k | 11.13 | 10.64 | 10.61 | 10.59 |
+| data3185k | 76.68 | 74.79 | 75.50 | 75.02 |
+
+as ratios to legacy:
+
+| dataset | inline | pure `Vec` (cap 4) | pure `Vec::new()` |
+|---|---|---|---|
+| data54k | 0.968 | 1.021 | 0.973 |
+| data689k | **0.955** | **0.953** | **0.951** |
+| data3185k | 0.975 | 0.985 | 0.978 |
+
+The three experimental variants are indistinguishable: the two large datasets
+agree within 1%, and data54k (0.9 ms total) is within noise. **On a single
+long haystack the inline buffer is worth nothing on Chinese text**, which
+matches the English single-haystack result (−2 to −4%) and is expected: with
+one iterator per pass there is one allocation to remove, and Chinese has ~0%
+unmapped characters so the scan dominates.
+
+Practical consequence: if the target is long-text search, the buffer choice is
+irrelevant to the experimental matcher's advantage over legacy — that advantage
+(1.5–5% on Chinese, ~2.5% on Japanese, −1 to −10% on English) comes from the
+matcher design, not from the buffer.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
