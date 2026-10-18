@@ -943,6 +943,86 @@ irrelevant to the experimental matcher's advantage over legacy — that advantag
 (1.5–5% on Chinese, ~2.5% on Japanese, −1 to −10% on English) comes from the
 matcher design, not from the buffer.
 
+## Storing a compact record in the buffer instead of `Match` (rejected: no penalty, no gain)
+
+A reasonable suggestion: have the buffer hold a tuple and convert to `Match` on
+output, to save memory without touching the public type.
+
+First, the premise: **a plain tuple does not save anything.**
+`(usize, usize, u32)` is 24 B, exactly like `Match`. Measured sizes:
+
+| type | size |
+|---|---|
+| `Match<u32>` | 24 B |
+| `Option<Match<u32>>` | 32 B |
+| `(usize, usize, u32)` | 24 B |
+| `(usize, u32, u32)` | 16 B |
+| `(u32, u32, u32)` | 12 B |
+
+To save anything one field must shrink. The buffer only needs
+`(end, length, value)`, and `length` is `u32` everywhere internally (a match
+cannot exceed its pattern, which the builder stores as `u32`). So a 16 B
+`Pending { end: usize, length: u32, value: V }` is possible **without changing
+the public `Match`** — which sidesteps the main objection to the earlier
+`Match`-shrinking experiment.
+
+This was implemented and measured (`iter_pending` yields `Pending` directly
+from the emit chain, `next()` maps it to `Match`).
+
+### Correctness
+
+All 216 tests pass and the match streams are **byte-identical** on all eight
+corpora for both match kinds.
+
+### Performance: no measurable change
+
+12 layout variants each, 15 reps, ratio to each binary's own legacy arm:
+
+| dataset | cur (24B) median | mt (16B) median | delta | mt better | paired median | stdev |
+|---|---|---|---|---|---|---|
+| words100 | 0.957 | 0.957 | −0.0% | 7/12 | −0.1% | 0.7 |
+| words5k | 1.026 | 1.025 | −0.2% | 6/12 | +0.1% | 1.2 |
+| words15k | 1.055 | 1.051 | −0.4% | 8/12 | −0.6% | 1.7 |
+| words100k | 1.075 | 1.077 | +0.1% | 5/12 | +0.6% | 3.5 |
+| unidic | 0.900 | 0.894 | −0.6% | 8/12 | −0.8% | 2.0 |
+
+Same conclusion as the `Match`-shrinking experiment: the effect (−0.6% to
++0.1%) is smaller than the layout noise it must be distinguished from
+(stdev 0.7–3.5%), and the win counts are near a coin flip. **No penalty, but no
+gain either.**
+
+### Memory: the saving is real but far too small to matter
+
+The record shrinks from 24 B to 16 B, and because `Vec` grows to capacity 4 on
+the first `push`, the allocation drops from **96 B to 64 B** — 32 B per live
+iterator. But:
+
+- there is **one buffer per iterator**, and the peak element count is the
+  longest emit chain, measured at 1 in 99.5% of cases (max 3);
+- `leftmost_find_iter` returns one iterator per call, whose lifetime is the
+  scan, so there are never many live iterators.
+
+Measured peak RSS (`VmHWM`) on the two densest workloads is dominated by the
+automaton itself:
+
+| dataset | cur | mt |
+|---|---|---|
+| words100k | 108.6–110.6 MB | 109.3–112.8 MB |
+| unidic | 206.7–207.9 MB | 207.5–208.1 MB |
+
+The differences are noise; 32 B against a 200 MB automaton is 0.00002%.
+
+### Decision: not adopted
+
+It costs an extra `to_match()` per pop and a second copy of the
+`(end, length, value)` triple in the codebase, in exchange for 32 B per live
+iterator that cannot be observed. The public `Match` stays 24 B and the buffer
+keeps storing `Match` directly.
+
+The one case where it *would* matter is an API that holds many iterators alive
+at once, or one that stores many pending matches per iterator. Neither applies
+here.
+
 ## Re-testing 16-byte `Match` after the buffer became a `Vec`
 
 `Match` was shrunk from 24 B to 16 B once before (`length: usize` -> `u32`) and
