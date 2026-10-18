@@ -661,6 +661,57 @@ registers and reorder, versus `unsafe` reads, live `Vec` fields, or split
 branches that force spills. **Reducing bytes is not the lever; keeping the hot
 path as plain, unconditional data flow is.**
 
+## The emit-chain length has a principled bound: `L - 1`
+
+Earlier revisions of this document argued about `INLINE` from measured chain
+lengths (2 on words100k, 3 on unidic) and even claimed 4 slots was "safe". That
+reasoning was wrong: sampling cannot establish a bound. The bound comes from the
+builder.
+
+A chain accumulates matches that were committed while the scan stays on one trie
+path, because emission happens only when the automaton returns to ROOT. The
+longest stretch without returning to ROOT is the longest pattern, so
+
+    chain length <= L - 1,   L = length of the longest pattern in characters
+
+and the bound is **tight**. Construction: one long pattern to hold the scan off
+ROOT, plus a pattern for every character along it so each character commits a
+match. Verified:
+
+| longest pattern L | chain length | matches |
+|---|---|---|
+| 3 | 2 | 2 |
+| 10 | 9 | 9 |
+| 26 | 25 | 25 |
+| 100 | 99 | 99 |
+| 500 | 499 | 499 |
+| **1000** | **999** | **999** |
+
+Reaching `L - 1` needs the pattern set to also contain the short prefixes
+(single characters in the construction above). That is why ordinary word lists
+stay tiny despite long patterns:
+
+| corpus | max pattern chars | observed chain |
+|---|---|---|
+| words100k | 107 | 2 |
+| unidic | 34 | 3 |
+| English prose words | — | 2 |
+
+A random English word does not complete a match at each of its prefixes, so the
+chain never grows. But `{"abcdefghij…z", "a", "b", …, "z"}` over `"abc…y"`
+produces 25, and the same shape with a 1000-character alphabet produces 999.
+
+**Consequences for `INLINE`:**
+
+- No fixed `INLINE` can be "safe" in the sense of never spilling. `4` covers
+  short-pattern workloads and spills for the construction above; the spill path
+  is what makes that correct, and it must be kept.
+- The bound depends on data the builder knows (max pattern length, and how many
+  prefixes are patterns), but `INLINE` is a const generic, so it cannot be sized
+  at build time. It stays a compile-time default.
+- Both `INLINE = 2` and `INLINE = 4` measured performance-identical on real
+  corpora, so 4 costs nothing while covering more of the short-pattern range.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
