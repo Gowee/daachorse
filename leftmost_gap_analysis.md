@@ -564,6 +564,55 @@ faster representation, and it needs no `unsafe`.
 footprint is irrelevant (one per iterator, non-recursive, dwarfed by any thread
 stack), field order does not matter, and both available reductions cost 6–13%.
 
+## Candidate 9: return the match directly from `ensure_buffered` (rejected)
+
+Proposal: have `ensure_buffered` hand back the next ready match directly,
+pushing only the remainder into `buf`, so the common single-match case costs no
+push and no pop. Two implementations were measured.
+
+**r1** — `ensure_buffered() -> Option<Match<V>>`; `next()` keeps the value,
+and on the epsilon path pushes it back before interpolating:
+
+| dataset | current | r1 | delta |
+|---|---|---|---|
+| words100 | 9.98 | 11.99 | **+20.1%** |
+| words5k | 10.19 | 11.82 | +16.0% |
+| words15k | 11.07 | 12.53 | +13.2% |
+| words100k | 13.71 | 15.00 | +9.4% |
+| unidic | 30.14 | 32.45 | +7.7% |
+
+**r2** — cheaper: test `epsilon_emit_pos.is_none()` at the top of `next()` and
+take a branch-free path, so no value is carried across the epsilon branch:
+
+| dataset | current | r2 | delta |
+|---|---|---|---|
+| words100 | 9.99 | 10.84 | +8.5% |
+| words5k | 10.20 | 11.04 | +8.2% |
+| words15k | 11.03 | 11.83 | +7.3% |
+| words100k | 13.70 | 14.30 | +4.4% |
+| unidic | 30.32 | 31.31 | +3.3% |
+
+Both are correct (identical match sequences on all five corpora) and both are
+slower. `perf` shows r1 at 1.860 B instructions against 1.840 B — only +1.1% —
+while taking 9.4% longer on words100k.
+
+Two separable costs:
+
+1. **Carrying `Option<Match<V>>` (32 bytes, four registers) across the epsilon
+   branch** forces a spill/reload. r1 pays this; r2 does not, and r2 is
+   correspondingly less bad.
+2. **The extra branch itself.** r2 still costs 3–8% with no carried value,
+   because it splits `next()` into two paths and the compiler can no longer
+   schedule the single existing path as tightly.
+
+The push and the pop that the proposal removes are L1-resident stack writes on
+an already-hot object; they were never the cost. This is the third result in
+this document with the same shape: identical instruction counts, materially
+worse time, caused by register pressure and lost scheduling freedom rather than
+by work performed.
+
+**The current single-path `next()` is already the right shape.** Leave it.
+
 ## Why an earlier note said "~10%"
 
 Appendix B records a callgrind run that reported the remaining cost as "~10% on
