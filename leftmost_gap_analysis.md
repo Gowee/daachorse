@@ -1002,15 +1002,42 @@ iterator. But:
 - `leftmost_find_iter` returns one iterator per call, whose lifetime is the
   scan, so there are never many live iterators.
 
-Measured peak RSS (`VmHWM`) on the two densest workloads is dominated by the
-automaton itself:
+Measured RSS on the two densest workloads shows no difference:
 
 | dataset | cur | mt |
 |---|---|---|
 | words100k | 108.6–110.6 MB | 109.3–112.8 MB |
 | unidic | 206.7–207.9 MB | 207.5–208.1 MB |
 
-The differences are noise; 32 B against a 200 MB automaton is 0.00002%.
+**Correction: those `VmHWM` figures are not the automaton size.** `VmHWM` is the
+lifetime *peak* RSS, and the peak is reached inside `build()`, where the builder
+holds the NFA (trie + fail links + emit chains) while emitting the double-array,
+so both representations are briefly alive. Measuring stage by stage on unidic:
+
+| point | VmRSS |
+|---|---|
+| start | 0.5 MB |
+| after reading patterns | 34.3 MB |
+| after reading haystack | 35.4 MB |
+| after build (patterns still alive) | 67.1 MB |
+| after dropping patterns | 34.3 MB |
+| after scan | 34.3 MB |
+
+with `VmHWM` peaking at 208.2 MB during the build. The automaton itself is much
+smaller than the peak suggests:
+
+| dataset | states | `State x N` (16 B each) | serialized |
+|---|---|---|---|
+| words100 | 920 | 14 KB | 17 KB |
+| words5k | 32,180 | 0.5 MB | 0.6 MB |
+| words15k | 75,368 | 1.2 MB | 1.4 MB |
+| words100k | 644,363 | 9.8 MB | 13.5 MB |
+| unidic | 911,862 | **13.9 MB** | 28.3 MB |
+
+So the steady-state footprint on unidic is ~34 MB, of which the state array is
+13.9 MB. The 32 B per live iterator is 0.0002% of the automaton, and using
+`VmHWM` to compare buffer sizes was the wrong instrument: the peak is dominated
+by the builder and is identical for both variants.
 
 ### Decision: not adopted
 
