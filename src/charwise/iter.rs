@@ -879,16 +879,17 @@ where
                             // SAFETY: state_id is a valid state index as
                             // guaranteed by the builder or deserializer.
                             let st = unsafe { states.get_unchecked(state_id as usize) };
-                            // SAFETY: `base` comes from the state loaded above,
-                            // and `base ^ code` is in range by the double-array
-                            // invariant.
-                            if let Some(base) = st.base() {
-                                let child_idx = (base.get() ^ code) as usize;
-                                if unsafe { states.get_unchecked(child_idx) }.check() == state_id {
-                                    state_id = child_idx as u32;
-                                    pos += char_len;
-                                    break;
-                                }
+                            // SAFETY: `base` comes from the state loaded
+                            // above, and `base ^ code` is in range by the
+                            // double-array invariant. `code` is known to be
+                            // mapped here, so `Some` is passed literally and
+                            // the option test folds away.
+                            if let Some(child_id) =
+                                unsafe { step_child(states, st.base(), state_id, Some(code)) }
+                            {
+                                state_id = child_id;
+                                pos += char_len;
+                                break;
                             }
                             if state_id == ROOT_STATE_IDX {
                                 // No transition from ROOT: this character cannot
