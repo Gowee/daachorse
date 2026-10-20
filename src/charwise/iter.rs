@@ -868,28 +868,56 @@ where
                     // soon as a state with output is reached; that chain is left
                     // for the next call, which preserves output order (only one
                     // chain is ever buffered per call).
-                    loop {
-                        // SAFETY: state_id is a valid state index as guaranteed
-                        // by the builder or deserializer.
-                        let st = unsafe { states.get_unchecked(state_id as usize) };
-                        if let Some(child_id) =
-                            unsafe { step_child(states, st.base(), state_id, mapped_c) }
-                        {
-                            state_id = child_id;
-                            pos += char_len;
-                            break;
+                    //
+                    // `mapped_c` is invariant across the walk, so it is hoisted
+                    // out: the mapped branch inlines the transition probe (one
+                    // `base` test, one `check` compare) and the unmapped branch
+                    // has no probe at all, since no state can have a child for a
+                    // character the alphabet does not contain.
+                    if let Some(code) = mapped_c {
+                        loop {
+                            // SAFETY: state_id is a valid state index as
+                            // guaranteed by the builder or deserializer.
+                            let st = unsafe { states.get_unchecked(state_id as usize) };
+                            // SAFETY: `base` comes from the state loaded above,
+                            // and `base ^ code` is in range by the double-array
+                            // invariant.
+                            if let Some(base) = st.base() {
+                                let child_idx = (base.get() ^ code) as usize;
+                                if unsafe { states.get_unchecked(child_idx) }.check() == state_id {
+                                    state_id = child_idx as u32;
+                                    pos += char_len;
+                                    break;
+                                }
+                            }
+                            if state_id == ROOT_STATE_IDX {
+                                // No transition from ROOT: this character cannot
+                                // start any pattern, so skip it.
+                                pos += char_len;
+                                break;
+                            }
+                            if st.output_pos().is_some() {
+                                // Second non-empty chain: stop probing here.
+                                break;
+                            }
+                            state_id = st.fail();
                         }
-                        if state_id == ROOT_STATE_IDX {
-                            // No transition from ROOT: this character cannot
-                            // start any pattern, so skip it.
-                            pos += char_len;
-                            break;
+                    } else {
+                        loop {
+                            // Tested before the state load: ROOT always consumes.
+                            if state_id == ROOT_STATE_IDX {
+                                pos += char_len;
+                                break;
+                            }
+                            // SAFETY: state_id is a valid state index as
+                            // guaranteed by the builder or deserializer.
+                            let st = unsafe { states.get_unchecked(state_id as usize) };
+                            if st.output_pos().is_some() {
+                                // Second non-empty chain: stop probing here.
+                                break;
+                            }
+                            state_id = st.fail();
                         }
-                        if st.output_pos().is_some() {
-                            // Second non-empty chain: stop probing here.
-                            break;
-                        }
-                        state_id = st.fail();
                     }
                     self.pos = pos;
                     self.state_id = state_id;
