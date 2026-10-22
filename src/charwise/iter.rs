@@ -843,10 +843,14 @@ where
                         return;
                     }
                 }
-            } else if let Some(next_pos) =
-                Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, pos, char_len)
-            {
-                self.pos = next_pos;
+            } else if Self::drain_fail_at(
+                self.pma,
+                &mut self.buf,
+                &mut state_id,
+                &mut pos,
+                char_len,
+            ) {
+                self.pos = pos;
                 self.state_id = state_id;
                 return;
             }
@@ -855,27 +859,23 @@ where
         }
 
         self.pos = pos;
-        if let Some(next_pos) =
-            Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, pos, 0)
-        {
-            self.pos = next_pos;
-        }
+        Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, &mut self.pos, 0);
         self.state_id = state_id;
     }
 
     /// Drains failure links from `*state_id` at `pos`, buffering the first state with an output,
     /// or skipping directly to `ROOT_STATE_IDX` if no failure ancestor has an emit.
     ///
-    /// Returns `Some(next_pos)` if a match was emitted, or `None` if `ROOT_STATE_IDX` was
+    /// Returns `true` if a match was emitted, or `false` if `ROOT_STATE_IDX` was
     /// reached without any emit.
     #[inline(always)]
     fn drain_fail_at(
         pma: &CharwiseDoubleArrayAhoCorasick<V>,
         buf: &mut alloc::vec::Vec<Match<V>>,
         state_id: &mut u32,
-        pos: usize,
+        pos: &mut usize,
         char_len: usize,
-    ) -> Option<usize> {
+    ) -> bool {
         let states = &pma.states;
         while *state_id != ROOT_STATE_IDX {
             // SAFETY: *state_id is guaranteed to be a valid state index by construction.
@@ -887,15 +887,14 @@ where
             *state_id = state.fail();
             if let Some(ep) = state.output_pos() {
                 // SAFETY: ep is a valid output position stored in the automaton.
-                buf.extend(unsafe { pma.iter_emits(ep, pos) });
-                return Some(if *state_id == ROOT_STATE_IDX {
-                    pos + char_len
-                } else {
-                    pos
-                });
+                buf.extend(unsafe { pma.iter_emits(ep, *pos) });
+                if *state_id == ROOT_STATE_IDX {
+                    *pos += char_len;
+                }
+                return true;
             }
         }
-        None
+        false
     }
 
     /// Ensures `self.buf` contains the next non-empty match(es), scanning forward
