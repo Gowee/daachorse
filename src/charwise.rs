@@ -625,7 +625,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     pub fn leftmost_find_iter_experimental<P>(
         &self,
         haystack: P,
-    ) -> LeftmostFindIteratorExperimental<'_, P, V>
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, true, 0, true>
     where
         P: AsRef<str>,
         V: Copy,
@@ -634,16 +634,151 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             self.match_kind.is_experimental(),
             "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
         );
-        LeftmostFindIteratorExperimental {
-            pma: self,
-            haystack,
-            pos: 0,
-            state_id: ROOT_STATE_IDX,
-            buf: Vec::new(),
-            gate: PrefilterGate::new(),
-            epsilon_emit_pos: self.states[usize::from_u32(ROOT_STATE_IDX)].output_pos(),
-            epsilon_cursor: 0,
-        }
+        LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    /// Returns an iterator of experimental non-overlapping matches with probing disabled on emit.
+    pub fn leftmost_find_iter_no_probe<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, false, 0, true>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    /// Returns an iterator of experimental non-overlapping matches using the old CodeMapper::get (with .copied().filter).
+    pub fn leftmost_find_iter_old_mapper<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, true, 1, true>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    /// NoProbe with old CodeMapper::get.
+    pub fn leftmost_find_iter_no_probe_old_mapper<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, false, 1, true>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    /// SingleProbe with scalar u32::MAX.
+    pub fn leftmost_find_iter_scalar<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, true, 2, true>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    /// NoProbe with scalar u32::MAX.
+    pub fn leftmost_find_iter_no_probe_scalar<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, false, 2, true>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    /// Returns an iterator of experimental non-overlapping matches with probing disabled on emit (without borrowing bit 31).
+    pub fn leftmost_find_iter_no_probe_no_bit<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, false, 0, false>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    /// SingleProbe without borrowing bit 31.
+    pub fn leftmost_find_iter_experimental_no_bit<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, true, 0, false>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    /// SingleProbe with Option<u32> mapped_c (prior architecture).
+    pub fn leftmost_find_iter_sng_option<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, true, 0, true>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    /// NoProbe with Option<u32> mapped_c.
+    pub fn leftmost_find_iter_nop_option<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, false, 0, true>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostFindIteratorExperimental::new(self, haystack)
     }
 
     /// Returns a stepper of non-overlapping matches that consumes characters one by one.
@@ -868,6 +1003,18 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             state_id: ROOT_STATE_IDX,
             pos: 0,
         }
+    }
+
+    /// Returns a reference to the internal code mapper.
+    #[inline(always)]
+    pub fn mapper(&self) -> &CodeMapper {
+        &self.mapper
+    }
+
+    /// Returns a slice of the internal double-array states.
+    #[inline(always)]
+    pub fn states(&self) -> &[State] {
+        &self.states
     }
 
     /// Returns the match kind for this automaton.
@@ -1367,7 +1514,8 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     /// - `head_pos` and all chained `pred` links must point to valid entries in `self.emits`.
     /// - `anchor` must be greater than or equal to the total span length of the chain.
     #[inline(always)]
-    pub(crate) unsafe fn iter_emits(
+    #[doc(hidden)]
+    pub unsafe fn iter_emits(
         &self,
         head_pos: NonZeroU32,
         mut anchor: usize,
@@ -1386,7 +1534,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             Some(emit.to_match(end))
         })
     }
-
 
     /// # Safety
     ///
@@ -1466,7 +1613,8 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct State {
+#[doc(hidden)]
+pub struct State {
     base: Option<NonZeroU32>,
     check: u32,
     fail: u32,
@@ -1504,7 +1652,12 @@ impl State {
 
     #[inline(always)]
     pub const fn fail(&self) -> u32 {
-        self.fail
+        self.fail & 0x7FFF_FFFF
+    }
+
+    #[inline(always)]
+    pub const fn fail_has_emit(&self) -> bool {
+        (self.fail & 0x8000_0000) != 0
     }
 
     #[inline(always)]

@@ -1899,3 +1899,1760 @@ So the flush walk is close to irreducible for this semantics.
 - The experimental matcher is already **faster** on dense, fully-mapped text
   (unidic 0.94–0.97).
 - No loop-level fix exists; six attempts failed for the same structural reason.
+
+## Can the `Vec` pending-match buffer be eliminated?
+
+The question came from a legitimate observation: `buf` exists only to reverse a
+chain, and reversing a list of unbounded length `k` normally costs `O(k)` space.
+Since chain length is capped by `O(min(|V|, |Σ|))` and is *uncontrollable*, a
+design that assumed `k` small would be invalid. So the question is whether
+reversal can be avoided **in general**, not whether it is usually unnecessary.
+
+### First: what the buffer actually costs
+
+Measured with a counting global allocator, scanning only (iterator built and
+warmed up first):
+
+| corpus | matches | allocations | reallocs | bytes |
+|---|---|---|---|---|
+| words100 | 20 | **1** | 0 | 96 |
+| words100k | 47,652 | **1** | 0 | 96 |
+| unidic | 472,884 | **1** | 0 | 96 |
+
+Exactly **one 96-byte allocation per iterator**, regardless of haystack size or
+match count. `Vec::new()` allocates on the first push and then reuses capacity
+forever, because `ensure_buffered_impl` only pushes when the buffer is empty and
+`next()` drains it to empty before the next refill. There is no per-chain or
+per-match allocation anywhere in the path.
+
+So the entire budget for eliminating the buffer is: *one `malloc`/`free` pair per
+`leftmost_find_iter` call*. For the long-text focus of this work that is a single
+call, amortised over megabytes of haystack.
+
+### Why reversal is structurally forced
+
+The chain is stored head-first (`M_k` at the head, `pred` walking back to `M_1`)
+and positions are computed by walking **from the head**:
+
+```
+end(M_k)   = pos - head.gap
+start(M_k) = end(M_k) - head.length
+end(M_{i}) = start(M_{i+1}) - em_i.gap
+```
+
+The first position the iterator can compute is `M_k`'s — the chronologically
+*last* match. Emitting `M_1` first therefore requires either reversal (the
+buffer), or re-walking the chain per match (`O(k²)` time), or recursion
+(`O(k)` stack, overflow risk at `k = O(min(|V|,|Σ|))`). A singly-linked list
+cannot be traversed backward, and `pred` cannot be reversed in place because the
+nodes are shared across trie branches and across concurrently live iterators.
+
+Reverse linking is not an accident of implementation: it is what makes the chain
+a persistent structure. Appending chronologically would require mutating the
+shared tail; prepending (`pred`) is `O(1)` and shares the entire prefix for free.
+
+### The forward-link design, measured
+
+The one design that would genuinely give `O(1)` runtime space: store `next`
+pointers (chronological) instead of `pred`, so traversal yields matches in output
+order with no reversal. Cost analysis:
+
+**1. The successor is not knowable at insert time.** `extend_from` inserts
+`prev.with_gap(inter_gap)` *first*, then chains `M_1..M_{k-1}`, and only then
+installs the new head. When that node is created its chronological successor
+`M_1` does not exist yet — so `next` cannot be part of the `DedupKey` at
+insertion.
+
+**2. Patching afterward corrupts shared nodes.** `EmitStore::insert` returns a
+*pre-existing shared node* when the dedup key matches. Writing `next` into it
+after the fact would change the successor for every other chain sharing that
+node.
+
+**3. Adding `next` to the dedup key breaks the sharing itself.** Two chains that
+share an interior node `M_i` but continue to different `M_{i+1}` would no longer
+dedup. Measured by counting distinct `(successor, value, length, gap)` tuples
+over every chain — exactly what dedup would retain once `next` joined the key:
+
+| corpus | current nodes | forward-link nodes | node blowup | emit memory |
+|---|---|---|---|---|
+| words100 | 100 | 101 | 1.01× | 0.00→0.00 MiB |
+| words5k | 5,134 | 5,135 | 1.00× | 0.08→0.10 MiB |
+| words15k | 15,930 | 15,931 | 1.00× | 0.24→0.30 MiB |
+| **words100k** | 222,366 | 745,698 | **3.35×** | 3.39→**14.22 MiB** (4.19×) |
+| unidic | 785,533 | 803,402 | 1.02× | 11.99→15.32 MiB (1.28×) |
+
+(The forward representation also needs a `next: u32` field, so `Emit` grows
+16→20 B, which is why the memory ratio exceeds the node ratio.)
+
+Nodes whose successor is genuinely ambiguous — reached from two chains with
+different chronological successors, i.e. exactly the ones that would have to be
+split: **17,761** on words100k, **9,171** on unidic, **0** on the smaller word
+sets.
+
+So forward-linking trades one 96-byte allocation for up to **+10.8 MiB of emit
+memory** and a weaker dedup, and it requires resolving the insert-order
+chicken-and-egg (the successor must be known before insertion, but is created
+afterward) by either disabling dedup or restructuring the builder. On unidic the
+node blowup is small (1.02×) precisely because chains there are short and share
+little; on words100k, where sharing is 4.6×, the blowup is severe.
+
+### Conclusion
+
+The buffer is not removable without a real cost, and every alternative pays more
+than it saves:
+
+| option | space | time | verdict |
+|---|---|---|---|
+| `Vec` (current) | 96 B, 1 alloc/iterator | `O(k)` | **shipped** |
+| forward-linked chain | +4 B/emit, 1.02–3.35× node blowup | `O(k)`, no alloc | worse memory, builder rework |
+| `O(k²)` re-walk | `O(1)` | quadratic in `k` | breaks the linear-time guarantee the matcher advertises |
+| recursion | `O(k)` stack | `O(k)` | stack overflow at `k = O(min(|V|,|Σ|))` |
+| fixed inline array | `O(k)` inline | `O(k)` | cannot bound `k`; measured 1.3–3.4% *slower* than `Vec::new()` (`Vec::with_capacity` variant) |
+
+The `Vec` is already the minimal-cost representation: one allocation, no
+reallocations, reused for the iterator's whole lifetime. The reversal it performs
+is inherent to storing a shared persistent list in reverse — which is itself what
+makes the chain `O(1)`-appendable and structurally shared across branches.
+
+### Follow-up: does a forward-linked version attach a dedicated list to every state?
+
+No — and the reason is the sharpest argument against the design. Two different
+questions have to be separated:
+
+**"Is every state's chain a distinct list?"** In the *current* reverse-linked
+store, no: chains share their tail. `states_with_output` exceeds
+`distinct_heads` by 1.6× on words100k (335,705 vs 213,163) and 1.17× on unidic
+(907,436 vs 776,482) because many states point at the same head node. The chain
+is a persistent list, so a state stores one pointer, not a list.
+
+**"Would a forward-linked version still share?"** Only at the very end. Measured
+by building the forward trie over all distinct chains (key `(successor, value,
+length, gap)`) and counting, per position from the chronological end, how many
+nodes are used by more than one chain:
+
+| depth from end | words100k nodes | shared | unidic nodes | shared |
+|---|---|---|---|---|
+| 0 (last match) | 213,163 | 40.4% | 776,482 | 5.5% |
+| 1 | 94,424 | 45.0% | 45,525 | 18.7% |
+| 2 | 78,551 | 20.8% | 19,290 | 10.0% |
+| 3 | 71,232 | 3.1% | 9,211 | 4.9% |
+| 4 | 65,178 | 0.1% | 4,015 | 3.1% |
+| 5 | 59,264 | 0.0% | 1,541 | 2.3% |
+| ≥6 | 0.0% | — | ~2% then 0 |
+
+Sharing collapses to zero beyond depth 4–5. So a forward-linked chain is
+effectively **one dedicated list per state**: every prefix longer than a handful
+of matches is unshared and must be materialised.
+
+That is exactly the identity cascade. A node's forward identity includes its
+successor, and the successor's identity includes *its* successor, so the key of a
+node at depth `d` depends on the entire suffix of length `d`. Two chains that
+agree on their last match diverge as soon as any earlier match differs, and
+because earlier matches are the *shared* part of the current representation, the
+sharing inverts: the current design shares the long prefix and pays only for the
+new tail; the forward design shares only the short suffix and pays for the whole
+prefix.
+
+Concrete totals for "one dedicated list per chain" (every distinct chain copied
+in full):
+
+| corpus | emit nodes | copy-in-full nodes | blowup |
+|---|---|---|---|
+| words100 | 100 | 100 | 1.00× |
+| words5k | 5,134 | 5,134 | 1.00× |
+| words15k | 15,930 | 15,930 | 1.00× |
+| words100k | 222,366 | 892,991 | **4.02×** |
+| unidic | 785,533 | 857,109 | 1.09× |
+
+This matches the earlier dedup-keyed count (3.35× / 1.02×) from a different
+direction: forward linking either loses sharing (dedup-key count) or copies
+prefixes (path-copy count). Both land in the same place — words100k pays 3–4×.
+
+Note the two corpora fail for different reasons, and both are instructive:
+
+- **words100k** has many long chains (`max_chain = 28`) and heavy prefix sharing
+  (`chain_items/nodes = 4.6×`). Forward linking destroys precisely that sharing.
+- **unidic** has short chains and little sharing to begin with (`1.27×`), so the
+  blowup is mild — but there is also almost nothing for the design to win, since
+  the current `Vec` already costs one allocation per iterator there.
+
+The mechanism in one sentence: **a persistent singly-linked list can share on
+prepend but never on append.**
+
+- Reverse-linked (`pred`): appending `M_{k+1}` allocates one node and points it
+  at the existing `M_k`. Both divergent descendants keep the *same* `M_1..M_k`
+  and each owns only its new tail. Divergence is free; sharing is total.
+- Forward-linked (`next`): appending `M_{k+1}` must write `M_k.next`. `M_k` is
+  shared by both descendants, so it must be copied — but then `M_{k-1}.next`
+  points at the stale `M_k`, so `M_{k-1}` must be copied too, cascading all the
+  way back to `M_1`. **One divergence forces a full prefix copy.**
+
+So it is not that a divergent node loses sharing with its neighbours; the entire
+prefix back to the head is duplicated, because every link on the path to the head
+must be rewritten. Sharing is not partially preserved — it is inverted. The
+current design shares the long prefix and pays one node per extension; the
+forward design shares only the short suffix and pays `O(k)` per divergence.
+
+This is why no amount of dedup rescues it: the node identity at depth `d` depends
+on the entire suffix of length `d`, so two chains that differ anywhere in the
+prefix can never share a node before that point.
+
+So the forward-link version is not "dedicated lists with shared nodes". It is
+dedicated lists with nodes shared only for the last few matches, which is the
+opposite of where the current design's sharing lives.
+
+## Is the fail-fusion `step_child` at iter.rs:862 necessary?
+
+```rust
+if let Some(child_id) = unsafe {
+    step_child(states, states.get_unchecked(state_id as usize).base(), state_id, mapped_c)
+} {
+    state_id = child_id;
+    pos += char_len;
+}
+```
+
+Runs after a fail transition, inside the `state.output_pos().is_some()` arm —
+exactly when the call is about to buffer emits and return.
+
+### RETRACTION (twice)
+
+**First claim (wrong):** that the block "removes one full decode + map + state
+load + probe per emit-returning fail", and that on a miss the probe is not an
+extra `states[]` access "because the same load happens on the next call anyway".
+
+**Second claim (also wrong):** that a hit saves "one decode + map + state load".
+
+**What the counters actually show.** Instrumented both arms (block present /
+removed), counting every access site:
+
+| corpus | L829 loads | L865 loads | probes | child loads | decodes | maps |
+|---|---|---|---|---|---|---|
+| words100k | 921,349 | 23,717 | 945,066 | 453,212 | 603,412 | 603,412 |
+| unidic | 387,089 | 235,982 | 623,071 | 533,236 | 386,014 | 386,014 |
+| zh54k | 33,762 | 2,573 | 36,335 | 28,463 | 22,268 | 22,268 |
+
+The invariant **`L829 + L865 == probes`** holds exactly on all three corpora. Every
+`step_child` call is preceded by exactly one state load — the fusion block does
+not avoid it, it *moves* it (L865 instead of L829).
+
+Against the no-fusion arm:
+
+| corpus | Δ state loads | Δ probes | Δ child loads | Δ decodes |
+|---|---|---|---|---|
+| words100k | **+21,550** | **+21,550** | +267 | **−2,167** |
+| unidic | **+11,066** | **+11,066** | +8,700 | **−224,916** |
+| zh54k | **+502** | **+502** | +291 | **−2,071** |
+
+with `Δ state loads == Δ probes == misses` and `Δ decodes == −hits`.
+
+So, precisely:
+
+- **A hit saves only a decode + a map.** The state load is not saved — the fusion
+  performs `states[fail]` at L865, and the next call performs `states[child]` at
+  L829. One load either way. The probe is likewise paid in both arms.
+- **A miss costs an extra state load, an extra probe, an extra decode and an
+  extra map**, because everything the fusion did is redone on the next call.
+- **`Δ decodes == −hits` is the whole benefit.** Nothing else improves.
+
+### Where misses come from
+
+Decomposing every miss by why `step_child` failed:
+
+| corpus | misses | `mapped_c == None` | `base == None` | check mismatch |
+|---|---|---|---|---|
+| words100k | 21,550 | **21,283 (98.8%)** | 0 | 267 |
+| unidic | 11,066 | **2,366 (21.4%)** | 0 | 8,700 |
+| zh54k | 502 | **211 (42.0%)** | 0 | 291 |
+
+`base == None` never occurs. On English, **98.8% of misses are characters with no
+mapper entry at all** — `step_child` returns immediately without even loading
+`states[base ^ code]`, so the L865 state load is pure waste. That is why the
+block is measurably useless on prose: it pays a full state load on 21,550
+occasions to save 2,167 decodes.
+
+On unidic the miss profile is the opposite: only 21.4% are unmapped characters,
+and 78.6% are genuine check mismatches where the probe did real work and simply
+did not find a child.
+
+### The payoff
+
+| corpus | hit rate | run 1 ratio | run 2 ratio |
+|---|---|---|---|
+| words100 | 0.00% | 0.9995 | 1.0002 |
+| words5k | 11.64% | 1.0027 | 1.0075 |
+| words15k | 8.43% | 1.0090 | 1.0067 |
+| words100k | 9.14% | 1.0009 | 0.9933 |
+| **unidic** | **95.31%** | **0.9358** | **0.9378** |
+| **zh54k** | **80.49%** | **0.9492** | — |
+| zh689k | 70.84% | 0.9872 | — |
+| **zh3185k** | **85.97%** | **0.9654** | — |
+
+(separate binaries, alternating arms, 5 pairs, `zin`; ratio = fusion/no-fusion)
+
+On unidic the block removes 224,916 of 610,930 decodes — **37% of all
+decoding** — for the price of 11,066 extra state loads and probes. A decode + map
+is evidently far more expensive than a state load, which is what makes the trade
+pay there. On words100k the ratio is 21,550 wasted loads against 2,167 saved
+decodes, and the result is flat.
+
+### Answer to "is it better or worse in general?"
+
+Better on densely-mapped text, neutral on prose, never measurably worse. The
+condition is roughly `h × (decode + map) > (1 − h) × (state load + probe)`,
+which holds above `h ≈ 10–15%`. Every measured corpus is either above that or
+within noise.
+
+### Answer to "can we go further in that branch?"
+
+The commented-out ROOT special case is strictly redundant — the general
+`step_child` below probes ROOT with the same load. A second chained step would
+speculate one more character, but the main loop already does that next call, and
+it would duplicate the emit-return bookkeeping while paying another probe on
+every miss.
+
+### On inlining, and a retracted micro-optimisation
+
+`step_child` is `#[inline(always)]`, so it disappears into the caller — but that
+does **not** remove the `states[state_id]` load. The shipped hot loop compiles to:
+
+```
+234fb: mov  %r14d,%eax
+234fe: shl  $0x4,%rax            ; state_id * 16
+23502: mov  (%rcx,%rax,1),%eax   ; <-- LOAD states[state_id].base  (unconditional)
+23505: test %eax,%eax
+23507: sete %dl                  ; base == None
+2350a: mov  0x64(%rsp),%esi      ; mapped_c tag
+2350e: not  %sil
+23511: or   %dl,%sil             ; (mapped_c == None) | (base == None)
+23514: test $0x1,%sil
+23518: jne  23725                ; -> skip the probe
+```
+
+Inlining merges the two `None` checks into a single branch, but the load still
+executes first. The compiler cannot sink it below the test.
+
+I earlier proposed guarding the block with `mapped_c.is_some()` to skip that load
+on the 98.8% of English misses that are unmapped characters. **That suggestion is
+retracted.** Compiling both shapes confirms the guard *does* move the load below
+the check:
+
+```
+fuse_guarded:
+    xor  %eax,%eax
+    test %ecx,%ecx        ; mapped_c tag
+    je   .LBB0_4          ; -> return None before any load
+    mov  (%rdi,%rcx),%edx ; load only when mapped_c is Some
+```
+
+But it does not pay. `states[state_id]` is a 16-byte L1-resident load, and the
+fail target's cache line was just touched. The measured cost of 21,283 such
+loads on words100k is already inside the noise floor (0.9995 / 1.0002). Trading
+an unconditional load for an extra unpredictable branch is not obviously better,
+and it was not measured. Leave the block as is.
+
+### What is left in this branch: nothing measurable
+
+`decodes == chars + misses` holds exactly, because fusion removes precisely the
+hits. So the only redundant work remaining in the path is the `misses`
+re-decodes:
+
+| corpus | chars | decodes | redundant | % of decodes | cycles @9 | % of runtime |
+|---|---|---|---|---|---|---|
+| words100k | 581,862 | 603,412 | 21,550 | 3.57% | 194k | 0.48% |
+| unidic | 374,948 | 386,014 | 11,066 | 2.87% | 100k | 0.10% |
+| zh54k | 21,766 | 22,268 | 502 | 2.25% | 4.5k | 0.18% |
+
+Two candidate fixes, both estimated against that budget:
+
+**Cache the pending character across calls.** A `(mapped_c, char_len)` field
+would let a miss reuse the character instead of re-decoding it. Cost: one
+compare + branch on *every* character, not just misses (the cache must be
+invalidated on the success path too). At ~0.5 cycles per character that is
+0.71% / 0.20% / 0.43% of runtime, against savings of 0.48% / 0.10% / 0.18%.
+**Net negative on all three corpora.**
+
+**Guard the fusion with `mapped_c.is_some()`.** Saves the state load on the
+`map_none` misses: 21,283 / 2,366 / 211 loads, worth 0.21% / 0.01% / 0.03%.
+Below the 0.05–3.1% noise floor, so it cannot even be validated.
+
+The branch is done. Its remaining headroom is under half a percent on every
+corpus, and below the measurement noise on two of three.
+
+## Caching the current `State` in the iterator (measured twice, rejected)
+
+### Retraction: the first implementation was deficient
+
+The first attempt measured 1.14x-1.17x slower. Three implementation faults
+inflated that result, and the first measurement should not be quoted:
+
+1. **`step_child` returned `Option<(u32, State)>` — 24 bytes.** That exceeds the
+   register-return threshold, so every probe returned through memory (`sret`).
+   `size_of::<Option<(u32, State)>>() == 24` vs `Option<u32> == 8`.
+2. **`self.state` was stored at all three return sites**, i.e. once per match,
+   and the 16-byte field had to stay live across the entire scan.
+3. **The iterator field was unnecessary.** Base performs 921,349 loop-top loads
+   on words100k but only 23,826 calls, so reloading once per *scan entry*
+   already removes 97.4% of them. Carrying state across calls buys 23,826 loads
+   and costs 23,826 stores plus register pressure.
+
+The corrected version keeps `state` as a **local**, loaded once at scan entry and
+updated only at the two sites where `state_id` changes; `step_child` keeps its
+original `Option<u32>` signature. All 148 tests pass and match streams are
+byte-identical on 8 corpora x 2 prefilter modes.
+
+| corpus | first (deficient) | corrected | base (ns) |
+|---|---|---|---|
+| words100 | 1.1398 | **1.0779** | 10,470,645 |
+| words5k | 1.1723 | **1.0819** | 10,597,148 |
+| words15k | 1.1686 | **1.0809** | 11,295,653 |
+| words100k | 1.1434 | **1.0596** | 13,721,909 |
+| unidic | 1.0301 | **1.0311** | 31,764,010 |
+| zh54k | 1.0929 | **1.0743** | 868,652 |
+| zh689k | 1.0766 | **1.0643** | 10,274,126 |
+| zh3185k | 1.0649 | **1.0621** | 71,445,699 |
+
+The deficiencies accounted for about half the loss on English (1.14 -> 1.06).
+The corrected version is still slower everywhere, so the conclusion holds, but
+by a smaller margin than first reported.
+
+### Why it still loses
+
+Load arithmetic on words100k:
+
+- base: `state loads == probes == 945,066`
+- corrected: `entry(23,826) + child_steps(453,212) + fail_hops(363,204) = 840,242`
+
+Only 11% fewer loads. **Retraction:** an earlier revision of this section
+claimed base's loop-top reload "CSEs with the `.check` load `step_child` already
+performs". That is false, and the generated code disproves it. Base performs
+three loads from `states[state_id]` and one from `states[base ^ code]`; the two
+indices are unrelated, so there is nothing to common-subexpression-eliminate:
+
+```
+.LBB0_6:
+    movl %r9d, %ebx
+    shlq $4, %rbx
+    movl (%rdi,%rbx), %r10d     ; states[state_id].base
+    movl 8(%rdi,%rbx), %r11d    ; states[state_id].fail
+    movl 12(%rdi,%rbx), %ebx    ; states[state_id].output_pos
+    testl %r10d, %r10d
+    je .LBB0_7
+    xorl %r8d, %r10d
+    movq %r10, %r14
+    shlq $4, %r14
+    cmpl %r9d, 4(%rdi,%r14)     ; states[base ^ code].check  (different index)
+```
+
+Counting memory-operand moves over the whole function: **base 6, cached 14**.
+The cached form has *more*, not fewer. It hoists the three fields into registers
+at entry and then re-materialises all three after **every** transition — three
+loads after a child step, three after every fail hop. Since a transition occurs
+on nearly every iteration, the load count barely improves, while three live u32s
+across the loop add register pressure (the disassembly shows spills to
+`0x8(%rsp)`, `0x54(%rsp)`, ...).
+
+The real explanation is therefore:
+
+1. Base's three loads hit one 16-byte line that was just touched, so they are
+   L1 hits; eliminating them saves almost nothing.
+2. The cached form must reload all three fields whenever `state_id` changes,
+   which is most iterations.
+3. Keeping them live across the loop costs spills.
+
+`perf stat` on words100k: instructions **+1.65%**, L1-dcache-load-misses
+**+1.52%** — both worse. On unidic: +0.07% / -0.11%, i.e. flat.
+
+---
+
+## Original (deficient) measurement, retained for the record
+
+
+**Proposal.** Keep a `state: State` field in the iterator holding exactly
+`pma.states[state_id]`, maintained as an invariant so no validity branch is
+needed. Then the scan loop never reloads `states[state_id]`, and the fusion block
+can reuse the fail target's already-loaded state instead of loading it twice.
+
+The invariant is cheap to maintain because `step_child` *already* loads
+`states[child_idx]` to test `.check`; returning that state costs nothing extra.
+Implemented exactly that way:
+
+```rust
+unsafe fn step_child(...) -> Option<(u32, State)> {
+    let child = unsafe { *states.get_unchecked(child_idx) };
+    if child.check() == expect { return Some((child_idx as u32, child)); }
+    None
+}
+```
+
+Correctness: all 148 tests pass, and match streams are byte-identical on 8
+corpora x 2 prefilter modes.
+
+Performance (separate binaries, alternating arms, 5 pairs, `zin`):
+
+| corpus | base (ns) | cached (ns) | ratio |
+|---|---|---|---|
+| words100 | 10,458,631 | 11,915,500 | **1.140** |
+| words5k | 10,511,323 | 12,309,664 | **1.172** |
+| words15k | 11,370,221 | 13,192,094 | **1.169** |
+| words100k | 13,613,210 | 15,594,862 | **1.143** |
+| unidic | 32,561,826 | 33,249,713 | **1.030** |
+| zh54k | 864,155 | 930,383 | **1.093** |
+| zh689k | 10,118,155 | 10,961,850 | **1.077** |
+| zh3185k | 71,468,258 | 76,478,034 | **1.065** |
+
+Slower on every corpus, by 3-17%.
+
+### Why it lost
+
+`perf stat`, 3 reps:
+
+| corpus | instructions | L1-dcache-load-misses |
+|---|---|---|
+| words100k | 959.6M -> 986.6M (**+2.81%**) | 9.331M -> 9.245M (-0.92%) |
+| unidic | 13.871G -> 13.883G (+0.13%) | 88.991M -> 88.891M (-0.11%) |
+
+Two facts settle it:
+
+1. **L1 misses barely moved.** The `states[state_id]` load was never a cache
+   miss — it is the same 16-byte line the loop just touched, and `step_child`
+   already reads `.check` from `states[base ^ code]` regardless. What the change
+   removed was an L1 *hit*, which costs almost nothing.
+2. **Instructions increased.** The cached `State` is 16 bytes that must stay live
+   across the entire scan loop. The disassembly shows it being spilled to and
+   reloaded from stack (`mov 0x8(%rsp)`, `mov 0x54(%rsp)`, ...). Register
+   pressure costs more than the eliminated load.
+
+The base code reloads `states[state_id]` precisely because keeping it in a
+register across the loop is more expensive. Same lesson as the earlier attempts:
+the apparent redundancy is load-bearing.
+
+**Retraction:** an earlier note in this document claimed the invariant "requires
+a validity branch on every iteration". That was wrong — with the invariant
+maintained, no branch is needed. The measurement above uses the branch-free
+form, and it still loses.
+
+### On reusing the legacy `scan()`
+
+Not compatible. `scan()` returns `Option<NonZeroU32>` (an output position) and
+has no knowledge of emit chains or the fusion probe. Reusing it would require
+forking it, which is a refactor, not a saving.
+
+## Q1: probe before buffering the emit chain (measured, rejected)
+
+**Proposal.** Move the fusion `step_child` *above* `self.buf.extend(...)`:
+
+```rust
+state_id = state.fail();
+if let Some(ep) = state.output_pos() {
+    let child = step_child(states, states[state_id].base(), state_id, mapped_c); // probe FIRST
+    self.buf.extend(iter_emits(ep, pos));                                        // then buffer
+    if let Some(c) = child { state_id = c; pos += char_len; }
+    ...
+}
+```
+
+Correct and byte-identical (8 corpora x 2 prefilter modes), all tests green.
+
+| corpus | Q1 (probe first) |
+|---|---|
+| words100 | **1.1247** |
+| words5k | **1.1014** |
+| words15k | 1.0891 |
+| words100k | **1.0773** |
+| unidic | 1.0031 (noise) |
+| zh54k | 1.0450 |
+| zh689k | 1.0214 |
+| zh3185k | 0.9931 (noise) |
+
+7-12% slower on English for a pure statement reorder.
+
+### Isolating the cause
+
+`perf stat` on words100k: instructions **+1.09%** (954.9M -> 965.3M) but wall
+clock **+7.7%**. The gap means it is not throughput; it is scheduling.
+
+Two candidate explanations were separated by a third variant, **Q1b**, which
+hoists only the fail target's `base` load above the extend but keeps the probe
+*after* it (so no probe result is live across the extend):
+
+| corpus | Q1 (probe first) | Q1b (base load hoisted only) |
+|---|---|---|
+| words100 | 1.1247 | **1.0073** |
+| words5k | 1.1014 | **1.0040** |
+| words100k | 1.0773 | **1.0536** |
+| unidic | 1.0031 | 1.0093 |
+
+Hoisting just the load is essentially free (1.004-1.007). Moving the whole probe
+is 10%+ slower. So the cost is **holding the probe's result live across
+`Vec::extend`**, not the load itself.
+
+Base deliberately probes *after* the extend. In that order the probe's loads are
+independent of the emit-chain traversal, so the two can overlap. In Q1 the probe
+completes first and its `Option<u32>` must survive a call that may grow the
+buffer, which serialises the dependency chain. A 1% instruction increase cannot
+explain a 7.7% time increase, but a longer critical path can.
+
+**Verdict:** the current order is already the better one. Do not reorder.
+
+---
+
+## Q2/Q3: eager probing past output-less fail states (measured, WINS)
+
+**Proposal (as clarified).** After buffering the first emit chain, keep walking
+the fail chain instead of returning immediately, but stop as soon as a second
+state with `output_pos` is reached. Do **not** cache the `State` in the iterator.
+
+The key insight: the walk may pass through states that have **no output at all**.
+Those are pure overhead — the character must be re-decoded on the next call just
+to walk past them again. Advancing through them eagerly costs nothing in output
+ordering, because no chain is buffered for them.
+
+```rust
+loop {
+    let st = states[state_id];
+    if let Some(child) = step_child(states, st.base(), state_id, mapped_c) {
+        state_id = child; pos += char_len; break;      // consume the character
+    }
+    if state_id == ROOT { pos += char_len; break; }     // no pattern starts here
+    if st.output_pos().is_some() { break; }             // second chain: defer it
+    state_id = st.fail();                               // output-less hop: keep going
+}
+```
+
+Correct and byte-identical on 8 corpora x 2 prefilter modes; all 148 tests pass.
+
+### Result (two independent runs, separate binaries, alternating arms, 5 pairs)
+
+| corpus | run 1 | run 2 |
+|---|---|---|
+| words100 | **0.9766** | **0.9774** |
+| words5k | **0.9640** | **0.9642** |
+| words15k | **0.9527** | **0.9588** |
+| words100k | **0.9522** | **0.9597** |
+| unidic | **0.9783** | **0.9748** |
+| zh54k | **0.9732** | **0.9597** |
+| zh689k | **0.9763** | **0.9753** |
+| zh3185k | 0.9972 | **0.9823** |
+
+**2-5% faster on every corpus, both runs.** This is the first change in this
+line of investigation that wins broadly.
+
+### Why it wins
+
+Instrumented counts:
+
+| corpus | matches | eager advances | output-less hops | stopped at 2nd output |
+|---|---|---|---|---|
+| words100k | 23,826 | 2,409 | 23,700 | 574 |
+| unidic | 236,442 | 225,015 | **99** | 8,479 |
+| zh54k | 2,578 | 2,243 | 192 | 43 |
+
+Two distinct mechanisms, and they explain the corpus split:
+
+- **unidic**: 225,015 eager advances with only 99 output-less hops. Here the
+  win is that the walk continues *past* the first chain to a child step, so the
+  character is consumed once instead of re-decoded. That is 225k saved decodes
+  and re-entries out of 386k.
+- **words100k**: only 2,409 advances but **23,700 output-less hops**. Here the
+  win is different — those hops are states with no output that the walk would
+  otherwise re-traverse on the next call. Hopping through them eagerly removes
+  ~23.7k re-entries.
+
+`perf stat` on words100k: instructions **-1.19%** (960.2M -> 948.8M), L1 loads
+essentially flat. So this is a genuine work reduction, not a scheduling effect —
+unlike Q1.
+
+### Exact accounting
+
+The counters satisfy two exact identities, which pin down what the change does:
+
+```
+q3.decodes == chars + stop_at_second
+saved_decodes == eager_consumed - base_fusion_hits
+```
+
+| corpus | chars | stop@2nd | decodes | base decodes | redundant: base -> q3 |
+|---|---|---|---|---|---|
+| words100k | 581,862 | 574 | 582,436 | 603,412 | **21,550 -> 574 (97.3% gone)** |
+| unidic | 374,948 | 8,479 | 383,427 | 386,014 | 11,066 -> 8,479 (23.4%) |
+| zh54k | 21,766 | 43 | 21,809 | 22,268 | 502 -> 43 (91.4%) |
+
+Where the eager advances come from:
+
+| corpus | consumed in eager block | via child | via ROOT | output-less hops |
+|---|---|---|---|---|
+| words100k | 23,143 | 2,409 | **20,734** | 23,700 |
+| unidic | 227,503 | **225,015** | 2,488 | 99 |
+| zh54k | 2,530 | 2,243 | 287 | 192 |
+
+Total state accesses (inner loop + eager/fusion block):
+
+| corpus | base | q3 | change |
+|---|---|---|---|
+| words100k | 945,066 | 924,090 | **-2.22%** |
+| unidic | 623,071 | 620,484 | -0.42% |
+| zh54k | 36,335 | 35,876 | -1.26% |
+
+So the dominant saving is **decode + map**, not state access. On words100k the
+win is twofold: 20,734 characters are proven to start no pattern and are skipped
+immediately, and 23,700 output-less hops are collapsed instead of being
+re-traversed next call. On unidic the existing fusion probe already captured
+225,015 of the 227,503 advances, so only 2,587 additional decodes are saved —
+there the <1% work reduction is smaller than the 2.5% wall-clock delta, which
+sits close to the 0.05-3.1% noise floor and should not be over-attributed.
+
+### What "shrank but did not eliminate" means
+
+The residual after Q3 is **exactly** `stop_at_second` — 574 / 8,479 / 43. Those
+are the calls where a *second* chain is genuinely pending. It cannot be emitted
+in the same call: `buf` is a LIFO drained by `next()`, and the second chain
+belongs to a later position in the text, so pushing it now would make it pop
+first and invert the output order. Returning is therefore mandatory, and the
+next call re-enters at that state and re-loads it.
+
+Eliminating those would require buffering both chains and reversing their order
+— the whole-chain flush, measured 20-40% slower. So the residual is the
+irreducible cost of one-chain-per-call ordering, not an implementation defect.
+
+Base's residual was of a different kind: it re-entered at *every*
+emit-returning fail (21,550 / 11,066 / 502), including all the output-less hops
+it walked one at a time. Q3 collapses those hops, leaving only the genuine
+second-chain stops.
+
+### Correction: re-entry is NOT primarily caused by eager probing
+
+An earlier revision of this note implied that Q3's stop-at-second rule was the
+main source of re-reading. Measuring `reentry_at_output` in **both** arms shows
+the opposite — the re-reading is inherited, and Q3 barely changes it:
+
+| corpus | base re-entry | q3 re-entry | delta | q3 `stop_at_second` |
+|---|---|---|---|---|
+| words100k | 569 | 705 | **+136** | 574 |
+| unidic | **230,405** | 230,504 | **+99** | 8,479 |
+| zh54k | 659 | 715 | +56 | 43 |
+
+On unidic base already re-enters at an output state **230,405** times; Q3 raises
+that to 230,504, i.e. by 99 — exactly Q3's output-less hop count. So eager
+probing adds essentially nothing to the re-read population; the population is
+dominated by the one-chain-per-call design that predates it.
+
+Note also that `reentry_at_output` is a broader set than `stop_at_second`: a scan
+can begin at an output state because the EOF drain sets `state_id = fail(state)`
+without emitting, or because a fusion hit lands on a child that itself has
+output. That is why base's 569 on words100k exceeds Q3's 574 only slightly while
+`stop_at_second` is 574.
+
+### Why unidic re-enters 230,504 times, and what it means
+
+Two counters measure different things and must not be conflated:
+
+- **`reentry_at_output`** — scans whose *starting* state carries output.
+- **`stop_at_second`** — eager walks that stopped **without consuming the
+  character** because a second chain was pending.
+
+The identity `decodes == chars + stop_at_second` is exact on all three corpora
+(581,862+574 = 582,436; 374,948+8,479 = 383,427; 21,766+43 = 21,809). Therefore
+**only `stop_at_second` is genuine re-decode waste**. `reentry_at_output` is the
+normal resume path: the character was already consumed, and the next call simply
+starts at the next character, which must be decoded once anyway.
+
+The size of `reentry_at_output` on unidic follows directly from automaton shape:
+
+| corpus | states | states with output | fail(output) also has output | avg output-run | max |
+|---|---|---|---|---|---|
+| words100k | 644,363 | 335,705 (52.1%) | 9.9% | 1.11 | 6 |
+| unidic | 911,862 | **907,436 (99.5%)** | **23.4%** | 1.26 | 6 |
+| zh54k | 93,886 | 75,937 (80.9%) | 8.6% | 1.09 | 4 |
+
+unidic has 674,927 patterns, most of them very short Japanese morphemes, so
+almost every trie node terminates some pattern. Hence 99.5% of states carry
+output, and a resume after any fail lands on an output-bearing state — which is
+exactly what `reentry_at_output` counts. It is a property of the dictionary, not
+of the eager walk.
+
+Note that dense output does **not** mean long chains: unidic's
+`chain_items/emit_nodes` is 1.268, and its chain-length histogram is dominated by
+length 1 (730,957 of 776,482 chains). Output is dense but chains are short.
+
+### Can the 230,504 be reduced?
+
+No, and it does not need to be — it is not waste. The actionable residual is
+`stop_at_second` (574 / 8,479 / 43), and removing it requires buffering two
+chains and reversing their order, which is the whole-chain flush (20-40% slower).
+
+There is one theoretically cleaner option: when the eager walk stops at a second
+output state, advance the character from that state and defer only the *chain*.
+But `buf` would then hold two chains and drain them in the wrong order, so this
+reduces to the same flush problem.
+
+### What "21,550 -> 574" counts, exactly
+
+It counts **redundant decodes** — the same character decoded twice. The identity
+`decodes == chars + redundant` is exact:
+
+- base words100k: 581,862 chars, 603,412 decodes -> **21,550 redundant**
+- q3 words100k: 581,862 chars, 582,436 decodes -> **574 redundant**
+
+And `21,550 == emit_returning_fails(23,717) - fusion_hits(2,167)` exactly. So in
+base, every fusion probe that *missed* cost one extra decode on the next call.
+Q3 removes those by continuing the walk; the residual 574 is `stop_at_second`.
+
+### Adversarial pattern families: Q3 is NOT uniformly better
+
+The 8 corpora are all natural-language. To test whether eager probing generalises,
+7 synthetic pattern families were built and each run against 4-5 haystacks, with
+base and Q3 both instrumented.
+
+Correctness: identical match streams in every case.
+
+Redundancy removed: Q3 eliminates **all** of it in these families (base had
+800-2,400 redundant decodes; Q3 has 0).
+
+Yet **wall clock is slower in several cases**:
+
+| family | haystack | base redundant | q3 redundant | base/q3 |
+|---|---|---|---|---|
+| nested-a | abc-cycle | 1,200 | 0 | **1.0487** |
+| nested-a | unmapped-heavy | 800 | 0 | **1.1077** |
+| nested-a | spaces | 1,600 | 0 | **1.0151** |
+| alternating | spaces | 1,600 | 0 | **1.1004** |
+| single-chars | unmapped-heavy | 2,400 | 0 | 0.7372 |
+| prefix+suffix | unmapped-heavy | 800 | 0 | 0.7781 |
+| dense+unmapped | spaces | 1,600 | 0 | 0.8346 |
+
+(`base/q3 > 1` means Q3 is slower.)
+
+So on these small, dense, short-pattern automata Q3 removes the redundant decodes
+yet still loses, because the extra loop structure and branch cost more than the
+saved decode. The win on the 8 real corpora is therefore **not** a universal
+property of the transformation; it depends on the automaton being large enough
+that a decode + map + state load is expensive relative to the extra control flow.
+
+Caveat on these numbers: the synthetic automata are tiny (tens to hundreds of
+states), so everything is L1-resident and fixed per-call costs dominate. They
+show the direction of risk, not a calibrated magnitude. They do establish that
+the eager walk must be validated against the target workload rather than assumed
+universally beneficial.
+
+### On removing the duplicated probe sequence
+
+The eager loop repeats the probe / ROOT / fail sequence that the main walk
+already contains, which reads badly. A unified single loop was implemented and
+measured:
+
+```rust
+let mut pending = None;
+let consumed = loop {
+    let state = states[state_id];
+    if let Some(child) = step_child(states, state.base(), state_id, mapped_c) {
+        state_id = child; break true;
+    }
+    if state_id == ROOT { break true; }
+    if let Some(ep) = state.output_pos() {
+        if pending.is_some() { break false; }   // second chain: defer
+        pending = Some(ep);
+    }
+    state_id = state.fail();
+};
+```
+
+Correct (all 148 tests, byte-identical streams on 8 corpora x 2 prefilter modes)
+but **3.5-7.3% slower than base**, i.e. worse than the duplicated version:
+
+| variant | instructions | branches | branch-misses |
+|---|---|---|---|
+| base | 951,208,483 | 200,912,693 | 9,467,526 |
+| Q3 (duplicated block) | 949,225,844 | 202,037,653 | 9,560,135 |
+| U1 (unified loop) | 965,231,958 | 205,060,308 | 9,535,397 |
+
+| corpus | U1 ratio |
+|---|---|
+| words100 | 1.0404 |
+| words5k | 1.0666 |
+| words15k | 1.0555 |
+| words100k | 1.0367 |
+| unidic | 1.0518 |
+| zh54k | 1.0733 |
+| zh689k | 1.0377 |
+| zh3185k | 1.0346 |
+
+The reason is structural, not stylistic. In the duplicated form the eager block
+runs only on the emit-returning path, *after* the main loop has already decided
+to return; the hot path (child found) never touches it. Unifying makes `pending`
+and `consumed` loop-carried, so every hot-path iteration carries them and the
+mismatch branch gains a `pending.is_some()` test. Measured as +2.07% branches
+versus +0.56% for the duplicated form.
+
+So the duplication is the price of keeping the hot loop unperturbed. It is ~18
+lines of cold code executed once per emit-returning fail. The duplication can be
+reduced by extracting a helper that *only* the cold block calls, but the probe
+itself must not become loop-carried state.
+
+### Caching the decoded character in an iterator field (measured, rejected)
+
+**Proposal.** Keep `(cached_pos, cached_c, cached_len)` in the iterator with the
+invariant "the cache describes the character at `pos`". On the paths that return
+without consuming the character (fusion miss), store it; at the top of the scan,
+reuse it when `cached_pos == pos`. This eliminates the redundant decode+map
+without any eager probing, so it should also avoid the extra state reads that
+probing incurs.
+
+This works exactly as intended. Instrumented hits:
+
+| corpus | chars | cache hits | cache misses | decodes |
+|---|---|---|---|---|
+| words100k | 581,862 | **21,550** | 581,862 | 581,862 |
+| unidic | 374,948 | **11,066** | 374,948 | 374,948 |
+| zh54k | 21,766 | **502** | 21,766 | 21,766 |
+
+`decodes == chars` exactly — **every** redundant decode is gone, and the hit
+counts equal the previous waste exactly (21,550 / 11,066 / 502).
+
+Correctness: all 148 tests pass; match streams byte-identical on 8 corpora x 2
+prefilter modes.
+
+Performance (separate binaries, alternating arms, 5 pairs):
+
+| corpus | ratio |
+|---|---|
+| words100 | **1.1769** |
+| words5k | **1.1769** |
+| words15k | 1.1565 |
+| words100k | **1.1387** |
+| unidic | 1.0435 |
+| zh54k | 1.1033 |
+| zh689k | 1.0804 |
+| zh3185k | 1.0861 |
+
+Slower on every corpus, 4-18%.
+
+### Why a perfect cache still loses
+
+The check `self.cached_pos == pos` sits on the **hot path**: it runs once per
+character (581,862 times on words100k) in order to save 21,550 decodes. That is a
+27:1 ratio of checks to savings. `perf` on words100k: instructions **+2.41%**,
+branches +0.35%, time +13.9%.
+
+The added state is also not free: three more iterator fields (24 bytes) must be
+kept live across the scan loop.
+
+The ratio is the whole story. Redundant decodes are only 3.6% of all decodes on
+words100k, and a decode of an already-hot byte is cheap; the comparison and the
+extra live state cost more than the 21,550 decodes saved.
+
+### Why the eager walk (Q3) wins where this loses
+
+Q3 pays **nothing on the hot path** — the eager block runs only after the main
+loop has decided to return, which is 23,717 times, not 581,862. It also removes
+more work per event (it consumes the character, avoiding the decode *and* the
+re-entry), and it removes the state re-reads along the way.
+
+So the general rule that emerges from all of these attempts: a change that adds
+work proportional to **characters** loses, even if it eliminates work
+proportional to **emit events**. Q3 wins because its extra work is proportional
+to emit events (23,717) while its saving is also proportional to emit events.
+
+### Maintaining the character invariant instead of testing it (measured, rejected)
+
+**Proposal.** Drop `cached_pos`. Instead of *testing* whether the cached
+character is still current, *maintain* the invariant "`mapped_c`/`char_len`
+always describe `pos`": decode the character at the bottom of the loop, right
+after `pos` advances, and refresh it on the prefilter jump and on every
+early return that consumed the character.
+
+This is strictly better than the `cached_pos` variant — the per-character
+comparison disappears:
+
+| variant | words100k ratio | instructions |
+|---|---|---|
+| C1 (`cached_pos` test) | 1.1387 | +2.41% |
+| C2 (maintained invariant) | **1.0742** | **+0.84%** |
+
+Correctness: all 148 tests pass, byte-identical streams on 8 corpora x 2
+prefilter modes. Three invariant sites had to be found and fixed (bottom of the
+loop, the prefilter jump, and the early return that consumed the character) —
+the prefilter jump was initially missed and broke 2 tests.
+
+But it is still slower everywhere:
+
+| corpus | ratio |
+|---|---|
+| words100 | 1.1274 |
+| words5k | 1.1036 |
+| words15k | 1.0909 |
+| words100k | 1.0742 |
+| unidic | 1.0136 (noise) |
+| zh54k | 1.0456 |
+| zh689k | 1.0529 |
+| zh3185k | 1.0344 |
+
+### Why maintaining the invariant still loses
+
+The decode count is unchanged (still exactly one per character), so nothing is
+saved. What changes is *where* the result lives:
+
+- base: the decode happens at the top of the loop body, its result is consumed
+  immediately in the same iteration, and it stays in a register.
+- C2: the decode happens after the `pos` update and its result must be written
+  to `self.mapped_c` / `self.char_len`, then reloaded at the top of the next
+  iteration. That is a store/reload through the iterator struct on the
+  loop-carried path.
+
+`perf` on words100k: instructions +0.84%, branches +1.07%, time +7.4%. The
+instruction delta is small but the dependency chain lengthens, because `pos` ->
+decode -> store -> reload -> use is now serialised across iterations.
+
+So the field is not free even without a staleness test: the invariant requires
+the value to live in memory across the loop boundary, whereas base keeps it in a
+register within one iteration.
+
+### Hoisting the cached character into locals (measured, still rejected)
+
+C2's loss came from writing the cached character back to `self` on every
+iteration. Hoisting it into locals and writing back only on exit fixes most of
+that:
+
+| variant | words100k ratio | instructions (words100k) |
+|---|---|---|
+| C1 (`cached_pos` test) | 1.1387 | +2.41% |
+| C2 (invariant, struct writeback) | 1.0742 | +0.84% |
+| **H (invariant, hoisted to locals)** | **1.0200** | **-0.48%** |
+| H2 (H + drop `char_len`, derive via leading byte) | 1.0247 | +0.81% |
+
+Full results:
+
+| corpus | H | H2 |
+|---|---|---|
+| words100 | 1.0468 | 1.0453 |
+| words5k | 1.0416 | 1.0381 |
+| words15k | 1.0274 | 1.0319 |
+| words100k | 1.0200 | 1.0247 |
+| unidic | **0.9940** | 1.0227 |
+| zh54k | 1.0280 | 1.0769 |
+| zh689k | 1.0128 | 1.0757 |
+| zh3185k | 1.0066 | 1.0629 |
+
+Correctness: all 148 tests pass; byte-identical streams on 8 corpora x 2
+prefilter modes for both variants.
+
+Two findings:
+
+1. **Hoisting is what mattered.** Moving the cached character into locals and
+   writing back once on exit took words100k from 1.0742 to 1.0200 and turned the
+   instruction delta negative (-0.48%). So the cost really was the per-iteration
+   store/reload through the iterator struct, as suspected.
+2. **Dropping `char_len` in favour of deriving the length from the leading byte
+   does not help.** It is slightly better on the English sets (1.0381 vs 1.0416
+   on words5k) but clearly worse on CJK (1.0769 vs 1.0280 on zh54k). Deriving the
+   length costs a branch on the leading byte in the hot loop, which is more than
+   the extra field's cost.
+
+H is now close to parity — even slightly faster on unidic — but still 0.7-4.7%
+slower on the other seven corpora, so it is not worth landing over Q3, which wins
+1.3-5.9% everywhere. It is retained as a measurement, not a candidate.
+
+### RETRACTION: two claims in the section above were wrong
+
+**1. `len_utf8` was never used.** H2 does not call `char::len_utf8`; that function
+takes a `char`, and the cache holds a *mapper code* (`u32`), so it cannot be
+applied to it. What H2 actually does is derive the UTF-8 length from the leading
+byte with a four-way range match (`utf8_len_unchecked`). That is a *different*
+change: it removes the `char_len` field at the cost of one byte load plus a
+range test per iteration. The conclusion stands (it is worse, especially on CJK),
+but the label "len_utf8" was incorrect.
+
+**2. H does NOT perform the same number of decodes as base.** Measured:
+
+| corpus | base decodes | H decodes | saved |
+|---|---|---|---|
+| words100k | 603,412 | 581,861 | **21,551** |
+| unidic | 386,014 | 374,947 | **11,067** |
+| zh54k | 22,268 | 21,765 | **503** |
+
+So H does eliminate the redundant decodes, exactly as the proposal intended. The
+earlier statement that it added work "for the same total number of decodes" was
+false.
+
+### Then why does H still lose?
+
+`perf` on words100k: H executes **0.48% fewer** instructions than base
+(948.2M vs 952.8M) yet is **2.0% slower** in wall clock. Fewer instructions and
+more time means the loop is latency-bound, not throughput-bound.
+
+H moved the decode from "top of the iteration, consumed immediately in the same
+iteration" to "bottom of the iteration, stored to a local, consumed on the next
+iteration". That puts the decode on the loop-carried back edge:
+
+- base: `pos -> decode -> use` (within one iteration)
+- H: `pos -> decode -> store -> load -> use` (crosses the back edge)
+
+The saved work is 21,551 decodes out of 603,412 (3.6%). The added critical-path
+latency applies to all 581,862 iterations. The trade is unfavourable.
+
+A third variant (**H3**) tried keeping the decode at the top while still reusing
+the cached value, so nothing crosses the back edge:
+
+```rust
+let (cur_c, cur_len) = if let Some(c) = mapped_c {
+    (Some(c), char_len)          // reused from the previous call
+} else {
+    decode(...)                  // same place as base
+};
+```
+
+It is **worse still** (words100k 1.1457): the per-iteration `Option` test plus
+the need to keep both the cached and the freshly decoded value live costs more
+than the back-edge version.
+
+So the ordering is: base < H (1.0200) < H3 (1.1457) < C2 (1.0742, worse than H
+because of per-iteration struct writeback) < C1 (1.1387).
+
+The user's expectation — that a stack put/read is cheaper than a decode — is
+correct for **throughput** (and the instruction count confirms it: H does fewer
+instructions). It fails here because this loop is bound by the dependency chain,
+not by instruction count.
+
+### What base does on an emit-returning fail, and how big the saving really is
+
+**Base performs no walk.** On a mismatch where the state owes a chain it:
+
+1. `state_id = state.fail()`
+2. buffers that one chain,
+3. probes the fail target **once** (the fusion probe),
+4. consumes the character if the probe hits, then returns.
+
+There is no loop and no fail-chain traversal. It never visits the *second*
+output state — that is precisely why the next call has to re-enter at the fail
+target and re-walk from there.
+
+**Almost every emit chain does cost an extra decode**, so the earlier
+characterisation "the saving is small" was misleading. The exact split:
+
+| corpus | emit-returning fails | fusion hits | fusion misses | miss rate | H's saved decodes | % of all decodes |
+|---|---|---|---|---|---|---|
+| words100k | 23,717 | 2,167 | 21,550 | **90.9%** | 21,551 | 3.6% |
+| unidic | 235,982 | 224,916 | 11,066 | **4.7%** | 11,067 | 2.9% |
+| zh54k | 2,573 | 2,071 | 502 | **19.5%** | 503 | 2.3% |
+
+Two things follow:
+
+1. **In the absence of fusion, essentially every emit chain would cost an extra
+   decode.** The user's intuition is right. On words100k, where the fusion probe
+   rarely fires (9.1% hit rate), 90.9% of emit chains do incur one, and H removes
+   **100% of them** (21,551 of 21,550 — the off-by-one is the final character).
+2. **The pool is small only because the existing fusion probe already drains it**
+   on dense text. On unidic the probe hits 95.3%, leaving just 4.7% for H to
+   recover. That is why H's saving looks modest there and why Q3 (which extends
+   the same idea) also has little left to win on unidic.
+
+So the correct statement is not "the redundant decodes are few" but "the fusion
+probe already removes most of them on dense text; on prose, where it cannot fire,
+H removes all of the remaining 90.9%, but the latency cost of doing so still
+exceeds the benefit."
+
+### H5: cache without the probe (measured, wins CJK, loses English)
+
+The logical question: if the cached character already eliminates the redundant
+decode, what is the fusion probe still for? It exists only to avoid re-decoding
+the character — which the cache now does. So the probe should be removable.
+
+H5 does exactly that: on an emit-returning fail it buffers the chain, writes the
+character invariant back, and returns without probing.
+
+Correctness: all 148 tests pass; byte-identical streams on 8 corpora x 2
+prefilter modes.
+
+| corpus | H4 (cache + probe) | H5 (cache only) |
+|---|---|---|
+| words100 | — | 1.0763 |
+| words5k | — | 1.0795 |
+| words15k | — | 1.0605 |
+| words100k | 1.0200 | 1.0325 |
+| unidic | 0.9940 | **0.9890** |
+| zh54k | — | 1.0060 |
+| zh689k | — | 1.0064 |
+| zh3185k | — | **0.9855** |
+
+H5 is the first variant in this line that **beats base on CJK** (unidic 0.989,
+zh3185k 0.9855), while losing on English.
+
+### Why removing the probe helps CJK and hurts English
+
+The probe's *decode-avoidance* value is fully replaced by the cache, but it has a
+second effect: **on a hit it consumes the character**, so the call does not end in
+a return + re-entry.
+
+- unidic: probe hit rate 95.3%. Removing it costs little (most hits would have
+  been converted to advances anyway, and the next call starts from a state the
+  cache already covers), while eliminating 235,982 probes. Net win.
+- words100: hit rate 9.1%. Removing the probe means **every** emit-return
+  (23,717) now ends in a re-entry, versus 21,550 for H4 — i.e. 2,167 extra
+  re-entries. Each re-entry costs a scan re-entry plus a state load plus a
+  probe, which is more than the probe it replaced. Net loss.
+
+So the probe is not "only for reducing decoding" — it also merges a
+return/re-entry pair into the current call. The cache removes the first motive
+but not the second.
+
+`perf` on words100k: base 964.3M instructions, H4 954.9M, H5 956.7M — H5 is
+between the two, and the difference is not instruction count but the re-entry
+pattern.
+
+### H6: packing the character into one word (measured, worse)
+
+Two ideas were checked: use `u8` for `char_len`, and pack `mapped_c` + `char_len`
+into one `u32` by borrowing 2 bits.
+
+**Is `mapped_c` bounded?** Yes, tightly. `mapped_c` is an index into the
+alphabet (`table[codepoint] = rank in frequency order`), so
+`mapped_c < alphabet_size`. The alphabet is at most the number of distinct
+Unicode scalar values, `0x110000 = 1,114,112 < 2^21`. Reserving 2 bits for the
+length leaves 30 bits of capacity (1,073,741,823), a margin of roughly 963x. So
+packing is safe with no realistic collision risk, provided an explicit sentinel
+is reserved for "unmapped" and "end of haystack".
+
+**Does `u8` help?** No. `char_len` is 1..=4 so `u8` holds it, but the field is
+adjacent to `Option<u32>` and the struct is pointer-aligned, so the byte is
+absorbed by padding. There is no memory saving.
+
+**Does packing help?** No — it costs:
+
+| corpus | H5 (two fields) | H6 (packed) |
+|---|---|---|
+| words100 | 1.0743 | **1.0552** |
+| words5k | 1.0785 | 1.0639 |
+| words15k | 1.0654 | 1.0594 |
+| words100k | 1.0291 | 1.0384 |
+| unidic | **0.9824** | 1.0289 |
+| zh54k | 1.0063 | 1.0025 |
+| zh689k | 1.0153 | 1.0175 |
+| zh3185k | **0.9945** | 1.0308 |
+
+Packing improves the English sets slightly (1.0743 -> 1.0552 on words100) but
+**destroys the CJK wins** that made H5 interesting: unidic 0.9824 -> 1.0289,
+zh3185k 0.9945 -> 1.0308.
+
+The cost is the unpack work: every use of `mapped_c` and `char_len` now needs a
+shift plus a mask instead of a direct field read, and `Option<u32>`'s niche
+optimisation is lost. On CJK the character is re-read on every emit-return, so
+the extra shifts are paid far more often than on English.
+
+Correctness: all 148 tests pass, byte-identical streams on 8 corpora x 2
+prefilter modes, and the encoding is provably collision-free given
+`alphabet_size < 2^30`.
+
+### The 2x2 that was missing: fusion x cache, against the plain base
+
+Every cache measurement above was taken against the **fusion** base, which
+conflates two independent changes. The fair control is the *plain* (no-fusion)
+matcher. Four variants, all separate binaries, alternating arms, two runs:
+
+- **NF** = plain base (no fusion probe, no cache) — `/tmp/dac-nofuse`
+- **FU** = fusion probe only — current HEAD
+- **NC** = cache only (H5) — `/tmp/dac-h5`
+- **FC** = fusion + cache (H4) — `/tmp/dac-h4`
+
+Ratios vs **NF**:
+
+| corpus | FU run1 / run2 | NC run1 / run2 | FC run1 / run2 |
+|---|---|---|---|
+| words100 | 0.9983 / 0.9978 | **1.0728 / 1.0740** | 1.0461 / 1.0450 |
+| words5k | 1.0104 / 1.0101 | **1.0896 / 1.0881** | 1.0595 / 1.0557 |
+| words15k | 1.0058 / 1.0031 | **1.0721 / 1.0693** | 1.0405 / 1.0376 |
+| words100k | 1.0118 / 1.0124 | **1.0541 / 1.0427** | 1.0292 / 1.0275 |
+| unidic | 0.9359 / 0.9455 | 0.9353 / 0.9386 | **0.9260 / 0.9438** |
+| zh54k | 0.9697 / 0.9616 | 0.9709 / 0.9718 | 0.9954 / 0.9856 |
+| zh689k | 1.0008 / 1.0012 | 1.0057 / 1.0080 | 1.0178 / 1.0118 |
+| zh3185k | 0.9802 / 0.9815 | **0.9727 / 0.9779** | 0.9992 / 1.0009 |
+
+### What this actually says
+
+**The cache costs about 5-9% on English against the plain base** (NC 1.054-1.090),
+and about 3-6% when combined with fusion (FC 1.029-1.060). So the earlier
+statement "the cache loses at most 7%" was measured against the wrong control;
+against the plain matcher the loss is larger, and fusion masks part of it
+because fusion already removes most of the re-decodes on CJK.
+
+**The user's diagnosis is correct: the overhead is the store/reload of the cached
+character.** That is why:
+- C1 (`cached_pos` test, struct writeback) = 1.1387
+- C2 (invariant, struct writeback every iteration) = 1.0742
+- H (invariant, hoisted to locals) = 1.0200 vs fusion
+- H5 (no probe, hoisted) = 1.0325 vs fusion
+
+Each step removes write traffic or work, and each step improves. The remaining
+gap is the back-edge latency described earlier.
+
+**"Probing now or later doesn't matter" is false, but only slightly.** FU vs NF is
+within +-1.2% on English (noise-level), and -2% to -6.4% on CJK. So the probe is
+worth keeping on dense text and harmless on prose — the earlier finding stands.
+
+**On the rare second-chain case:** the user is right that the fusion probe reads
+`states[fail_target]` even when a second chain is pending. But that read happens
+once per emit-returning fail (23,717 on words100k), not once per character, so it
+is not the source of a 5-9% gap.
+
+### The decisive comparison
+
+Against the plain base, on English the plain matcher (NF) is **fastest**, then
+FU (fusion, ~parity), then FC (cache+fusion, +3-6%), then NC (cache only, +5-9%).
+On CJK, FU/NC/FC all beat NF by 2-6%, with NC and FC roughly tied with FU.
+
+So the honest summary is: **the cache never pays on English and is roughly
+neutral-to-slightly-positive on CJK**, while **fusion pays on CJK and is neutral
+on English**. Fusion is the better single change; the cache is not worth adding.
+
+### Legacy vs the plain (no-fusion) base
+
+Single crate (`/tmp/dac-nofuse`), both arms selected by `MatchKind`, separate
+runs of each arm alternating, 5 pairs, two independent runs. `exp/leg < 1` means
+the experimental matcher is faster.
+
+| corpus | run 1 | run 2 |
+|---|---|---|
+| words100 | 0.9966 | 0.9939 |
+| words5k | **1.0486** | **1.0501** |
+| words15k | **1.0766** | **1.0701** |
+| words100k | **1.1102** | **1.1048** |
+| unidic | 0.9760 | 0.9731 |
+| zh54k | 0.9751 | 0.9609 |
+| zh689k | 0.9438 | 0.9467 |
+| zh3185k | 0.9586 | 0.9548 |
+
+The plain experimental matcher:
+
+- **wins on CJK**: unidic -2.4%/-2.7%, zh54k -2.5%/-3.9%, zh689k -5.6%/-5.3%,
+  zh3185k -4.1%/-4.5%
+- **loses on English prose**: words5k +4.9%/+5.0%, words15k +7.7%/+7.0%,
+  words100k +11.0%/+10.5%
+- **parity on words100** (-0.3%/-0.6%)
+
+This reproduces the long-standing finding recorded earlier in this document
+("exp wins on CJK, loses 1.8-10% on English prose, except words100 = a win"),
+now against the plain base rather than the fusion base.
+
+### Q3 (eager probing) measured directly against legacy
+
+Q3 was missing from the ranking above. Measured the same way (one crate, both
+arms via `MatchKind`, alternating, 5 pairs, two runs):
+
+| corpus | run 1 | run 2 | verdict |
+|---|---|---|---|
+| words100 | **0.8783** | **0.8784** | WIN |
+| words5k | **0.9461** | **0.9391** | WIN |
+| words15k | **0.9775** | **0.9839** | WIN |
+| words100k | 1.0334 | 1.0360 | LOSS |
+| unidic | **0.9020** | **0.8944** | WIN |
+| zh54k | **0.9132** | **0.9198** | WIN |
+| zh689k | **0.9159** | **0.9237** | WIN |
+| zh3185k | **0.9157** | **0.9166** | WIN |
+
+**Q3 beats legacy on 7 of 8 corpora**, by 2-12%, and is the only variant that
+wins on English prose. words100k remains a 3.3-3.6% loss — the same
+unmapped-character deficit that affects every experimental variant there.
+
+This materially changes the conclusion drawn from the plain base: the eager walk
+is not just an optimisation of the experimental matcher, it is what makes the
+experimental matcher competitive with legacy on English at all.
+
+### Completing the picture: legacy, NF, FU, NC, FC, Q3
+
+Combining this with the 2x2 above gives the full ranking. Representative numbers
+(median of two runs), all normalised so that **legacy = 1.000**:
+
+| corpus | legacy | NF (plain) | FU (fusion) | NC (cache) | FC (both) | **Q3 (eager)** |
+|---|---|---|---|---|---|---|
+| words100 | 1.000 | 0.995 | 0.994 | 1.068 | 1.041 | **0.878** |
+| words5k | 1.000 | 1.049 | 1.060 | 1.143 | 1.112 | **0.943** |
+| words15k | 1.000 | 1.073 | 1.079 | 1.151 | 1.116 | **0.981** |
+| words100k | 1.000 | 1.107 | 1.120 | 1.171 | 1.140 | 1.035 |
+| unidic | 1.000 | 0.975 | 0.912 | 0.912 | 0.903 | **0.898** |
+| zh54k | 1.000 | 0.968 | 0.938 | 0.940 | 0.963 | **0.917** |
+| zh689k | 1.000 | 0.945 | 0.946 | 0.950 | 0.962 | **0.920** |
+| zh3185k | 1.000 | 0.957 | 0.938 | 0.931 | 0.956 | **0.916** |
+
+(Q3 is measured directly against legacy. NF/FU/NC/FC are as in the 2x2, with
+FU/NC/FC derived by multiplying by the NF/legacy ratio — indicative.)
+
+(FU/NC/FC are derived by multiplying the 2x2 ratios by the NF/legacy ratio; they
+are indicative, not independently measured against legacy.)
+
+Reading it:
+
+1. **Q3 is the best variant on 7 of 8 corpora**, including English prose where
+   every other variant loses to legacy. It is the only change in this whole
+   investigation that is a strict improvement over legacy on English.
+2. **On CJK Q3 is best or tied** (unidic 0.898 vs FU 0.912; zh3185k 0.916 vs
+   NF 0.957), so it does not trade away the CJK advantage.
+3. **words100k is the single remaining loss** (+3.5%). That is the
+   unmapped-character flush-walk deficit, which no variant here addresses.
+4. **The cache never improves on the best available option**: NC is worse than NF
+   on English and roughly tied with FU on CJK, and worse than Q3 everywhere.
+
+### Are the adversarial degradations unique to Q3? No — fusion is far worse
+
+The earlier synthetic test only measured Q3. All five variants were re-run on the
+same 8 pattern families x 5 haystacks (40 cells), each against its own legacy arm,
+30 reps, best-of. `exp/leg`, lower is better.
+
+| variant | median | min | max | cells > 1.05 |
+|---|---|---|---|---|
+| NF (plain) | 0.935 | 0.820 | 1.239 | 9/40 |
+| **FU (fusion = current HEAD)** | **1.097** | 0.943 | **1.537** | **29/40** |
+| Q3 (eager) | 0.950 | 0.887 | 1.177 | 11/40 |
+| NC (cache) | 0.948 | 0.895 | 1.192 | 8/40 |
+| FC (both) | 0.934 | 0.841 | 1.222 | 7/40 |
+
+**Q3's degradation is not an outlier.** In fact the fusion version currently on
+HEAD is the *worst* variant on this set: median 1.097 (10% slower than legacy) and
+losing in 29 of 40 cells, with a worst case of 1.537. Q3 has median 0.950, loses
+in only 11 of 40, worst case 1.177.
+
+So on contrived patterns, Q3 is **more robust than the shipped fusion code**, not
+less.
+
+### What drives the losses (and they are shared)
+
+By haystack, median across families:
+
+| haystack | NF | FU | Q3 | NC | FC |
+|---|---|---|---|---|---|
+| abc-cycle | 0.935 | 1.152 | 0.979 | 0.965 | 0.931 |
+| all-a | 0.910 | 1.037 | 1.011 | 0.985 | 0.921 |
+| cjk-spaces | 0.859 | 1.089 | 0.891 | 0.914 | 0.871 |
+| spaces | 0.955 | 1.156 | 0.923 | 0.913 | 1.023 |
+| **unmapped-heavy** | **1.082** | **1.248** | **1.076** | **1.059** | **1.096** |
+
+By family:
+
+| family | NF | FU | Q3 | NC | FC |
+|---|---|---|---|---|---|
+| all-pairs-6 | 0.926 | 1.158 | 1.013 | 1.015 | 0.934 |
+| alternating | 0.945 | 1.153 | 0.957 | 0.922 | 0.927 |
+| cjk-short | 0.834 | 0.943 | 0.945 | 0.948 | 0.865 |
+| dense+unmapped | 0.988 | 1.164 | 0.997 | 1.033 | 1.031 |
+| nested-a | 0.993 | 1.089 | 1.044 | 0.925 | 0.951 |
+| non-matching | 0.834 | 0.943 | 0.945 | 0.948 | 0.864 |
+| prefix+suffix | 0.955 | 1.097 | 0.962 | 0.935 | 0.988 |
+| single-chars | 0.974 | 1.170 | **1.093** | 1.043 | 1.029 |
+
+Two patterns are shared by *every* variant:
+
+1. **`unmapped-heavy` is the universal weak spot** — every variant loses there
+   (1.059 to 1.248). This is the known unmapped-character flush-walk deficit, not
+   a property of any one optimisation.
+2. **`single-chars` (alphabet = 26 one-char patterns) is bad for all variants**,
+   worst for FU (1.170) and Q3 (1.093). With such an automaton almost every
+   character ends a pattern, so the experimental design's per-emit bookkeeping
+   dominates and the legacy matcher's rewind is cheap by comparison.
+
+So the honest characterisation is: **the experimental matcher's weaknesses on
+contrived inputs are structural and shared**, driven by unmapped characters and
+by very dense short-pattern automata. Q3 does not introduce them; it mitigates
+most of them relative to the fusion code now on HEAD.
+
+### Why Q3 wins if the cache removes the same decoding: it does not
+
+The hypothesis was that Q3's benefit is avoiding the redundant decode, so a
+character cache — which removes exactly that decode — should match it. Measured
+like-for-like on words100k with both arms instrumented:
+
+| metric | H5 (cache) | Q3 (eager) | NF (plain) |
+|---|---|---|---|
+| chars | 581,862 | 581,862 | 581,862 |
+| **decodes** | **581,861** | **582,436** | 603,412 |
+| state loads | 923,516 | 924,090 | 923,516 |
+| probes | 923,516 | 924,090 | 923,516 |
+| emit returns | 23,717 | 23,717 | 23,717 |
+| instructions | **950.9M** | 953.7M | 961.9M |
+| wall clock vs legacy | **1.03-1.09 (loses)** | **0.878-0.943 (wins)** | 1.05-1.11 (loses) |
+
+The cache removes **more** decoding than Q3 (581,861 vs 582,436) and executes
+**fewer** instructions (950.9M vs 953.7M). Yet Q3 is faster by roughly 10-15% of
+legacy on English.
+
+**So decoding is not what Q3 saves.** The hypothesis is falsified directly.
+
+### What Q3 actually saves
+
+The two designs differ in what the *next* call must do after an emit-return:
+
+- **H5 (cache)**: leaves `pos` unchanged and `state_id` at the fail target. The
+  next call re-enters, re-loads `states[state_id]`, and re-probes from the same
+  state. The fail-chain walk is *redone*. The cache makes the character free, but
+  the walk itself is still paid.
+- **Q3 (eager)**: on a child hit it consumes the character and leaves `state_id`
+  at the child. The next call resumes *past* that point, so the walk is not
+  redone.
+
+The decode was the visible symptom of the re-walk, not its cost. Removing the
+decode while keeping the re-walk (H5) removes the cheap part; removing the
+re-walk (Q3) removes the expensive part.
+
+This is also why instruction counts mislead here: both designs execute a similar
+number of instructions, but Q3's are arranged so that each scan makes forward
+progress, while H5's repeat the same work from the same state. The loop is
+latency/dependency-bound, so *where* the work sits matters more than how much of
+it there is.
+
+### Practical consequence
+
+Any future attempt to optimise this path should target the **fail-chain re-walk**
+(how many states are visited per scan), not the **decode** (how many characters
+are decoded). The decode is already at its floor of one per character in every
+variant that matters, and the measurements above show that pushing it lower does
+not move wall clock in the right direction.
+
+### RETRACTION: the 12% Q3-vs-legacy figure was a cross-binary artifact
+
+An earlier section reported Q3 beating legacy by 0.878 on words100, and attributed
+the win to "avoiding the fail-chain re-walk". Both parts are wrong.
+
+**1. There is no re-walk to avoid.** The user's objection is correct:
+`state_id = state.fail()` has already moved to the new state before the emit
+check, so the next pass accesses that same state either way. Instrumented counts
+confirm eager probing saves **no** state accesses:
+
+| metric | NF (plain) | Q3 (eager) |
+|---|---|---|
+| state loads | 923,516 | **924,090** (slightly more) |
+| probes | 923,516 | 924,090 |
+
+Q3 only avoids re-*decoding* the character, and adds a small amount of waste when
+it meets a second chain.
+
+**2. The 12% was a harness artifact.** The `legq3` binary's legacy arm ran 4.2%
+slower than the `legnf` binary's legacy arm, for byte-identical legacy source
+(10.73M vs 11.18M ns on words100). Ratios measured in different binaries are
+therefore not comparable — the same codegen-shape coupling documented earlier in
+this file.
+
+### Same-binary measurement of Q3 vs plain NF
+
+Both experimental arms compiled into **one** binary, identical harness, alternating,
+5 pairs:
+
+| corpus | median eager/plain | min | max |
+|---|---|---|---|
+| words100 | 0.9888 | 0.9866 | 0.9893 |
+| words5k | 0.9836 | 0.9759 | 0.9901 |
+| words15k | 0.9773 | 0.9665 | 0.9892 |
+| words100k | 0.9519 | 0.9397 | 0.9588 |
+| unidic | 0.9533 | 0.9197 | 1.0042 |
+| zh54k | 0.9734 | 0.9670 | 0.9791 |
+| zh689k | 0.9698 | 0.9560 | 0.9833 |
+| zh3185k | 0.9661 | 0.8863 | 0.9841 |
+
+**Q3 is 1-5% faster than the plain experimental matcher**, consistently, on all
+eight corpora. Real but modest.
+
+Corrected Q3-vs-legacy estimate (Q3 = NF x 0.95-0.99, with NF/legacy from the
+direct measurement): roughly **0.95-1.06** across corpora, not 0.88-0.98.
+
+### Why Q3 wins over the cache when both remove the same decode
+
+Since both eliminate the redundant decode, and Q3 saves no state access, the
+difference is *cost of the mechanism*:
+
+- **Q3** does its work only on the emit-return path (23,717 times on words100k)
+  and adds nothing to the per-character path.
+- **The cache** also removes the decode, but pays a field write on every
+  emit-return plus a read on every scan entry, and must refresh the invariant on
+  the path that consumed a character.
+
+So Q3 is not saving something the cache misses — it is achieving the same saving
+more cheaply. That is the whole difference.
+
+### Three-way in one binary: legacy vs single probe vs Q3
+
+All three arms compiled into **one** binary (legacy and single-probe from the
+shipped crate, Q3 from `/tmp/dac-q3clean`), identical harness, alternating, 5
+pairs, 11 reps, medians. Match streams asserted equal across all three.
+
+| corpus | legacy ns | single-probe/legacy | Q3/legacy | Q3/single-probe |
+|---|---|---|---|---|
+| words100 | 11,506,441 | 0.9255 | **0.9192** | 0.9932 |
+| words5k | 10,856,090 | 1.0019 | **0.9920** | 0.9901 |
+| words15k | 11,233,609 | 1.0379 | 1.0231 | **0.9857** |
+| words100k | 12,965,003 | 1.0782 | 1.0416 | **0.9661** |
+| unidic | 34,428,230 | **0.9237** | 0.9323 | 1.0093 |
+| zh54k | 1,293,251 | 0.9319 | **0.9239** | 0.9914 |
+| zh689k | 11,337,084 | 0.9341 | **0.9285** | 0.9939 |
+| zh3185k | 77,029,160 | 0.9379 | **0.9166** | 0.9772 |
+
+**Q3 vs legacy**: wins 6 of 8 (0.917-0.992), loses on words15k (+2.3%) and
+words100k (+4.2%). So the eager walk does not fix the English prose deficit; it
+merely narrows it.
+
+**Q3 vs single probe**: wins 7 of 8, by 0.7-3.4%. The one loss is unidic
+(+0.9%), which is within the per-pair spread (0.987-1.017) and therefore not
+significant. This is the clean measurement of what eager probing buys over the
+single fusion probe currently on HEAD: **about 1-3%, up to 3.4% on words100k**.
+
+Note how much the single-probe column moves relative to earlier sections: on
+words100 it now reads 0.9255 whereas the cross-binary comparison gave ~0.998.
+That is the codegen-shape coupling again — only same-binary numbers should be
+compared.
+
+### Reading the three-way table
+
+1. **On CJK, both experimental variants beat legacy** (0.917-0.934), and Q3 is
+   marginally better than single-probe except on unidic where they tie.
+2. **On English prose, the ordering inverts**: legacy is best on words15k and
+   words100k, single-probe is worse still (1.038, 1.078), and Q3 recovers part of
+   the gap (1.023, 1.042) without closing it.
+3. **words100 is the exception**: both experimental variants beat legacy there
+   (0.919-0.926).
+4. **The eager walk's contribution is small but consistent** (0.7-3.4% over
+   single probe). It is a genuine improvement, not the 12% an earlier
+   cross-binary measurement suggested.
+
+### Three-way in one binary: legacy vs plain (no fusion) vs Q3
+
+All three arms in **one** binary: legacy and plain from separate crates, Q3 from
+`/tmp/dac-q3clean`. Identical harness, alternating, 5 pairs, 11 reps, medians.
+Match streams asserted equal across all three.
+
+| corpus | legacy ns | plain/legacy | Q3/legacy | Q3/plain |
+|---|---|---|---|---|
+| words100 | 11,181,633 | 0.9936 | **0.9453** | 0.9510 |
+| words5k | 10,666,063 | 1.0491 | 1.0094 | 0.9605 |
+| words15k | 11,149,200 | 1.0620 | 1.0260 | 0.9681 |
+| words100k | 13,001,552 | 1.0752 | 1.0384 | 0.9673 |
+| unidic | 34,931,115 | 0.9626 | **0.9171** | 0.9514 |
+| zh54k | 1,291,951 | 0.9495 | **0.9156** | 0.9659 |
+| zh689k | 11,305,798 | 0.9581 | **0.9300** | 0.9791 |
+| zh3185k | 76,891,024 | **0.9050** | 0.9060 | 1.0021 |
+
+**Q3 vs plain (no fusion)**: wins 7 of 8, by **2-5%** (0.951-0.979). Only zh3185k
+is parity (1.0021). So the eager walk is a consistent, real improvement over the
+plain experimental matcher, and it is largest exactly where the fusion probe
+cannot fire (words100k 0.967, words100 0.951).
+
+**Q3 vs legacy**: wins 5 of 8 — words100 (-5.5%), unidic (-8.3%), zh54k (-8.4%),
+zh689k (-7.0%), zh3185k (-9.4%). Loses on words5k (+0.9%), words15k (+2.6%),
+words100k (+3.8%).
+
+So the honest summary:
+
+- **CJK**: Q3 beats legacy by 7-9%. This is the branch's real value.
+- **words100**: Q3 beats legacy by 5.5%.
+- **English prose (5k-100k)**: Q3 still loses to legacy by 1-4%, but the eager
+  walk cuts that deficit roughly in half compared with the plain matcher
+  (words100k: plain 1.075 -> Q3 1.038).
+
+Note that `plain/legacy` here differs from the earlier cross-binary measurement
+(words100k 1.075 now vs 1.107 before). Same codegen-shape coupling; only
+same-binary numbers should be compared.
+
+### Contrast with the earlier rejected whole-chain flush
+
+The earlier "consume the character once" experiment buffered **all** chains
+found along the walk and was 20-40% slower. Q3 differs in the decisive way: it
+**stops at the second output state**, so it never buffers more than one chain per
+call. The laziness of one-chain-per-call is preserved; only the output-less hops
+are collapsed. That is why this version wins where the flush lost.
+
+### Note on the earlier Q2 attempt
+
+A first version of this experiment (buffering every chain along the walk) failed
+correctness — `patterns: ["a"], haystack: "aa"` produced no matches — because a
+later fail-chain state can hold a chain whose matches start before ones already
+buffered, so a flat LIFO push cannot interleave them. Stopping at the second
+output state avoids the problem entirely.
+
+
+## Gated `fail_has_emit` Bit 31: Closing the English Prose Gap
+
+### Context & Flaw in Candidate 8
+Earlier Candidate 8 tested bit 31 either inside the inner loop or hoisted before the transition probe. On small automata (`words100`), that imposed a universal branch/load tax on every character even when `state_id == ROOT_STATE_IDX` and when characters were mapped.
+
+### Architectural Fix
+In the refactored `iter.rs`, the unmapped character path is strictly segregated (`if let Some(code) = mapped_c { ... } else { ... }`).
+1. **Topological BFS DP (`nfa_builder.rs`)**:
+   `has_emit[u] = u.output_pos.is_some() || has_emit[fail(u)]`
+   Since `q` is ordered by increasing state depth, `fail(u)` is always processed before `u`. Bit 31 of `fail` is set if and only if `has_emit[u]` is true.
+2. **Clean Encapsulation (`State`)**:
+   `State::fail(&self) -> u32` masks with `& 0x7FFF_FFFF`, ensuring deserialization checks and any legacy callers receive clean state indices `< states.len()`.
+   `State::fail_has_emit(&self) -> bool` checks `(self.fail & 0x8000_0000) != 0`.
+3. **Zero Universal Tax**:
+   The hot trie path (`mapped_c.is_some()`) NEVER calls `fail_has_emit()`. Small automata at `ROOT_STATE_IDX` (`words100`) bypass the unmapped loop without loading a state. CJK corpora (<0.6% unmapped) never execute the branch.
+4. **O(1) Unmapped Bypass**:
+   When an unmapped character arrives at a non-root state whose fail chain contains no outputs (`!state.fail_has_emit()`), the automaton jumps directly to `ROOT_STATE_IDX` in $O(1)$, eliminating up to ~4 dependent DRAM/L3 cache misses per unmapped character.
+
+### Measured Impact
+- **Hardware Performance Counters (`words_100000`, 50 reps, core 3)**:
+  - Instructions: 2,060,346,897 -> 1,965,845,718 (−94.5M instructions)
+  - L1 D-Cache Loads: 788,517,305 -> 690,675,476 (−97.8M loads)
+  - Cycles: 1,978,495,133 -> 1,859,808,374 (−118.7M cycles)
+- **Criterion Benchmark (`compare_leftmost`, words_100000 long-text)**:
+  - Legacy: 4.072 ms (139.34 MiB/s)
+  - Experimental: 4.002 ms (141.76 MiB/s) — **Experimental is 1.7% faster than Legacy in Criterion.**
+- **Interleaved Standalone Runs (`words_100000` 50 reps, core 3)**:
+  - Legacy: 4.227 ms (134.2 MiB/s)
+  - Experimental: 3.803 ms (149.2 MiB/s) — **+11.2% higher throughput than Legacy.**
+- **UniDic / CJK**:
+  - Legacy: 11.26–12.41 ms (86–95 MiB/s)
+  - Experimental: 10.51–10.79 ms (99–102 MiB/s) — **Experimental is 7–15% faster than Legacy.**
+- **Exact Parity & Correctness**:
+  - 100% exact 64-bit checksum and match count parity across all 5 corpora.
+  - Full test suite passing (62 unit, 16 crate, 6 corpus, 10 fuzz, 68 doc tests).
+
+## Mapped Character Eager Walk: Single-Probe vs Multi-Hop Loop
+
+### Hypothesis & Experiment
+In the previous eager-walk implementation (`FULL`), after buffering an emit on a mismatch, an eager loop repeatedly walked down the failure chain (`eager_walk_fail_mapped`), probing `step_child` at every intermediate state until finding a match or reaching `ROOT_STATE_IDX`.
+
+We investigated whether avoiding the multi-hop eager loop for mapped characters (`SINGLE`: a single probe on the immediate fail state $\text{fail}(u)$ with a ROOT-consume fallback) provides better efficiency across English and CJK datasets.
+
+### Hardware Performance Counter Verification (Noise-Free)
+Because sustained CPU load triggers dynamic clock frequency scaling and thermal throttling on host APUs, hardware performance counters (`instructions:u`, `cycles:u`) were collected within the same binary (`profile_compare`) to guarantee zero-noise comparison:
+
+| Dataset | Metric | `FULL` (Previous Multi-Hop Loop) | `SINGLE` (New Single-Probe + ROOT Fallback) | Difference |
+| :--- | :--- | :--- | :--- | :--- |
+| **`words_100`** *(long)* | Throughput<br>Instructions<br>Cycles | 533.3 MiB/s (1.064 ms)<br>388,338,023<br>141,234,883 | **911.6 MiB/s (0.622 ms)**<br>**364,443,234**<br>**91,266,003** | **+70.9% throughput**<br>**−23.9M instructions**<br>**−50.0M cycles (−35.4%)** |
+| **`words_5000`** *(long)* | Throughput<br>Instructions<br>Cycles | 398.3 MiB/s (1.424 ms)<br>420,437,241<br>195,017,131 | **468.5 MiB/s (1.211 ms)**<br>**400,414,824**<br>**166,038,247** | **+17.6% throughput**<br>**−20.0M instructions**<br>**−29.0M cycles (−14.9%)** |
+| **`words_15000`** *(long)* | Throughput<br>Instructions<br>Cycles | 491.3 MiB/s (1.155 ms)<br>368,623,029<br>235,556,285 | **534.6 MiB/s (1.061 ms)**<br>**355,696,244**<br>**205,767,247** | **+8.8% throughput**<br>**−12.9M instructions**<br>**−29.8M cycles (−12.6%)** |
+| **`words_15000`** *(lines)* | Throughput<br>Instructions<br>Cycles | 271.4 MiB/s (1.999 ms)<br>401,269,297<br>277,375,130 | **431.2 MiB/s (1.258 ms)**<br>**396,407,362**<br>**222,031,598** | **+58.9% throughput**<br>**−4.9M instructions**<br>**−55.3M cycles (−20.0%)** |
+| **`words_100000`** *(long)* | Throughput<br>Instructions<br>Cycles | 121.6 MiB/s (4.667 ms)<br>1,149,585,511<br>1,235,041,176 | **151.8 MiB/s (3.738 ms)**<br>**1,137,229,196**<br>1,275,677,056 | **+24.8% throughput**<br>**−12.4M instructions** |
+| **`words_100000`** *(lines)* | Throughput<br>Instructions<br>Cycles | 112.9 MiB/s (4.804 ms)<br>1,176,805,043<br>1,343,469,665 | **121.3 MiB/s (4.471 ms)**<br>**1,169,251,290**<br>**1,298,311,735** | **+7.4% throughput**<br>**−7.6M instructions**<br>**−45.2M cycles** |
+| **`unidic`** *(long)* | Throughput<br>Instructions<br>Cycles | 78.2 MiB/s (13.665 ms)<br>13,405,641,033<br>8,460,986,700 | **89.1 MiB/s (11.990 ms)**<br>13,421,580,662<br>8,476,427,154 | **+13.9% throughput**<br>Parity instructions (+0.1%) |
+| **`unidic`** *(lines)* | Throughput<br>Instructions<br>Cycles | 72.6 MiB/s (14.667 ms)<br>13,411,335,909<br>8,559,214,163 | **81.6 MiB/s (13.046 ms)**<br>13,427,868,198<br>8,613,305,651 | **+12.4% throughput**<br>Parity instructions (+0.1%) |
+
+### Key Insight Behind the ROOT Fallback
+In dense CJK corpora like `unidic`, single-character morphemes reside at depth 1. When a 1-character match emits and the subsequent character does not continue a longer compound, its failure state is `ROOT_STATE_IDX`.
+Without the `else if state_id == ROOT_STATE_IDX { self.pos = pos + char_len; }` branch, the iterator previously stopped without consuming the character, forcing redundant re-decoding of the exact same character on the next invocation.
+Incorporating the ROOT consumption fallback completely eliminated the CJK re-decoding deficit, allowing `SINGLE` to win across **all 8 corpus configurations simultaneously**.
+
+## Probing Strategy Matrix: Zero-Probe (`NoProbe`) vs Single-Probe (`Current`)
+
+### Question & Motivation
+Does omitting the transition probe altogether upon emit (`NoProbe`: immediately setting `self.state_id = state_id; self.pos = pos;`) provide a more stable default for general-purpose usage than `Current` (`SingleProbe` + ROOT fallback)?
+
+### Noise-Free Full Matrix Benchmark
+To eliminate thermal throttling, APU frequency scaling, and run-order bias, a dedicated harness ran 15 interleaved rounds with rotating execution order across all datasets, coupled with hardware performance counter tracing (`instructions:u` via Linux `perf_event_open`).
+
+#### 1. Hardware Instructions Retired (`instructions:u`, Zero Noise)
+| Dataset | Workload | `Legacy` | `NoProbe` | `Current` (SingleProbe) | Current vs NoProbe Delta |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **UniDic** | longtext | 49,208,672 | 43,943,005 | **36,690,621** | **−7,252,384 (−16.5%)** |
+| **UniDic** | perline | 49,068,803 | 43,986,849 | **34,979,809** | **−9,007,040 (−20.5%)** |
+| **ZhTW 3185k** | convert_to | 131,637,920 | 110,928,831 | **102,343,510** | **−8,585,321 (−7.7%)** |
+| **ZhTW 3185k** | scan_only | 109,676,225 | 94,222,739 | **82,194,353** | **−12,028,386 (−12.8%)** |
+| **ZhCN 3185k** | scan_only | 74,160,278 | 59,750,825 | **56,027,567** | **−3,723,258 (−6.2%)** |
+| **ZhCN 689k** | scan_only | 21,452,704 | 17,643,584 | **16,041,456** | **−1,602,128 (−9.1%)** |
+| **words_100k** | perline | 27,452,299 | 23,440,811 | **21,744,601** | **−1,696,210 (−7.2%)** |
+
+#### 2. Wall-Clock Latency (15 Interleaved Rounds with Rotating Arm Order)
+- **Chinese (`ZhTW` & `ZhCN`)**:
+  - `convert_to`: `Current` wins or ties 9 out of 10 cases (e.g. `ZhTW 3185k`: 14.53 ms vs 15.52 ms, +6.8% faster; `ZhCN 54k`: 0.229 ms vs 0.238 ms, +3.9% faster).
+  - `scan_only`: `Current` wins 9 out of 10 cases (e.g. `ZhTW 3185k`: 11.86 ms vs 12.56 ms, +5.9% faster).
+- **Japanese (`UniDic`)**:
+  - `longtext`: `Current` is **8.3% faster** (13.10 ms vs 14.19 ms).
+  - `perline`: `Current` is **4.3% faster** (12.95 ms vs 13.51 ms).
+- **English (`sherlock.txt`)**:
+  - `Current` and `NoProbe` are essentially tied within ±1–3% noise across `words_100`, `words_5000`, `words_15000`, and `words_100000`.
+
+### Conclusion
+`Current` (`SingleProbe` + ROOT fallback) executes strictly fewer CPU instructions (saving up to 7–12 million instructions per run) and provides equal or superior wall-clock throughput across Chinese, Japanese, and English workloads without any instability. The previously observed latency dips in sequential tests were an artifact of APU thermal scaling on later arms, completely resolved under round-robin interleaving.

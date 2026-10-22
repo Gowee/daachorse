@@ -35,10 +35,39 @@ impl CodeMapper {
 
     #[inline(always)]
     pub fn get(&self, c: char) -> Option<u32> {
+        self.get_new(c)
+    }
+
+    #[inline(always)]
+    pub fn get_old(&self, c: char) -> Option<u32> {
         self.table
             .get(usize::from_u32(u32::from(c)))
             .copied()
             .filter(|&code| code != INVALID_CODE)
+    }
+
+    #[inline(always)]
+    pub fn get_new(&self, c: char) -> Option<u32> {
+        let idx = usize::from_u32(u32::from(c));
+        if idx < self.table.len() {
+            // SAFETY: idx is verified to be within table bounds.
+            let code = unsafe { *self.table.get_unchecked(idx) };
+            if code != INVALID_CODE {
+                return Some(code);
+            }
+        }
+        None
+    }
+
+    #[inline(always)]
+    pub fn get_code(&self, c: char) -> u32 {
+        let idx = usize::from_u32(u32::from(c));
+        if idx < self.table.len() {
+            // SAFETY: idx is verified to be within table bounds.
+            unsafe { *self.table.get_unchecked(idx) }
+        } else {
+            INVALID_CODE
+        }
     }
 
     #[inline(always)]

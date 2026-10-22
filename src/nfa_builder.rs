@@ -405,15 +405,12 @@ where
             let initial_head = if parent_id == ROOT_STATE_ID {
                 None
             } else {
-                self.states[parent_id as usize]
-                    .output_pos
-                    .get()
-                    .map(|pos| {
-                        (
-                            store.get(pos).with_incremented_gap(ch.num_bytes()),
-                            store.key_of(pos).pat_state,
-                        )
-                    })
+                self.states[parent_id as usize].output_pos.get().map(|pos| {
+                    (
+                        store.get(pos).with_incremented_gap(ch.num_bytes()),
+                        store.key_of(pos).pat_state,
+                    )
+                })
             };
 
             let mut chain = EmitChain::new(initial_head);
@@ -429,8 +426,7 @@ where
                     scratch_buffer.clear();
                     scratch_buffer.extend(store.iter_chain(curr_head));
                     // Matches along curr's prefix ended at P; advance the head gap by |c| to align with S:
-                    scratch_buffer[0].0 =
-                        scratch_buffer[0].0.with_incremented_gap(ch.num_bytes());
+                    scratch_buffer[0].0 = scratch_buffer[0].0.with_incremented_gap(ch.num_bytes());
                     scratch_buffer[0].1.gap += u32::try_from(ch.num_bytes()).unwrap();
                     chain.extend_from(&scratch_buffer, &mut store);
                 }
@@ -458,6 +454,30 @@ where
             let final_pos = chain.finish(&mut store);
             self.states[state_id as usize].output_pos.set(final_pos);
             self.states[state_id as usize].fail.set(fail_state);
+        }
+
+        // Stage 3: Compute reachability to emits along the fail chain (has_emit DP).
+        // Since `q` is topologically ordered by state depth, any proper suffix `fail(u)`
+        // has depth strictly less than `u` and was processed earlier in `q`.
+        let mut has_emit = alloc::vec![false; self.states.len()];
+        if self.states[ROOT_STATE_ID as usize]
+            .output_pos
+            .get()
+            .is_some()
+        {
+            has_emit[ROOT_STATE_ID as usize] = true;
+        }
+        for &state_id in &q[1..] {
+            let u = state_id as usize;
+            let fail_id = self.states[u].fail.get() as usize;
+            if self.states[u].output_pos.get().is_some() || has_emit[fail_id] {
+                has_emit[u] = true;
+            }
+        }
+        for (i, state) in self.states.iter().enumerate() {
+            if has_emit[i] {
+                state.fail.set(state.fail.get() | 0x8000_0000);
+            }
         }
 
         self.emits = store.into_emits();
@@ -774,6 +794,7 @@ struct EmitStore<V> {
 
 impl<V: Copy> EmitStore<V> {
     /// Creates an empty store with initial capacity.
+    #[allow(dead_code)]
     fn with_capacity(cap: usize) -> Self {
         Self {
             emits: Vec::with_capacity(cap),

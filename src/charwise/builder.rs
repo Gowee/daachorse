@@ -399,15 +399,17 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
 
             self.states[idx].set_output_pos(s.output_pos.get());
 
-            let fail_id = s.fail.get();
+            let raw_fail = s.fail.get();
+            let emit_bit = raw_fail & 0x8000_0000;
+            let fail_id = raw_fail & 0x7FFF_FFFF;
             if fail_id == DEAD_STATE_ID {
                 self.states[idx].set_fail(DEAD_STATE_IDX);
             } else if fail_id == ROOT_STATE_ID {
-                self.states[idx].set_fail(ROOT_STATE_IDX);
+                self.states[idx].set_fail(ROOT_STATE_IDX | emit_bit);
             } else {
                 let fail_idx = state_id_map[usize::from_u32(fail_id)];
                 debug_assert_ne!(fail_idx, DEAD_STATE_IDX);
-                self.states[idx].set_fail(fail_idx);
+                self.states[idx].set_fail(fail_idx | emit_bit);
             }
         }
     }
