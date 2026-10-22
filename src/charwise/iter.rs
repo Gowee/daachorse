@@ -858,8 +858,8 @@ where
             pos += char_len;
         }
 
+        Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, &mut pos, 0);
         self.pos = pos;
-        Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, &mut self.pos, 0);
         self.state_id = state_id;
     }
 
