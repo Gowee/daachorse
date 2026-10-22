@@ -6,7 +6,6 @@ use core::num::NonZeroU32;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::charwise::mapper::INVALID_CODE;
 use crate::charwise::{CharwiseDoubleArrayAhoCorasick, State};
 use crate::prefilter::{Prefilter, PrefilterGate};
 use crate::utils::FromU32;
@@ -727,14 +726,7 @@ unsafe fn step_child(
 /// match chains. It performs purely forward, single-pass streaming matching in guaranteed linear
 /// time `O(N)` over the input text, completely eliminating the worst-case `O(N * L)` text rewind
 /// behavior present in classic Aho-Corasick leftmost matching.
-pub struct LeftmostFindIteratorExperimental<
-    'a,
-    P,
-    V,
-    const PROBE: bool = true,
-    const CODE_MODE: usize = 0,
-    const BORROW_BIT: bool = true,
-> {
+pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
     pub(crate) haystack: P,
     pub(crate) pos: usize,
@@ -760,8 +752,7 @@ pub struct LeftmostFindIteratorExperimental<
     pub(crate) epsilon_cursor: usize,
 }
 
-impl<'a, P, V, const PROBE: bool, const CODE_MODE: usize, const BORROW_BIT: bool>
-    LeftmostFindIteratorExperimental<'a, P, V, PROBE, CODE_MODE, BORROW_BIT>
+impl<'a, P, V> LeftmostFindIteratorExperimental<'a, P, V>
 where
     P: AsRef<str>,
     V: Copy,
@@ -818,128 +809,60 @@ where
 
             let (c, char_len) = unsafe { decode_char_unchecked(bytes, pos) };
 
-            if CODE_MODE == 2 {
-                let code = self.pma.mapper.get_code(c);
-
-                if code != INVALID_CODE {
-                    loop {
-                        let state = unsafe { states.get_unchecked(state_id as usize) };
-                        if let Some(child_id) =
-                            unsafe { step_child(states, state.base(), state_id, code) }
-                        {
-                            state_id = child_id;
-                            break;
-                        }
-                        if state_id == ROOT_STATE_IDX {
-                            break;
-                        }
-                        state_id = state.fail();
-                        if let Some(ep) = state.output_pos() {
-                            self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
-
-                            if PROBE {
-                                let st = unsafe { states.get_unchecked(state_id as usize) };
-                                if let Some(child_id) =
-                                    unsafe { step_child(states, st.base(), state_id, code) }
-                                {
-                                    self.state_id = child_id;
-                                    self.pos = pos + char_len;
-                                } else if state_id == ROOT_STATE_IDX {
-                                    self.state_id = ROOT_STATE_IDX;
-                                    self.pos = pos + char_len;
-                                } else {
-                                    self.state_id = state_id;
-                                    self.pos = pos;
-                                }
-                            } else {
-                                self.state_id = state_id;
-                                self.pos = pos;
-                            }
-                            return;
-                        }
+            if let Some(code) = self.pma.mapper.get(c) {
+                loop {
+                    let state = unsafe { states.get_unchecked(state_id as usize) };
+                    if let Some(child_id) =
+                        unsafe { step_child(states, state.base(), state_id, code) }
+                    {
+                        state_id = child_id;
+                        break;
                     }
-                } else {
-                    while state_id != ROOT_STATE_IDX {
-                        let state = unsafe { states.get_unchecked(state_id as usize) };
-                        if BORROW_BIT && !state.fail_has_emit() {
-                            state_id = ROOT_STATE_IDX;
-                            break;
-                        }
-                        state_id = state.fail();
-                        if let Some(ep) = state.output_pos() {
-                            self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
-                            if PROBE && state_id == ROOT_STATE_IDX {
-                                self.pos = pos + char_len;
-                            } else {
-                                self.pos = pos;
-                            }
+                    if state_id == ROOT_STATE_IDX {
+                        break;
+                    }
+                    state_id = state.fail();
+                    if let Some(ep) = state.output_pos() {
+                        self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
+
+                        // Single-probe fast path: attempt to transition directly from this fail state
+                        // using the current character `code`. If successful, advance `pos` immediately.
+                        let st = unsafe { states.get_unchecked(state_id as usize) };
+                        if let Some(child_id) =
+                            unsafe { step_child(states, st.base(), state_id, code) }
+                        {
+                            self.state_id = child_id;
+                            self.pos = pos + char_len;
+                        } else if state_id == ROOT_STATE_IDX {
+                            self.state_id = ROOT_STATE_IDX;
+                            self.pos = pos + char_len;
+                        } else {
                             self.state_id = state_id;
-                            return;
+                            self.pos = pos;
                         }
+                        return;
                     }
                 }
             } else {
-                let mapped = if CODE_MODE == 1 {
-                    self.pma.mapper.get_old(c)
-                } else {
-                    self.pma.mapper.get_new(c)
-                };
-
-                if let Some(code) = mapped {
-                    loop {
-                        let state = unsafe { states.get_unchecked(state_id as usize) };
-                        if let Some(child_id) =
-                            unsafe { step_child(states, state.base(), state_id, code) }
-                        {
-                            state_id = child_id;
-                            break;
-                        }
-                        if state_id == ROOT_STATE_IDX {
-                            break;
-                        }
-                        state_id = state.fail();
-                        if let Some(ep) = state.output_pos() {
-                            self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
-
-                            if PROBE {
-                                let st = unsafe { states.get_unchecked(state_id as usize) };
-                                if let Some(child_id) =
-                                    unsafe { step_child(states, st.base(), state_id, code) }
-                                {
-                                    self.state_id = child_id;
-                                    self.pos = pos + char_len;
-                                } else if state_id == ROOT_STATE_IDX {
-                                    self.state_id = ROOT_STATE_IDX;
-                                    self.pos = pos + char_len;
-                                } else {
-                                    self.state_id = state_id;
-                                    self.pos = pos;
-                                }
-                            } else {
-                                self.state_id = state_id;
-                                self.pos = pos;
-                            }
-                            return;
-                        }
+                // For unmapped characters (absent from the alphabet), no transition on `c` is possible.
+                // Traverse failure links to emit any pending matches, using bit 31 (`fail_has_emit`)
+                // to skip directly to ROOT if no ancestor has an output.
+                while state_id != ROOT_STATE_IDX {
+                    let state = unsafe { states.get_unchecked(state_id as usize) };
+                    if !state.fail_has_emit() {
+                        state_id = ROOT_STATE_IDX;
+                        break;
                     }
-                } else {
-                    while state_id != ROOT_STATE_IDX {
-                        let state = unsafe { states.get_unchecked(state_id as usize) };
-                        if BORROW_BIT && !state.fail_has_emit() {
-                            state_id = ROOT_STATE_IDX;
-                            break;
+                    state_id = state.fail();
+                    if let Some(ep) = state.output_pos() {
+                        self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
+                        if state_id == ROOT_STATE_IDX {
+                            self.pos = pos + char_len;
+                        } else {
+                            self.pos = pos;
                         }
-                        state_id = state.fail();
-                        if let Some(ep) = state.output_pos() {
-                            self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
-                            if PROBE && state_id == ROOT_STATE_IDX {
-                                self.pos = pos + char_len;
-                            } else {
-                                self.pos = pos;
-                            }
-                            self.state_id = state_id;
-                            return;
-                        }
+                        self.state_id = state_id;
+                        return;
                     }
                 }
             }
@@ -953,9 +876,10 @@ where
 
     #[inline(always)]
     fn drain_eof(&mut self, pos: usize, mut state_id: u32) {
+        // At EOF, drain remaining matches along failure links.
         while state_id != ROOT_STATE_IDX {
             let state = unsafe { self.pma.states.get_unchecked(state_id as usize) };
-            if BORROW_BIT && !state.fail_has_emit() {
+            if !state.fail_has_emit() {
                 state_id = ROOT_STATE_IDX;
                 break;
             }
@@ -985,8 +909,7 @@ where
     }
 }
 
-impl<P, V, const PROBE: bool, const CODE_MODE: usize, const BORROW_BIT: bool>
-    Iterator for LeftmostFindIteratorExperimental<'_, P, V, PROBE, CODE_MODE, BORROW_BIT>
+impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
 where
     P: AsRef<str>,
     V: Copy,
