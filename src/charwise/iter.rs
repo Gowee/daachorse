@@ -705,15 +705,15 @@ where
 /// invariant, by construction).
 #[inline(always)]
 unsafe fn step_child(
-    states: &[crate::charwise::State],
+    states: &[State],
     base: Option<NonZeroU32>,
     expect: u32,
     code: u32,
 ) -> Option<u32> {
     if let Some(base) = base {
         let child_idx = (base.get() ^ code) as usize;
-        // SAFETY: see function contract.
-        if unsafe { states.get_unchecked(child_idx) }.check() == expect {
+        // SAFETY: child_idx is verified to be within states by the double-array invariant.
+        if states.get_unchecked(child_idx).check() == expect {
             return Some(child_idx as u32);
         }
     }
@@ -774,10 +774,6 @@ where
     /// are buffered into `self.buf` or EOF is reached.
     #[inline(always)]
     fn ensure_buffered_impl<const FILTERED: bool>(&mut self) {
-        if !self.buf.is_empty() {
-            return;
-        }
-
         let haystack = self.haystack.as_ref();
         let bytes = haystack.as_bytes();
 
@@ -807,10 +803,12 @@ where
                 }
             }
 
+            // SAFETY: pos < bytes.len() and pos sits on a valid character boundary.
             let (c, char_len) = unsafe { decode_char_unchecked(bytes, pos) };
 
             if let Some(code) = self.pma.mapper.get(c) {
                 loop {
+                    // SAFETY: state_id is a valid state index.
                     let state = unsafe { states.get_unchecked(state_id as usize) };
                     if let Some(child_id) =
                         unsafe { step_child(states, state.base(), state_id, code) }
@@ -823,6 +821,7 @@ where
                     }
                     state_id = state.fail();
                     if let Some(ep) = state.output_pos() {
+                        // SAFETY: ep is a valid output position stored in the automaton.
                         self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
 
                         // Single-probe fast path: attempt to transition directly from this fail state
@@ -833,66 +832,70 @@ where
                         {
                             self.state_id = child_id;
                             self.pos = pos + char_len;
-                        } else if state_id == ROOT_STATE_IDX {
-                            self.state_id = ROOT_STATE_IDX;
-                            self.pos = pos + char_len;
                         } else {
                             self.state_id = state_id;
-                            self.pos = pos;
+                            self.pos = if state_id == ROOT_STATE_IDX {
+                                pos + char_len
+                            } else {
+                                pos
+                            };
                         }
                         return;
                     }
                 }
-            } else {
-                // For unmapped characters (absent from the alphabet), no transition on `c` is possible.
-                // Traverse failure links to emit any pending matches, using bit 31 (`fail_has_emit`)
-                // to skip directly to ROOT if no ancestor has an output.
-                while state_id != ROOT_STATE_IDX {
-                    let state = unsafe { states.get_unchecked(state_id as usize) };
-                    if !state.fail_has_emit() {
-                        state_id = ROOT_STATE_IDX;
-                        break;
-                    }
-                    state_id = state.fail();
-                    if let Some(ep) = state.output_pos() {
-                        self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
-                        if state_id == ROOT_STATE_IDX {
-                            self.pos = pos + char_len;
-                        } else {
-                            self.pos = pos;
-                        }
-                        self.state_id = state_id;
-                        return;
-                    }
-                }
+            } else if let Some(next_pos) =
+                Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, pos, char_len)
+            {
+                self.pos = next_pos;
+                self.state_id = state_id;
+                return;
             }
 
             pos += char_len;
         }
 
         self.pos = pos;
-        self.drain_eof(pos, state_id);
-    }
-
-    #[inline(always)]
-    fn drain_eof(&mut self, pos: usize, mut state_id: u32) {
-        // At EOF, drain remaining matches along failure links.
-        while state_id != ROOT_STATE_IDX {
-            let state = unsafe { self.pma.states.get_unchecked(state_id as usize) };
-            if !state.fail_has_emit() {
-                state_id = ROOT_STATE_IDX;
-                break;
-            }
-            let emit_pos = state.output_pos();
-            state_id = state.fail();
-            if let Some(ep) = emit_pos {
-                self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
-                self.pos = pos;
-                self.state_id = state_id;
-                return;
-            }
+        if let Some(next_pos) =
+            Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, pos, 0)
+        {
+            self.pos = next_pos;
         }
         self.state_id = state_id;
+    }
+
+    /// Drains failure links from `*state_id` at `pos`, buffering the first state with an output,
+    /// or skipping directly to `ROOT_STATE_IDX` if no failure ancestor has an emit.
+    ///
+    /// Returns `Some(next_pos)` if a match was emitted, or `None` if `ROOT_STATE_IDX` was
+    /// reached without any emit.
+    #[inline(always)]
+    fn drain_fail_at(
+        pma: &CharwiseDoubleArrayAhoCorasick<V>,
+        buf: &mut alloc::vec::Vec<Match<V>>,
+        state_id: &mut u32,
+        pos: usize,
+        char_len: usize,
+    ) -> Option<usize> {
+        let states = &pma.states;
+        while *state_id != ROOT_STATE_IDX {
+            // SAFETY: *state_id is guaranteed to be a valid state index by construction.
+            let state = unsafe { states.get_unchecked(*state_id as usize) };
+            if !state.fail_has_emit() {
+                *state_id = ROOT_STATE_IDX;
+                break;
+            }
+            *state_id = state.fail();
+            if let Some(ep) = state.output_pos() {
+                // SAFETY: ep is a valid output position stored in the automaton.
+                buf.extend(unsafe { pma.iter_emits(ep, pos) });
+                return Some(if *state_id == ROOT_STATE_IDX {
+                    pos + char_len
+                } else {
+                    pos
+                });
+            }
+        }
+        None
     }
 
     /// Ensures `self.buf` contains the next non-empty match(es), scanning forward
