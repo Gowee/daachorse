@@ -720,35 +720,102 @@ unsafe fn step_child(
     None
 }
 
+const UNMAPPED_CODE: u32 = 0x00FF_FFFF;
+
+/// Compact 32-bit token caching an unconsumed character across emits.
+/// Bits 24..31: character byte length (1..4).
+/// Bits 0..23: mapped compact code (or `0x00FF_FFFF` for unmapped).
+/// `0` indicates no cached character is pending.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct Token(pub(crate) u32);
+
+impl Token {
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    #[inline(always)]
+    pub const fn is_valid(self) -> bool {
+        self.0 != 0
+    }
+
+    #[inline(always)]
+    pub const fn new(code: Option<u32>, len: usize) -> Self {
+        let c = match code {
+            Some(v) => v & UNMAPPED_CODE,
+            None => UNMAPPED_CODE,
+        };
+        Self(((len as u32) << 24) | c)
+    }
+
+    #[inline(always)]
+    pub const fn code(self) -> Option<u32> {
+        let c = self.0 & UNMAPPED_CODE;
+        if c != UNMAPPED_CODE {
+            Some(c)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub const fn len(self) -> usize {
+        (self.0 >> 24) as usize
+    }
+}
+
+/// Helper to extract emits in order: returns the single match directly in registers
+/// when there is no predecessor chain, or pushes predecessor matches to `buf` for multi-match chains.
+#[inline(always)]
+fn extract_emits<V: Copy>(
+    emits: &[crate::Emit<V>],
+    head_pos: NonZeroU32,
+    pos: usize,
+    buf: &mut alloc::vec::Vec<Match<V>>,
+) -> Match<V> {
+    let first_emit = unsafe { emits.get_unchecked(head_pos.get() as usize - 1) };
+    let end = pos - first_emit.gap as usize;
+    let start = end - first_emit.length as usize;
+    let first_match = first_emit.to_match(end);
+
+    let Some(mut curr_ep) = first_emit.pred else {
+        return first_match;
+    };
+
+    buf.push(first_match);
+    let mut last_start = start;
+    loop {
+        let em = unsafe { emits.get_unchecked(curr_ep.get() as usize - 1) };
+        let end = last_start - em.gap as usize;
+        let start = end - em.length as usize;
+        let m = em.to_match(end);
+        if let Some(next_pred) = em.pred {
+            buf.push(m);
+            last_start = start;
+            curr_ep = next_pred;
+        } else {
+            return m;
+        }
+    }
+}
+
 /// Dedicated iterator created by [`CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()`].
 ///
 /// This iterator executes non-overlapping leftmost pattern matching using pre-committed
-/// match chains. It performs purely forward, single-pass streaming matching in guaranteed linear
-/// time `O(N)` over the input text, completely eliminating the worst-case `O(N * L)` text rewind
-/// behavior present in classic Aho-Corasick leftmost matching.
+/// match chains and deferred unconsumed character resolution via a compact 32-bit token cache.
+/// It performs purely forward, single-pass streaming matching in guaranteed linear
+/// time `O(N)` over the input text, completely eliminating text rewinding.
 pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
     pub(crate) haystack: P,
     pub(crate) pos: usize,
     pub(crate) state_id: u32,
-    /// Pending matches produced by the emit chain, drained LIFO by `next()`.
-    ///
-    /// Emit chains have length 1 in ~99.5% of cases (max observed 3), so this
-    /// allocates exactly once per iterator and normally holds a single element.
-    /// Deliberately `Vec::new()` rather than `with_capacity`: the first `push`
-    /// allocates either way, and reserving four slots only makes that allocation
-    /// larger (4 x 24 B instead of a growth-doubled 1 -> 2) for capacity that is
-    /// almost never used. Measured 1.3-3.4% slower with `with_capacity(4)` on
-    /// English and Japanese long-text scans.
     pub(crate) buf: alloc::vec::Vec<Match<V>>,
     pub(crate) gate: PrefilterGate,
-
-    // Cached ROOT state output position for the empty pattern (""), if present.
-    // In leftmost matching, a pattern set containing "" matches at every character
-    // boundary unless covered or immediately followed by a non-empty match.
+    pub(crate) cached_token: Token,
     pub(crate) epsilon_emit_pos: Option<NonZeroU32>,
-
-    // Monotonically advancing text cursor tracking the next character boundary for epsilon emission.
     pub(crate) epsilon_cursor: usize,
 }
 
@@ -765,20 +832,72 @@ where
             state_id: ROOT_STATE_IDX,
             buf: alloc::vec::Vec::new(),
             gate: PrefilterGate::new(),
+            cached_token: Token::empty(),
             epsilon_emit_pos: pma.states[usize::from_u32(ROOT_STATE_IDX)].output_pos(),
             epsilon_cursor: 0,
         }
     }
 
-    /// Core scanning engine that advances the automaton forward until matches
-    /// are buffered into `self.buf` or EOF is reached.
+    /// Core scanning engine that advances the automaton forward until a match is found or EOF is reached.
     #[inline(always)]
-    fn ensure_buffered_impl<const FILTERED: bool>(&mut self) {
+    fn find_next_match<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
         let haystack = self.haystack.as_ref();
         let bytes = haystack.as_bytes();
 
         let mut pos = self.pos;
         let mut state_id = self.state_id;
+        let states = &self.pma.states;
+
+        // 1. Prelude: if a character was deferred on a previous emit, consume it first.
+        if self.cached_token.is_valid() {
+            let token = self.cached_token;
+            self.cached_token = Token::empty();
+            let char_len = token.len();
+
+            if let Some(code) = token.code() {
+                loop {
+                    // SAFETY: state_id is a valid state index.
+                    let state = unsafe { states.get_unchecked(state_id as usize) };
+                    if let Some(child_id) =
+                        unsafe { step_child(states, state.base(), state_id, code) }
+                    {
+                        state_id = child_id;
+                        break;
+                    }
+                    if state_id == ROOT_STATE_IDX {
+                        break;
+                    }
+                    state_id = state.fail();
+                    if let Some(ep) = state.output_pos() {
+                        let m = extract_emits(&self.pma.emits, ep, pos, &mut self.buf);
+                        if state_id == ROOT_STATE_IDX {
+                            let base =
+                                unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
+                            self.state_id =
+                                unsafe { step_child(states, base, ROOT_STATE_IDX, code) }
+                                    .unwrap_or(ROOT_STATE_IDX);
+                            self.pos = pos + char_len;
+                        } else {
+                            self.cached_token = Token::new(Some(code), char_len);
+                            self.state_id = state_id;
+                            self.pos = pos;
+                        }
+                        return Some(m);
+                    }
+                }
+            } else if let Some(m) =
+                Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, &mut pos, char_len)
+            {
+                if state_id != ROOT_STATE_IDX {
+                    self.cached_token = Token::new(None, char_len);
+                }
+                self.pos = pos;
+                self.state_id = state_id;
+                return Some(m);
+            }
+
+            pos += char_len;
+        }
 
         let mut prefilter = if FILTERED {
             self.pma.prefilter.as_ref()
@@ -786,8 +905,7 @@ where
             None
         };
 
-        let states = &self.pma.states;
-
+        // 2. Main streaming scan: decode at top
         while pos < bytes.len() {
             if let Some(pf) = prefilter {
                 if state_id == ROOT_STATE_IDX {
@@ -821,53 +939,49 @@ where
                     }
                     state_id = state.fail();
                     if let Some(ep) = state.output_pos() {
-                        // SAFETY: ep is a valid output position stored in the automaton.
-                        self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
-
-                        // Single-probe fast path: attempt to transition directly from this fail state
-                        // using the current character `code`. If successful, advance `pos` immediately.
-                        let st = unsafe { states.get_unchecked(state_id as usize) };
-                        if let Some(child_id) =
-                            unsafe { step_child(states, st.base(), state_id, code) }
-                        {
-                            self.state_id = child_id;
+                        let m = extract_emits(&self.pma.emits, ep, pos, &mut self.buf);
+                        if state_id == ROOT_STATE_IDX {
+                            let base =
+                                unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
+                            self.state_id =
+                                unsafe { step_child(states, base, ROOT_STATE_IDX, code) }
+                                    .unwrap_or(ROOT_STATE_IDX);
                             self.pos = pos + char_len;
                         } else {
+                            self.cached_token = Token::new(Some(code), char_len);
                             self.state_id = state_id;
-                            self.pos = if state_id == ROOT_STATE_IDX {
-                                pos + char_len
-                            } else {
-                                pos
-                            };
+                            self.pos = pos;
                         }
-                        return;
+                        return Some(m);
                     }
                 }
-            } else if Self::drain_fail_at(
-                self.pma,
-                &mut self.buf,
-                &mut state_id,
-                &mut pos,
-                char_len,
-            ) {
+            } else if let Some(m) =
+                Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, &mut pos, char_len)
+            {
+                if state_id != ROOT_STATE_IDX {
+                    self.cached_token = Token::new(None, char_len);
+                }
                 self.pos = pos;
                 self.state_id = state_id;
-                return;
+                return Some(m);
             }
 
             pos += char_len;
         }
 
-        Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, &mut pos, 0);
+        if let Some(m) = Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, &mut pos, 0) {
+            self.pos = pos;
+            self.state_id = state_id;
+            return Some(m);
+        }
+
         self.pos = pos;
         self.state_id = state_id;
+        None
     }
 
     /// Drains failure links from `*state_id` at `pos`, buffering the first state with an output,
     /// or skipping directly to `ROOT_STATE_IDX` if no failure ancestor has an emit.
-    ///
-    /// Returns `true` if a match was emitted, or `false` if `ROOT_STATE_IDX` was
-    /// reached without any emit.
     #[inline(always)]
     fn drain_fail_at(
         pma: &CharwiseDoubleArrayAhoCorasick<V>,
@@ -875,7 +989,7 @@ where
         state_id: &mut u32,
         pos: &mut usize,
         char_len: usize,
-    ) -> bool {
+    ) -> Option<Match<V>> {
         let states = &pma.states;
         while *state_id != ROOT_STATE_IDX {
             // SAFETY: *state_id is guaranteed to be a valid state index by construction.
@@ -886,28 +1000,64 @@ where
             }
             *state_id = state.fail();
             if let Some(ep) = state.output_pos() {
-                // SAFETY: ep is a valid output position stored in the automaton.
-                buf.extend(unsafe { pma.iter_emits(ep, *pos) });
+                let m = extract_emits(&pma.emits, ep, *pos, buf);
                 if *state_id == ROOT_STATE_IDX {
                     *pos += char_len;
                 }
-                return true;
+                return Some(m);
             }
         }
-        false
+        None
     }
 
-    /// Ensures `self.buf` contains the next non-empty match(es), scanning forward
-    /// if the buffer is currently empty.
-    #[inline(always)]
-    fn ensure_buffered(&mut self) {
+    /// Isolated handler for empty pattern ("") interleaving when present in the automaton.
+    #[inline(never)]
+    fn next_with_epsilon(&mut self) -> Option<Match<V>> {
+        let ep = self.epsilon_emit_pos?;
+        let epsilon = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
+
         if self.buf.is_empty() {
-            if self.pma.prefilter.is_some() && self.gate.is_enabled() {
-                self.ensure_buffered_impl::<true>();
+            let next_m = if self.pma.prefilter.is_some() && self.gate.is_enabled() {
+                self.find_next_match::<true>()
             } else {
-                self.ensure_buffered_impl::<false>();
+                self.find_next_match::<false>()
+            };
+            if let Some(m) = next_m {
+                self.buf.push(m);
             }
         }
+
+        let bytes = self.haystack.as_ref().as_bytes();
+        debug_assert_eq!(epsilon.length, 0);
+        debug_assert_eq!(epsilon.gap, 0);
+        debug_assert!(epsilon.pred.is_none());
+
+        let target = self.buf.last().map_or(bytes.len(), |m| m.start());
+
+        if self.epsilon_cursor < target {
+            let cursor = self.epsilon_cursor;
+            let (_, char_len) = unsafe { decode_char_unchecked(bytes, self.epsilon_cursor) };
+            self.epsilon_cursor += char_len;
+            return Some(epsilon.to_match(cursor));
+        }
+
+        if let Some(m) = self.buf.pop() {
+            self.epsilon_cursor = if m.end() < bytes.len() {
+                let (_, char_len) = unsafe { decode_char_unchecked(bytes, m.end()) };
+                m.end() + char_len
+            } else {
+                usize::MAX
+            };
+            return Some(m);
+        }
+
+        if self.epsilon_cursor <= bytes.len() {
+            self.epsilon_cursor = usize::MAX;
+            return Some(epsilon.to_match(bytes.len()));
+        }
+
+        self.epsilon_emit_pos = None;
+        None
     }
 }
 
@@ -920,58 +1070,196 @@ where
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        self.ensure_buffered();
-
-        let epsilon = match self.epsilon_emit_pos {
-            None => return self.buf.pop(),
-            // SAFETY: the emit for epsilon was populated by builder if "" is
-            // present in patterns
-            Some(ep) => unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) },
-        };
-
-        // Instead of messing the core leftmost(-longest) matching flow,
-        // here, interpolate zero-length matches ("") into the unconsumed text
-        // gaps between consecutive non-empty matches and at text boundaries:
-
-        debug_assert_eq!(epsilon.length, 0);
-        debug_assert_eq!(epsilon.gap, 0);
-        debug_assert!(epsilon.pred.is_none());
-
-        let bytes = self.haystack.as_ref().as_bytes();
-        let target = self.buf.last().map_or(bytes.len(), |m| m.start());
-
-        // Emit unconsumed boundaries before the non-empty match (or EOF)
-        if self.epsilon_cursor < target {
-            let cursor = self.epsilon_cursor;
-            // SAFETY: epsilon_cursor < target <= match.start() < bytes.len();
-            //         epsilon_cursor is only advanced in this method, by char_len.
-            let (_, char_len) = unsafe { decode_char_unchecked(bytes, self.epsilon_cursor) };
-            self.epsilon_cursor += char_len;
-            return Some(epsilon.to_match(cursor));
+        // 1. Delegate to epsilon engine if the empty pattern "" is present in patterns
+        if self.epsilon_emit_pos.is_some() {
+            return self.next_with_epsilon();
         }
 
-        // Cursor reached target: emit the ready non-empty match from the buffer
+        // 2. Drain pending matches from an emit chain
         if let Some(m) = self.buf.pop() {
-            self.epsilon_cursor = if m.end() < bytes.len() {
-                // SAFETY: m.end() sits at a char boundary, guaranteed at
-                // construction time or deserialization, and is smaller than
-                // bytes.len() as checked above.
-                let (_, char_len) = unsafe { decode_char_unchecked(bytes, m.end()) };
-                m.end() + char_len
-            } else {
-                usize::MAX
-            };
             return Some(m);
         }
 
-        // Emit trailing boundary at EOF if not suppressed by an immediately preceding match
-        if self.epsilon_cursor <= bytes.len() {
-            self.epsilon_cursor = usize::MAX;
-            return Some(epsilon.to_match(bytes.len()));
+        // 3. Fast streaming scan returning matches directly
+        if self.pma.prefilter.is_some() && self.gate.is_enabled() {
+            self.find_next_match::<true>()
+        } else {
+            self.find_next_match::<false>()
+        }
+    }
+}
+
+/// Helper to extract emits in forward order as originally implemented in commit `6695258`.
+#[inline(always)]
+fn extract_emits_v6695258<V: Copy>(
+    emits: &[crate::Emit<V>],
+    head_pos: u32,
+    pos: usize,
+    buf: &mut alloc::vec::Vec<Match<V>>,
+) -> Match<V> {
+    let first_emit = unsafe { emits.get_unchecked(head_pos as usize - 1) };
+    let end = pos - first_emit.gap as usize;
+    let start = end - first_emit.length as usize;
+    let first_match = first_emit.to_match(end);
+
+    let Some(pred) = first_emit.pred else {
+        return first_match;
+    };
+
+    buf.push(first_match);
+    let mut last_start = start;
+    let mut curr_ep = pred;
+    loop {
+        let em = unsafe { emits.get_unchecked(curr_ep.get() as usize - 1) };
+        let end = last_start - em.gap as usize;
+        let start = end - em.length as usize;
+        let m = em.to_match(end);
+        if let Some(next_pred) = em.pred {
+            buf.push(m);
+            last_start = start;
+            curr_ep = next_pred;
+        } else {
+            return m;
+        }
+    }
+}
+
+/// Helper to transition from ROOT on character `c` as originally implemented in commit `6695258`.
+#[inline(always)]
+fn step_root_v6695258(
+    mapped_c: Option<u32>,
+    root_base: Option<core::num::NonZeroU32>,
+    states: &[crate::charwise::State],
+) -> u32 {
+    if let (Some(code), Some(base)) = (mapped_c, root_base) {
+        let child_idx = (base.get() ^ code) as usize;
+        if child_idx < states.len()
+            && unsafe { states.get_unchecked(child_idx).check() } == ROOT_STATE_IDX
+        {
+            return child_idx as u32;
+        }
+    }
+    ROOT_STATE_IDX
+}
+
+/// Advances the zero-rewind leftmost-longest match iterator by one match, exactly as in commit `6695258`.
+#[inline(always)]
+pub(crate) fn next_leftmost_longest_match_v6695258<V: Copy>(
+    pma: &CharwiseDoubleArrayAhoCorasick<V>,
+    haystack: &str,
+    pos: &mut usize,
+    state_id: &mut u32,
+    buf: &mut alloc::vec::Vec<Match<V>>,
+) -> Option<Match<V>> {
+    if let Some(m) = buf.pop() {
+        return Some(m);
+    }
+
+    let bytes = haystack.as_bytes();
+    let text_len = bytes.len();
+    let states = pma.states.as_slice();
+    let states_len = states.len();
+    let root_base = unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
+
+    while *pos < text_len {
+        let (c, char_len) = unsafe { decode_char_unchecked(bytes, *pos) };
+        let mapped_c = pma.mapper.get(c);
+
+        if *state_id == ROOT_STATE_IDX {
+            *state_id = step_root_v6695258(mapped_c, root_base, states);
+            *pos += char_len;
+            continue;
         }
 
-        self.epsilon_emit_pos = None;
-        None
+        'step: loop {
+            if let Some(code) = mapped_c {
+                if let Some(base) = unsafe { states.get_unchecked(*state_id as usize).base() } {
+                    let child_idx = (base.get() ^ code) as usize;
+                    if child_idx < states_len
+                        && unsafe { states.get_unchecked(child_idx).check() } == *state_id
+                    {
+                        *state_id = child_idx as u32;
+                        *pos += char_len;
+                        break 'step;
+                    }
+                }
+            }
+
+            let emit_pos = unsafe { states.get_unchecked(*state_id as usize).output_pos() };
+            let target_state = unsafe { states.get_unchecked(*state_id as usize).fail() };
+            *state_id = target_state;
+
+            if let Some(ep) = emit_pos {
+                let first_match = extract_emits_v6695258(&pma.emits, ep.get(), *pos, buf);
+                if *state_id == ROOT_STATE_IDX {
+                    *state_id = step_root_v6695258(mapped_c, root_base, states);
+                    *pos += char_len;
+                }
+                return Some(first_match);
+            }
+
+            if *state_id == ROOT_STATE_IDX {
+                *state_id = step_root_v6695258(mapped_c, root_base, states);
+                *pos += char_len;
+                break 'step;
+            }
+        }
+    }
+
+    while *state_id != ROOT_STATE_IDX {
+        let emit_pos = unsafe { states.get_unchecked(*state_id as usize).output_pos() };
+        let target_state = unsafe { states.get_unchecked(*state_id as usize).fail() };
+        *state_id = target_state;
+        if let Some(ep) = emit_pos {
+            let first_match = extract_emits_v6695258(&pma.emits, ep.get(), *pos, buf);
+            return Some(first_match);
+        }
+    }
+
+    None
+}
+
+/// Dedicated iterator for leftmost-longest searching as originally implemented in commit `6695258b6cebf7ce8c784f03bbf0362b7a989e8e`.
+pub struct LeftmostLongestFindIteratorV6695258<'a, P, V> {
+    pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
+    pub(crate) haystack: P,
+    pub(crate) pos: usize,
+    pub(crate) state_id: u32,
+    pub(crate) buf: alloc::vec::Vec<Match<V>>,
+}
+
+impl<'a, P, V> LeftmostLongestFindIteratorV6695258<'a, P, V>
+where
+    P: AsRef<str>,
+    V: Copy,
+{
+    pub(crate) fn new(pma: &'a CharwiseDoubleArrayAhoCorasick<V>, haystack: P) -> Self {
+        Self {
+            pma,
+            haystack,
+            pos: 0,
+            state_id: ROOT_STATE_IDX,
+            buf: alloc::vec::Vec::new(),
+        }
+    }
+}
+
+impl<P, V> Iterator for LeftmostLongestFindIteratorV6695258<'_, P, V>
+where
+    P: AsRef<str>,
+    V: Copy,
+{
+    type Item = Match<V>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        next_leftmost_longest_match_v6695258(
+            self.pma,
+            self.haystack.as_ref(),
+            &mut self.pos,
+            &mut self.state_id,
+            &mut self.buf,
+        )
     }
 }
 

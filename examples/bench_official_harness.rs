@@ -115,32 +115,10 @@ fn run_v6695258(da: &CharwiseDoubleArrayAhoCorasick<u32>, haystacks: &[String]) 
 }
 
 #[inline(never)]
-fn run_fast_root(da: &CharwiseDoubleArrayAhoCorasick<u32>, haystacks: &[String]) -> usize {
+fn run_direct_return(da: &CharwiseDoubleArrayAhoCorasick<u32>, haystacks: &[String]) -> usize {
     let mut sum = 0usize;
     for h in haystacks {
-        for m in da.leftmost_find_iter_fast_root(h) {
-            sum += m.start() + m.end() + m.value() as usize;
-        }
-    }
-    black_box(sum)
-}
-
-#[inline(never)]
-fn run_single_probe(da: &CharwiseDoubleArrayAhoCorasick<u32>, haystacks: &[String]) -> usize {
-    let mut sum = 0usize;
-    for h in haystacks {
-        for m in da.leftmost_find_iter_single_probe(h) {
-            sum += m.start() + m.end() + m.value() as usize;
-        }
-    }
-    black_box(sum)
-}
-
-#[inline(never)]
-fn run_peeled_cache(da: &CharwiseDoubleArrayAhoCorasick<u32>, haystacks: &[String]) -> usize {
-    let mut sum = 0usize;
-    for h in haystacks {
-        for m in da.leftmost_find_iter_peeled_cache(h) {
+        for m in da.leftmost_find_iter_experimental(h) {
             sum += m.start() + m.end() + m.value() as usize;
         }
     }
@@ -212,9 +190,7 @@ pub struct WorkloadResult {
     mode: String,
     legacy: ArmResult,
     v6695258: ArmResult,
-    fast_root: ArmResult,
-    single_probe: ArmResult,
-    peeled_cache: ArmResult,
+    direct_return: ArmResult,
 }
 
 fn eval_workload(
@@ -247,12 +223,10 @@ fn eval_workload(
         .build(&patterns)
         .unwrap();
 
-    // Verify 100% equivalence & sanity check sum across all 5 arms
+    // Verify 100% equivalence & sanity check sum across arms
     let mut leg_count = 0;
     let mut v6695258_count = 0;
-    let mut fast_root_count = 0;
-    let mut sp_count = 0;
-    let mut pc_count = 0;
+    let mut dr_count = 0;
     for h in &haystacks {
         let leg_m: Vec<_> = leg
             .leftmost_find_iter(h)
@@ -262,16 +236,8 @@ fn eval_workload(
             .leftmost_find_iter_v6695258(h)
             .map(|m| (m.start(), m.end(), m.value()))
             .collect();
-        let fast_root_m: Vec<_> = exp
-            .leftmost_find_iter_fast_root(h)
-            .map(|m| (m.start(), m.end(), m.value()))
-            .collect();
-        let sp_m: Vec<_> = exp
-            .leftmost_find_iter_single_probe(h)
-            .map(|m| (m.start(), m.end(), m.value()))
-            .collect();
-        let pc_m: Vec<_> = exp
-            .leftmost_find_iter_peeled_cache(h)
+        let dr_m: Vec<_> = exp
+            .leftmost_find_iter_experimental(h)
             .map(|m| (m.start(), m.end(), m.value()))
             .collect();
         assert_eq!(
@@ -280,54 +246,34 @@ fn eval_workload(
             corpus_name, mode_name
         );
         assert_eq!(
-            leg_m, fast_root_m,
-            "FastRoot mismatch on {}/{}",
-            corpus_name, mode_name
-        );
-        assert_eq!(
-            leg_m, sp_m,
-            "SingleProbe mismatch on {}/{}",
-            corpus_name, mode_name
-        );
-        assert_eq!(
-            leg_m, pc_m,
-            "PeeledCache mismatch on {}/{}",
+            leg_m, dr_m,
+            "DirectReturn mismatch on {}/{}",
             corpus_name, mode_name
         );
         leg_count += leg_m.len();
         v6695258_count += v6695258_m.len();
-        fast_root_count += fast_root_m.len();
-        sp_count += sp_m.len();
-        pc_count += pc_m.len();
+        dr_count += dr_m.len();
     }
     assert_eq!(leg_count, v6695258_count);
-    assert_eq!(leg_count, fast_root_count);
-    assert_eq!(leg_count, sp_count);
-    assert_eq!(leg_count, pc_count);
+    assert_eq!(leg_count, dr_count);
 
     // Warmup
     for _ in 0..2 {
         run_legacy(&leg, &haystacks);
         run_v6695258(&exp, &haystacks);
-        run_fast_root(&exp, &haystacks);
-        run_single_probe(&exp, &haystacks);
-        run_peeled_cache(&exp, &haystacks);
+        run_direct_return(&exp, &haystacks);
     }
 
     let mut leg_metrics = Vec::new();
     let mut v6695258_metrics = Vec::new();
-    let mut fast_root_metrics = Vec::new();
-    let mut sp_metrics = Vec::new();
-    let mut pc_metrics = Vec::new();
+    let mut dr_metrics = Vec::new();
 
-    // 15 Interleaved rounds with strict 5-way cyclic rotation:
+    // 15 Interleaved rounds with strict 3-way cyclic rotation:
     for round in 0..rounds {
-        let order = match round % 5 {
-            0 => [0, 1, 2, 3, 4],
-            1 => [1, 2, 3, 4, 0],
-            2 => [2, 3, 4, 0, 1],
-            3 => [3, 4, 0, 1, 2],
-            4 => [4, 0, 1, 2, 3],
+        let order = match round % 3 {
+            0 => [0, 1, 2],
+            1 => [1, 2, 0],
+            2 => [2, 0, 1],
             _ => unreachable!(),
         };
 
@@ -344,9 +290,7 @@ fn eval_workload(
             let _ = match arm {
                 0 => run_legacy(&leg, &haystacks),
                 1 => run_v6695258(&exp, &haystacks),
-                2 => run_fast_root(&exp, &haystacks),
-                3 => run_single_probe(&exp, &haystacks),
-                4 => run_peeled_cache(&exp, &haystacks),
+                2 => run_direct_return(&exp, &haystacks),
                 _ => unreachable!(),
             };
 
@@ -363,9 +307,7 @@ fn eval_workload(
             match arm {
                 0 => leg_metrics.push(metric),
                 1 => v6695258_metrics.push(metric),
-                2 => fast_root_metrics.push(metric),
-                3 => sp_metrics.push(metric),
-                4 => pc_metrics.push(metric),
+                2 => dr_metrics.push(metric),
                 _ => unreachable!(),
             }
         }
@@ -373,26 +315,24 @@ fn eval_workload(
 
     let leg_res = analyze_arm(&leg_metrics);
     let v6695258_res = analyze_arm(&v6695258_metrics);
-    let fast_root_res = analyze_arm(&fast_root_metrics);
-    let sp_res = analyze_arm(&sp_metrics);
-    let pc_res = analyze_arm(&pc_metrics);
+    let dr_res = analyze_arm(&dr_metrics);
 
     Some(WorkloadResult {
         corpus: corpus_name.to_string(),
         mode: mode_name.to_string(),
         legacy: leg_res,
         v6695258: v6695258_res,
-        fast_root: fast_root_res,
-        single_probe: sp_res,
-        peeled_cache: pc_res,
+        direct_return: dr_res,
     })
 }
 
 fn run_all() {
     let base = "/root/smb/data";
     println!("\n# Official-Harness Benchmark on zin (15 Interleaved Rounds)");
-    println!("Arms: [0] Legacy  [1] v6695258 (Initial)  [2] FastRoot (Zero Tricks + Fast Root Path)  [3] SingleProbe  [4] PeeledCache");
-    println!("Rotation: 5-way cyclic order per round (0->1->2->3->4, 1->2->3->4->0, ...)\n");
+    println!(
+        "Arms: [0] Legacy  [1] v6695258 (Initial)  [2] DirectReturn (Neat Direct-Return Form)"
+    );
+    println!("Rotation: 3-way cyclic order per round (0->1->2, 1->2->0, 2->0->1)\n");
 
     let workloads = [
         (
@@ -473,71 +413,70 @@ fn run_all() {
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
         if let Some(r) = eval_workload(corpus, mode, &pat, &hay, longtext, 15) {
             println!(
-                "done. (Leg: {:.2}ms, 6695258: {:.2}ms, FR: {:.2}ms, SP: {:.2}ms, PC: {:.2}ms)",
-                r.legacy.med_ms,
-                r.v6695258.med_ms,
-                r.fast_root.med_ms,
-                r.single_probe.med_ms,
-                r.peeled_cache.med_ms
+                "done. (Leg: {:.2}ms, 6695258: {:.2}ms, DirectReturn: {:.2}ms)",
+                r.legacy.med_ms, r.v6695258.med_ms, r.direct_return.med_ms
             );
             results.push(r);
         }
     }
 
     println!("\n### 1. Wall-Clock Execution Time (ms, 15 Interleaved Rounds)");
-    println!("| Corpus | Mode | Legacy (ms) | v6695258 (ms) | FastRoot (ms) | FR vs Leg | SingleProbe (ms) | PeeledCache (ms) |");
-    println!("|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|");
+    println!("| Corpus | Mode | Legacy (ms) | v6695258 (ms) | DirectReturn (ms) | DR vs Leg | DR vs 6695258 |");
+    println!("|:---|:---|:---:|:---:|:---:|:---:|:---:|");
     for r in &results {
-        let fr_vs_leg = (r.fast_root.med_ms - r.legacy.med_ms) / r.legacy.med_ms * 100.0;
+        let dr_vs_leg = (r.direct_return.med_ms - r.legacy.med_ms) / r.legacy.med_ms * 100.0;
+        let dr_vs_v = (r.direct_return.med_ms - r.v6695258.med_ms) / r.v6695258.med_ms * 100.0;
         println!(
-            "| {:<12} | {:<9} | {:8.2} | {:8.2} | {:8.2} | {:+8.2}% | {:8.2} | {:8.2} |",
+            "| {:<12} | {:<9} | {:8.2} | {:8.2} | {:8.2} | {:+8.2}% | {:+8.2}% |",
             r.corpus,
             r.mode,
             r.legacy.med_ms,
             r.v6695258.med_ms,
-            r.fast_root.med_ms,
-            fr_vs_leg,
-            r.single_probe.med_ms,
-            r.peeled_cache.med_ms
+            r.direct_return.med_ms,
+            dr_vs_leg,
+            dr_vs_v
         );
     }
 
     println!("\n### 2. Hardware Instructions Retired");
-    println!("| Corpus | Mode | Legacy Instr | v6695258 Instr | FastRoot Instr | FR vs Leg | SingleProbe Instr | PeeledCache Instr |");
-    println!("|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|");
+    println!("| Corpus | Mode | Legacy Instr | v6695258 Instr | DirectReturn Instr | DR vs Leg | DR vs 6695258 |");
+    println!("|:---|:---|:---:|:---:|:---:|:---:|:---:|");
     for r in &results {
-        let fr_vs_leg =
-            (r.fast_root.instrs as f64 - r.legacy.instrs as f64) / r.legacy.instrs as f64 * 100.0;
+        let dr_vs_leg = (r.direct_return.instrs as f64 - r.legacy.instrs as f64)
+            / r.legacy.instrs as f64
+            * 100.0;
+        let dr_vs_v = (r.direct_return.instrs as f64 - r.v6695258.instrs as f64)
+            / r.v6695258.instrs as f64
+            * 100.0;
         println!(
-            "| {:<12} | {:<9} | {:12} | {:12} | {:12} | {:+8.2}% | {:12} | {:12} |",
+            "| {:<12} | {:<9} | {:12} | {:12} | {:12} | {:+8.2}% | {:+8.2}% |",
             r.corpus,
             r.mode,
             r.legacy.instrs,
             r.v6695258.instrs,
-            r.fast_root.instrs,
-            fr_vs_leg,
-            r.single_probe.instrs,
-            r.peeled_cache.instrs
+            r.direct_return.instrs,
+            dr_vs_leg,
+            dr_vs_v
         );
     }
 
     println!("\n### 3. CPU Cycles (Median)");
-    println!("| Corpus | Mode | Legacy Cycles | v6695258 Cycles | FastRoot Cycles | FR vs Leg | SingleProbe Cycles | PeeledCache Cycles |");
-    println!("|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|");
+    println!(
+        "| Corpus | Mode | Legacy Cycles | v6695258 Cycles | DirectReturn Cycles | DR vs Leg |"
+    );
+    println!("|:---|:---|:---:|:---:|:---:|:---:|");
     for r in &results {
-        let fr_vs_leg = (r.fast_root.med_cyc as f64 - r.legacy.med_cyc as f64)
+        let dr_vs_leg = (r.direct_return.med_cyc as f64 - r.legacy.med_cyc as f64)
             / r.legacy.med_cyc as f64
             * 100.0;
         println!(
-            "| {:<12} | {:<9} | {:12} | {:12} | {:12} | {:+8.2}% | {:12} | {:12} |",
+            "| {:<12} | {:<9} | {:12} | {:12} | {:12} | {:+8.2}% |",
             r.corpus,
             r.mode,
             r.legacy.med_cyc,
             r.v6695258.med_cyc,
-            r.fast_root.med_cyc,
-            fr_vs_leg,
-            r.single_probe.med_cyc,
-            r.peeled_cache.med_cyc
+            r.direct_return.med_cyc,
+            dr_vs_leg
         );
     }
 }

@@ -16,7 +16,9 @@ use crate::charwise::iter::{
     FindOverlappingSliceIterator, FindOverlappingStepper, FindSliceIterator, FindStepper,
     PatternIterator,
 };
-pub use crate::charwise::iter::{LeftmostFindIterator, LeftmostFindIteratorExperimental};
+pub use crate::charwise::iter::{
+    LeftmostFindIterator, LeftmostFindIteratorExperimental, LeftmostLongestFindIteratorV6695258,
+};
 use crate::charwise::mapper::CodeMapper;
 use crate::errors::{DaachorseError, Result};
 use crate::prefilter::{Prefilter, PrefilterGate};
@@ -635,6 +637,22 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
         );
         LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    #[doc(hidden)]
+    pub fn leftmost_find_iter_v6695258<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostLongestFindIteratorV6695258<'_, P, V>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostLongestFindIteratorV6695258::new(self, haystack)
     }
 
     /// Returns a stepper of non-overlapping matches that consumes characters one by one.
