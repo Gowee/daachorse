@@ -760,7 +760,7 @@ fn extract_emits<V: Copy>(
 /// This iterator executes non-overlapping leftmost pattern matching using pre-committed
 /// match chains. It performs purely forward, single-pass streaming matching in guaranteed linear
 /// time `O(N)` over the input text, completely eliminating text rewinding.
-pub struct LeftmostFindIteratorExperimental<'a, P, V> {
+pub struct LeftmostFindIteratorExperimental<'a, P, V, const BORROW_BIT: bool = true> {
     pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
     pub(crate) haystack: P,
     pub(crate) pos: usize,
@@ -771,7 +771,7 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) epsilon_cursor: usize,
 }
 
-impl<'a, P, V> LeftmostFindIteratorExperimental<'a, P, V>
+impl<'a, P, V, const BORROW_BIT: bool> LeftmostFindIteratorExperimental<'a, P, V, BORROW_BIT>
 where
     P: AsRef<str>,
     V: Copy,
@@ -786,6 +786,15 @@ where
             gate: PrefilterGate::new(),
             epsilon_emit_pos: pma.states[usize::from_u32(ROOT_STATE_IDX)].output_pos(),
             epsilon_cursor: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn get_fail(state: &State) -> u32 {
+        if BORROW_BIT {
+            state.fail & 0x7FFF_FFFF
+        } else {
+            state.fail
         }
     }
 
@@ -837,7 +846,7 @@ where
                     if state_id == ROOT_STATE_IDX {
                         break;
                     }
-                    state_id = state.fail();
+                    state_id = Self::get_fail(state);
                     if let Some(ep) = state.output_pos() {
                         let m = extract_emits(&self.pma.emits, ep, pos, &mut self.buf);
                         if state_id == ROOT_STATE_IDX {
@@ -890,7 +899,11 @@ where
         while *state_id != ROOT_STATE_IDX {
             // SAFETY: *state_id is guaranteed to be a valid state index by construction.
             let state = unsafe { states.get_unchecked(*state_id as usize) };
-            *state_id = state.fail();
+            if BORROW_BIT && !state.fail_has_emit() {
+                *state_id = ROOT_STATE_IDX;
+                break;
+            }
+            *state_id = Self::get_fail(state);
             if let Some(ep) = state.output_pos() {
                 let m = extract_emits(&pma.emits, ep, *pos, buf);
                 if *state_id == ROOT_STATE_IDX {
@@ -953,7 +966,7 @@ where
     }
 }
 
-impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
+impl<P, V, const BORROW_BIT: bool> Iterator for LeftmostFindIteratorExperimental<'_, P, V, BORROW_BIT>
 where
     P: AsRef<str>,
     V: Copy,

@@ -628,7 +628,23 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     pub fn leftmost_find_iter_experimental<P>(
         &self,
         haystack: P,
-    ) -> LeftmostFindIteratorExperimental<'_, P, V>
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, true>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    #[doc(hidden)]
+    pub fn leftmost_find_iter_borrow_bit<const BORROW_BIT: bool, P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V, BORROW_BIT>
     where
         P: AsRef<str>,
         V: Copy,
@@ -1548,7 +1564,12 @@ impl State {
 
     #[inline(always)]
     pub const fn fail(&self) -> u32 {
-        self.fail
+        self.fail & 0x7FFF_FFFF
+    }
+
+    #[inline(always)]
+    pub const fn fail_has_emit(&self) -> bool {
+        (self.fail & 0x8000_0000) != 0
     }
 
     #[inline(always)]

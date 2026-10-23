@@ -20,6 +20,7 @@ pub struct CharwiseDoubleArrayAhoCorasickBuilder {
     match_kind: MatchKind,
     corpus: Vec<String>,
     use_prefilter: bool,
+    use_borrow_bit: bool,
     /// TEST-ONLY: disable emit dedup for experimental builds.
     test_no_dedup: bool,
 }
@@ -61,8 +62,17 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
             match_kind: MatchKind::Standard,
             corpus: vec![],
             use_prefilter: true,
+            use_borrow_bit: true,
             test_no_dedup: false,
         }
+    }
+
+    /// TEST-ONLY: enable/disable borrowing bit 31 of fail for failure chain emit skip.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn use_borrow_bit(mut self, yes: bool) -> Self {
+        self.use_borrow_bit = yes;
+        self
     }
 
     /// TEST-ONLY: disable emit dedup for experimental leftmost builds.
@@ -295,7 +305,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
         P: AsRef<str>,
         V: Copy,
     {
-        let mut nfa = CharwiseNfaBuilder::new(self.match_kind);
+        let mut nfa = CharwiseNfaBuilder::new(self.match_kind).use_borrow_bit(self.use_borrow_bit);
         let mut prefilter_builder = self.use_prefilter.then(PrefilterBuilder::new);
         let mut freqs = vec![];
         {
@@ -399,15 +409,20 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
 
             self.states[idx].set_output_pos(s.output_pos.get());
 
-            let fail_id = s.fail.get();
+            let raw_fail = s.fail.get();
+            let (emit_bit, fail_id) = if self.use_borrow_bit {
+                (raw_fail & 0x8000_0000, raw_fail & 0x7FFF_FFFF)
+            } else {
+                (0, raw_fail)
+            };
             if fail_id == DEAD_STATE_ID {
                 self.states[idx].set_fail(DEAD_STATE_IDX);
             } else if fail_id == ROOT_STATE_ID {
-                self.states[idx].set_fail(ROOT_STATE_IDX);
+                self.states[idx].set_fail(ROOT_STATE_IDX | emit_bit);
             } else {
                 let fail_idx = state_id_map[usize::from_u32(fail_id)];
                 debug_assert_ne!(fail_idx, DEAD_STATE_IDX);
-                self.states[idx].set_fail(fail_idx);
+                self.states[idx].set_fail(fail_idx | emit_bit);
             }
         }
     }

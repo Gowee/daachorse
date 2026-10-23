@@ -70,6 +70,7 @@ pub struct NfaBuilder<L, V> {
     pub(crate) emits: Vec<Emit<V>>,     // emits for leftmost-longest matching.
     pub(crate) len: usize,
     pub(crate) match_kind: MatchKind,
+    pub(crate) use_borrow_bit: bool,
 }
 
 impl<L, V> NfaBuilder<L, V>
@@ -87,7 +88,13 @@ where
             emits: vec![],
             len: 0,
             match_kind,
+            use_borrow_bit: false,
         }
+    }
+
+    pub(crate) fn use_borrow_bit(mut self, yes: bool) -> Self {
+        self.use_borrow_bit = yes;
+        self
     }
 
     #[inline(always)]
@@ -456,7 +463,30 @@ where
             self.states[state_id as usize].fail.set(fail_state);
         }
 
-        // Stage 3: Compute reachability to emits along the fail chain (has_emit DP).
+        // Stage 3: Compute reachability to emits along the fail chain (has_emit DP) if borrow bit is requested.
+        if self.use_borrow_bit {
+            let mut has_emit = alloc::vec![false; self.states.len()];
+            if self.states[ROOT_STATE_ID as usize]
+                .output_pos
+                .get()
+                .is_some()
+            {
+                has_emit[ROOT_STATE_ID as usize] = true;
+            }
+            for &state_id in &q[1..] {
+                let u = state_id as usize;
+                let fail_id = self.states[u].fail.get() as usize;
+                if self.states[u].output_pos.get().is_some() || has_emit[fail_id] {
+                    has_emit[u] = true;
+                }
+            }
+            for (i, state) in self.states.iter().enumerate() {
+                if has_emit[i] {
+                    state.fail.set(state.fail.get() | 0x8000_0000);
+                }
+            }
+        }
+
         self.emits = store.into_emits();
     }
 }
