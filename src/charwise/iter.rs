@@ -700,24 +700,15 @@ where
 ///
 /// # Safety
 ///
-/// `base` must be the `base()` of a valid state, and `base.get() ^ code` must
-/// be a valid index into `states` for every mapped code (double-array
-/// invariant, by construction).
 #[inline(always)]
-unsafe fn step_child(
-    states: &[State],
-    base: Option<NonZeroU32>,
-    expect: u32,
-    code: u32,
-) -> Option<u32> {
-    if let Some(base) = base {
+unsafe fn step_root(states: &[State], code: u32) -> u32 {
+    if let Some(base) = states.get_unchecked(ROOT_STATE_IDX as usize).base() {
         let child_idx = (base.get() ^ code) as usize;
-        // SAFETY: child_idx is verified to be within states by the double-array invariant.
-        if states.get_unchecked(child_idx).check() == expect {
-            return Some(child_idx as u32);
+        if states.get_unchecked(child_idx).check() == ROOT_STATE_IDX {
+            return child_idx as u32;
         }
     }
-    None
+    ROOT_STATE_IDX
 }
 
 /// Extracts pre-committed leftmost matches along the predecessor chain in chronological order.
@@ -805,10 +796,18 @@ where
     V: Copy,
 {
     pub(crate) fn new(pma: &'a CharwiseDoubleArrayAhoCorasick<V>, haystack: P) -> Self {
+        // Invariant: if root has no base, the trie has 0 character edges (either empty pattern set
+        // or only ""). Setting pos = len skips the character scanning engine entirely while preserving
+        // zero-length epsilon match interpolation.
+        let pos = if pma.states[usize::from_u32(ROOT_STATE_IDX)].base().is_none() {
+            haystack.as_ref().len()
+        } else {
+            0
+        };
         Self {
             pma,
             haystack,
-            pos: 0,
+            pos,
             state_id: ROOT_STATE_IDX,
             buf: alloc::vec::Vec::new(),
             gate: PrefilterGate::new(),
@@ -829,8 +828,6 @@ where
         let states = self.pma.states.as_slice();
         let emits = self.pma.emits.as_slice();
         let mapper = &self.pma.mapper;
-        // Invariant: root base is immutable during search; hoisting it avoids reloading states[0] on root transitions.
-        let root_base = unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
 
         let mut prefilter = if FILTERED {
             self.pma.prefilter.as_ref()
@@ -861,25 +858,28 @@ where
                 loop {
                     // SAFETY: state_id is a valid state index.
                     let state = unsafe { states.get_unchecked(state_id as usize) };
-                    // FIXME: if base is state.none, it is leaf node? possible to reach a leaf node with a new c?
-                    if let Some(child_id) =
-                        unsafe { step_child(states, state.base(), state_id, code) }
-                    {
-                        state_id = child_id;
-                        break;
+                    if let Some(base) = state.base() {
+                        let child_idx = (base.get() ^ code) as usize;
+                        if unsafe { states.get_unchecked(child_idx).check() } == state_id {
+                            state_id = child_idx as u32;
+                            break;
+                        }
+                    } else {
+                        let ep = unsafe { state.output_pos().unwrap_unchecked() };
+                        let emit = unsafe { emits.get_unchecked(ep.get() as usize - 1) };
+                        self.state_id = unsafe { step_root(states, code) };
+                        self.pos = pos + char_len;
+                        return Some(emit.to_match(pos));
                     }
+
                     if state_id == ROOT_STATE_IDX {
                         break;
                     }
                     state_id = state.fail();
                     if let Some(ep) = state.output_pos() {
                         let m = extract_emits(emits, ep, pos, &mut self.buf);
-                        // FIXME: simpl explaination here
                         if state_id == ROOT_STATE_IDX {
-                            // FIXME: question: inner branch cost? Can compiler ensure root_Base is not none?
-                            self.state_id =
-                                unsafe { step_child(states, root_base, ROOT_STATE_IDX, code) }
-                                    .unwrap_or(ROOT_STATE_IDX);
+                            self.state_id = unsafe { step_root(states, code) };
                             self.pos = pos + char_len;
                         } else {
                             self.state_id = state_id;
