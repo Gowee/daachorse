@@ -720,52 +720,6 @@ unsafe fn step_child(
     None
 }
 
-const UNMAPPED_CODE: u32 = 0x00FF_FFFF;
-
-/// Compact 32-bit token caching an unconsumed character across emits.
-/// Bits 24..31: character byte length (1..4).
-/// Bits 0..23: mapped compact code (or `0x00FF_FFFF` for unmapped).
-/// `0` indicates no cached character is pending.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub(crate) struct Token(pub(crate) u32);
-
-impl Token {
-    #[inline(always)]
-    pub const fn empty() -> Self {
-        Self(0)
-    }
-
-    #[inline(always)]
-    pub const fn is_valid(self) -> bool {
-        self.0 != 0
-    }
-
-    #[inline(always)]
-    pub const fn new(code: Option<u32>, len: usize) -> Self {
-        let c = match code {
-            Some(v) => v & UNMAPPED_CODE,
-            None => UNMAPPED_CODE,
-        };
-        Self(((len as u32) << 24) | c)
-    }
-
-    #[inline(always)]
-    pub const fn code(self) -> Option<u32> {
-        let c = self.0 & UNMAPPED_CODE;
-        if c != UNMAPPED_CODE {
-            Some(c)
-        } else {
-            None
-        }
-    }
-
-    #[inline(always)]
-    pub const fn len(self) -> usize {
-        (self.0 >> 24) as usize
-    }
-}
-
 /// Helper to extract emits in order: returns the single match directly in registers
 /// when there is no predecessor chain, or pushes predecessor matches to `buf` for multi-match chains.
 #[inline(always)]
@@ -804,8 +758,7 @@ fn extract_emits<V: Copy>(
 /// Dedicated iterator created by [`CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()`].
 ///
 /// This iterator executes non-overlapping leftmost pattern matching using pre-committed
-/// match chains and deferred unconsumed character resolution via a compact 32-bit token cache.
-/// It performs purely forward, single-pass streaming matching in guaranteed linear
+/// match chains. It performs purely forward, single-pass streaming matching in guaranteed linear
 /// time `O(N)` over the input text, completely eliminating text rewinding.
 pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
@@ -814,7 +767,6 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) state_id: u32,
     pub(crate) buf: alloc::vec::Vec<Match<V>>,
     pub(crate) gate: PrefilterGate,
-    pub(crate) cached_token: Token,
     pub(crate) epsilon_emit_pos: Option<NonZeroU32>,
     pub(crate) epsilon_cursor: usize,
 }
@@ -832,7 +784,6 @@ where
             state_id: ROOT_STATE_IDX,
             buf: alloc::vec::Vec::new(),
             gate: PrefilterGate::new(),
-            cached_token: Token::empty(),
             epsilon_emit_pos: pma.states[usize::from_u32(ROOT_STATE_IDX)].output_pos(),
             epsilon_cursor: 0,
         }
@@ -848,64 +799,13 @@ where
         let mut state_id = self.state_id;
         let states = &self.pma.states;
 
-        // 1. Prelude: if a character was deferred on a previous emit, consume it first.
-        if self.cached_token.is_valid() {
-            let token = self.cached_token;
-            self.cached_token = Token::empty();
-            let char_len = token.len();
-
-            if let Some(code) = token.code() {
-                loop {
-                    // SAFETY: state_id is a valid state index.
-                    let state = unsafe { states.get_unchecked(state_id as usize) };
-                    if let Some(child_id) =
-                        unsafe { step_child(states, state.base(), state_id, code) }
-                    {
-                        state_id = child_id;
-                        break;
-                    }
-                    if state_id == ROOT_STATE_IDX {
-                        break;
-                    }
-                    state_id = state.fail();
-                    if let Some(ep) = state.output_pos() {
-                        let m = extract_emits(&self.pma.emits, ep, pos, &mut self.buf);
-                        if state_id == ROOT_STATE_IDX {
-                            let base =
-                                unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
-                            self.state_id =
-                                unsafe { step_child(states, base, ROOT_STATE_IDX, code) }
-                                    .unwrap_or(ROOT_STATE_IDX);
-                            self.pos = pos + char_len;
-                        } else {
-                            self.cached_token = Token::new(Some(code), char_len);
-                            self.state_id = state_id;
-                            self.pos = pos;
-                        }
-                        return Some(m);
-                    }
-                }
-            } else if let Some(m) =
-                Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, &mut pos, char_len)
-            {
-                if state_id != ROOT_STATE_IDX {
-                    self.cached_token = Token::new(None, char_len);
-                }
-                self.pos = pos;
-                self.state_id = state_id;
-                return Some(m);
-            }
-
-            pos += char_len;
-        }
-
         let mut prefilter = if FILTERED {
             self.pma.prefilter.as_ref()
         } else {
             None
         };
 
-        // 2. Main streaming scan: decode at top
+        // Main streaming scan: decode at top
         while pos < bytes.len() {
             if let Some(pf) = prefilter {
                 if state_id == ROOT_STATE_IDX {
@@ -948,7 +848,6 @@ where
                                     .unwrap_or(ROOT_STATE_IDX);
                             self.pos = pos + char_len;
                         } else {
-                            self.cached_token = Token::new(Some(code), char_len);
                             self.state_id = state_id;
                             self.pos = pos;
                         }
@@ -958,9 +857,6 @@ where
             } else if let Some(m) =
                 Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, &mut pos, char_len)
             {
-                if state_id != ROOT_STATE_IDX {
-                    self.cached_token = Token::new(None, char_len);
-                }
                 self.pos = pos;
                 self.state_id = state_id;
                 return Some(m);

@@ -115,7 +115,7 @@ fn run_v6695258(da: &CharwiseDoubleArrayAhoCorasick<u32>, haystacks: &[String]) 
 }
 
 #[inline(never)]
-fn run_direct_return(da: &CharwiseDoubleArrayAhoCorasick<u32>, haystacks: &[String]) -> usize {
+fn run_optimized(da: &CharwiseDoubleArrayAhoCorasick<u32>, haystacks: &[String]) -> usize {
     let mut sum = 0usize;
     for h in haystacks {
         for m in da.leftmost_find_iter_experimental(h) {
@@ -190,7 +190,7 @@ pub struct WorkloadResult {
     mode: String,
     legacy: ArmResult,
     v6695258: ArmResult,
-    direct_return: ArmResult,
+    optimized: ArmResult,
 }
 
 fn eval_workload(
@@ -226,7 +226,7 @@ fn eval_workload(
     // Verify 100% equivalence & sanity check sum across arms
     let mut leg_count = 0;
     let mut v6695258_count = 0;
-    let mut dr_count = 0;
+    let mut opt_count = 0;
     for h in &haystacks {
         let leg_m: Vec<_> = leg
             .leftmost_find_iter(h)
@@ -236,7 +236,7 @@ fn eval_workload(
             .leftmost_find_iter_v6695258(h)
             .map(|m| (m.start(), m.end(), m.value()))
             .collect();
-        let dr_m: Vec<_> = exp
+        let opt_m: Vec<_> = exp
             .leftmost_find_iter_experimental(h)
             .map(|m| (m.start(), m.end(), m.value()))
             .collect();
@@ -246,27 +246,27 @@ fn eval_workload(
             corpus_name, mode_name
         );
         assert_eq!(
-            leg_m, dr_m,
-            "DirectReturn mismatch on {}/{}",
+            leg_m, opt_m,
+            "Optimized mismatch on {}/{}",
             corpus_name, mode_name
         );
         leg_count += leg_m.len();
         v6695258_count += v6695258_m.len();
-        dr_count += dr_m.len();
+        opt_count += opt_m.len();
     }
     assert_eq!(leg_count, v6695258_count);
-    assert_eq!(leg_count, dr_count);
+    assert_eq!(leg_count, opt_count);
 
     // Warmup
     for _ in 0..2 {
         run_legacy(&leg, &haystacks);
         run_v6695258(&exp, &haystacks);
-        run_direct_return(&exp, &haystacks);
+        run_optimized(&exp, &haystacks);
     }
 
     let mut leg_metrics = Vec::new();
     let mut v6695258_metrics = Vec::new();
-    let mut dr_metrics = Vec::new();
+    let mut opt_metrics = Vec::new();
 
     // 15 Interleaved rounds with strict 3-way cyclic rotation:
     for round in 0..rounds {
@@ -290,7 +290,7 @@ fn eval_workload(
             let _ = match arm {
                 0 => run_legacy(&leg, &haystacks),
                 1 => run_v6695258(&exp, &haystacks),
-                2 => run_direct_return(&exp, &haystacks),
+                2 => run_optimized(&exp, &haystacks),
                 _ => unreachable!(),
             };
 
@@ -307,7 +307,7 @@ fn eval_workload(
             match arm {
                 0 => leg_metrics.push(metric),
                 1 => v6695258_metrics.push(metric),
-                2 => dr_metrics.push(metric),
+                2 => opt_metrics.push(metric),
                 _ => unreachable!(),
             }
         }
@@ -315,14 +315,14 @@ fn eval_workload(
 
     let leg_res = analyze_arm(&leg_metrics);
     let v6695258_res = analyze_arm(&v6695258_metrics);
-    let dr_res = analyze_arm(&dr_metrics);
+    let opt_res = analyze_arm(&opt_metrics);
 
     Some(WorkloadResult {
         corpus: corpus_name.to_string(),
         mode: mode_name.to_string(),
         legacy: leg_res,
         v6695258: v6695258_res,
-        direct_return: dr_res,
+        optimized: opt_res,
     })
 }
 
@@ -330,7 +330,7 @@ fn run_all() {
     let base = "/root/smb/data";
     println!("\n# Official-Harness Benchmark on zin (15 Interleaved Rounds)");
     println!(
-        "Arms: [0] Legacy  [1] v6695258 (Initial)  [2] DirectReturn (Neat Direct-Return Form)"
+        "Arms: [0] Legacy  [1] v6695258 (Initial)  [2] Optimized (Direct-Return Linear Stream)"
     );
     println!("Rotation: 3-way cyclic order per round (0->1->2, 1->2->0, 2->0->1)\n");
 
@@ -413,39 +413,38 @@ fn run_all() {
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
         if let Some(r) = eval_workload(corpus, mode, &pat, &hay, longtext, 15) {
             println!(
-                "done. (Leg: {:.2}ms, 6695258: {:.2}ms, DirectReturn: {:.2}ms)",
-                r.legacy.med_ms, r.v6695258.med_ms, r.direct_return.med_ms
+                "done. (Leg: {:.2}ms, 6695258: {:.2}ms, Opt: {:.2}ms)",
+                r.legacy.med_ms, r.v6695258.med_ms, r.optimized.med_ms
             );
             results.push(r);
         }
     }
 
     println!("\n### 1. Wall-Clock Execution Time (ms, 15 Interleaved Rounds)");
-    println!("| Corpus | Mode | Legacy (ms) | v6695258 (ms) | DirectReturn (ms) | DR vs Leg | DR vs 6695258 |");
+    println!("| Corpus | Mode | Legacy (ms) | v6695258 (ms) | Optimized (ms) | Opt vs Leg | Opt vs 6695258 |");
     println!("|:---|:---|:---:|:---:|:---:|:---:|:---:|");
     for r in &results {
-        let dr_vs_leg = (r.direct_return.med_ms - r.legacy.med_ms) / r.legacy.med_ms * 100.0;
-        let dr_vs_v = (r.direct_return.med_ms - r.v6695258.med_ms) / r.v6695258.med_ms * 100.0;
+        let opt_vs_leg = (r.optimized.med_ms - r.legacy.med_ms) / r.legacy.med_ms * 100.0;
+        let opt_vs_v = (r.optimized.med_ms - r.v6695258.med_ms) / r.v6695258.med_ms * 100.0;
         println!(
             "| {:<12} | {:<9} | {:8.2} | {:8.2} | {:8.2} | {:+8.2}% | {:+8.2}% |",
             r.corpus,
             r.mode,
             r.legacy.med_ms,
             r.v6695258.med_ms,
-            r.direct_return.med_ms,
-            dr_vs_leg,
-            dr_vs_v
+            r.optimized.med_ms,
+            opt_vs_leg,
+            opt_vs_v
         );
     }
 
     println!("\n### 2. Hardware Instructions Retired");
-    println!("| Corpus | Mode | Legacy Instr | v6695258 Instr | DirectReturn Instr | DR vs Leg | DR vs 6695258 |");
+    println!("| Corpus | Mode | Legacy Instr | v6695258 Instr | Optimized Instr | Opt vs Leg | Opt vs 6695258 |");
     println!("|:---|:---|:---:|:---:|:---:|:---:|:---:|");
     for r in &results {
-        let dr_vs_leg = (r.direct_return.instrs as f64 - r.legacy.instrs as f64)
-            / r.legacy.instrs as f64
-            * 100.0;
-        let dr_vs_v = (r.direct_return.instrs as f64 - r.v6695258.instrs as f64)
+        let opt_vs_leg =
+            (r.optimized.instrs as f64 - r.legacy.instrs as f64) / r.legacy.instrs as f64 * 100.0;
+        let opt_vs_v = (r.optimized.instrs as f64 - r.v6695258.instrs as f64)
             / r.v6695258.instrs as f64
             * 100.0;
         println!(
@@ -454,29 +453,22 @@ fn run_all() {
             r.mode,
             r.legacy.instrs,
             r.v6695258.instrs,
-            r.direct_return.instrs,
-            dr_vs_leg,
-            dr_vs_v
+            r.optimized.instrs,
+            opt_vs_leg,
+            opt_vs_v
         );
     }
 
     println!("\n### 3. CPU Cycles (Median)");
-    println!(
-        "| Corpus | Mode | Legacy Cycles | v6695258 Cycles | DirectReturn Cycles | DR vs Leg |"
-    );
+    println!("| Corpus | Mode | Legacy Cycles | v6695258 Cycles | Optimized Cycles | Opt vs Leg |");
     println!("|:---|:---|:---:|:---:|:---:|:---:|");
     for r in &results {
-        let dr_vs_leg = (r.direct_return.med_cyc as f64 - r.legacy.med_cyc as f64)
+        let opt_vs_leg = (r.optimized.med_cyc as f64 - r.legacy.med_cyc as f64)
             / r.legacy.med_cyc as f64
             * 100.0;
         println!(
             "| {:<12} | {:<9} | {:12} | {:12} | {:12} | {:+8.2}% |",
-            r.corpus,
-            r.mode,
-            r.legacy.med_cyc,
-            r.v6695258.med_cyc,
-            r.direct_return.med_cyc,
-            dr_vs_leg
+            r.corpus, r.mode, r.legacy.med_cyc, r.v6695258.med_cyc, r.optimized.med_cyc, opt_vs_leg
         );
     }
 }
