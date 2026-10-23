@@ -720,47 +720,75 @@ unsafe fn step_child(
     None
 }
 
-/// Helper to extract emits in order: returns the single match directly in registers
-/// when there is no predecessor chain, or pushes predecessor matches to `buf` for multi-match chains.
+/// Extracts pre-committed leftmost matches along the predecessor chain in chronological order.
+///
+/// Returns the earliest match in the chain directly in CPU registers, while buffering any
+/// later matches into `buf` (which is popped LIFO on subsequent `next()` calls).
 #[inline(always)]
 fn extract_emits<V: Copy>(
     emits: &[crate::Emit<V>],
     head_pos: NonZeroU32,
-    pos: usize,
+    mut anchor: usize,
     buf: &mut alloc::vec::Vec<Match<V>>,
 ) -> Match<V> {
-    let first_emit = unsafe { emits.get_unchecked(head_pos.get() as usize - 1) };
-    let end = pos - first_emit.gap as usize;
-    let start = end - first_emit.length as usize;
-    let first_match = first_emit.to_match(end);
-
-    let Some(mut curr_ep) = first_emit.pred else {
-        return first_match;
-    };
-
-    buf.push(first_match);
-    let mut last_start = start;
+    let mut curr_ep = head_pos;
     loop {
-        let em = unsafe { emits.get_unchecked(curr_ep.get() as usize - 1) };
-        let end = last_start - em.gap as usize;
-        let start = end - em.length as usize;
-        let m = em.to_match(end);
-        if let Some(next_pred) = em.pred {
-            buf.push(m);
-            last_start = start;
-            curr_ep = next_pred;
-        } else {
+        // SAFETY: head_pos and all chained pred links are valid 1-based indices in emits.
+        let emit = unsafe { emits.get_unchecked(curr_ep.get() as usize - 1) };
+        let end = anchor - emit.gap as usize;
+        anchor = end - emit.length as usize;
+        let m = emit.to_match(end);
+        let Some(pred) = emit.pred else {
             return m;
-        }
+        };
+        buf.push(m);
+        curr_ep = pred;
     }
 }
 
-/// Dedicated iterator created by [`CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()`].
+/// Drains failure links from `state_id` at `pos`, emitting the first match if reachable,
+/// or skipping directly to `ROOT_STATE_IDX` in O(1) if no failure ancestor has an emit.
+#[inline(always)]
+fn drain_fail_chain<V: Copy>(
+    states: &[State],
+    emits: &[crate::Emit<V>],
+    buf: &mut alloc::vec::Vec<Match<V>>,
+    mut state_id: u32,
+    pos: usize,
+) -> (u32, Option<Match<V>>) {
+    while state_id != ROOT_STATE_IDX {
+        let state = unsafe { states.get_unchecked(state_id as usize) };
+        if !state.fail_has_emit() {
+            break;
+        }
+        state_id = state.fail();
+        if let Some(ep) = state.output_pos() {
+            let m = extract_emits(emits, ep, pos, buf);
+            return (state_id, Some(m));
+        }
+    }
+    (ROOT_STATE_IDX, None)
+}
+
+/// Dedicated zero-rewind streaming iterator created by [`CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()`].
 ///
-/// This iterator executes non-overlapping leftmost pattern matching using pre-committed
-/// match chains. It performs purely forward, single-pass streaming matching in guaranteed linear
-/// time `O(N)` over the input text, completely eliminating text rewinding.
-pub struct LeftmostFindIteratorExperimental<'a, P, V, const BORROW_BIT: bool = true> {
+/// This iterator executes non-overlapping leftmost pattern matching in strictly guaranteed linear time $O(N)$
+/// over the input text, completely eliminating input text backtracking and buffer re-scanning.
+///
+/// # Architecture & Acceleration Pillars
+/// 1. **Reverse Delta-Encoded Match Chains (`Emit<V>`)**:
+///    Pre-commits leftmost matches during DFA construction. Emits encode relative distances (`gap` and `length`),
+///    allowing constant-time single-pass stream matching without rewinding `pos`.
+/// 2. **Inlined Direct Register Return**:
+///    Single-match patterns (the overwhelmingly common case) bypass intermediate buffer allocations and are returned
+///    directly in CPU registers `(start, end, value)`, avoiding stack spills and pointer indirections.
+/// 3. **Deterministic Root Single-Step Hoisting**:
+///    Transitions from `ROOT_STATE_IDX` immediately step into the next character using an invariant `root_base`
+///    held in CPU registers, eliminating redundant loop re-entry overhead.
+/// 4. **Bit-31 Borrow-Bit Reachability Skips**:
+///    Unmapped characters and EOF flushes inspect `state.fail_has_emit()`. If false, failure pointer traversal is
+///    aborted immediately in $O(1)$, avoiding redundant hops to the root.
+pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
     pub(crate) haystack: P,
     pub(crate) pos: usize,
@@ -771,7 +799,7 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V, const BORROW_BIT: bool = t
     pub(crate) epsilon_cursor: usize,
 }
 
-impl<'a, P, V, const BORROW_BIT: bool> LeftmostFindIteratorExperimental<'a, P, V, BORROW_BIT>
+impl<'a, P, V> LeftmostFindIteratorExperimental<'a, P, V>
 where
     P: AsRef<str>,
     V: Copy,
@@ -789,14 +817,6 @@ where
         }
     }
 
-    #[inline(always)]
-    fn get_fail(state: &State) -> u32 {
-        if BORROW_BIT {
-            state.fail & 0x7FFF_FFFF
-        } else {
-            state.fail
-        }
-    }
 
     /// Core scanning engine that advances the automaton forward until a match is found or EOF is reached.
     #[inline(always)]
@@ -806,7 +826,11 @@ where
 
         let mut pos = self.pos;
         let mut state_id = self.state_id;
-        let states = &self.pma.states;
+        let states = self.pma.states.as_slice();
+        let emits = self.pma.emits.as_slice();
+        let mapper = &self.pma.mapper;
+        // Invariant: root base is immutable during search; hoisting it avoids reloading states[0] on root transitions.
+        let root_base = unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
 
         let mut prefilter = if FILTERED {
             self.pma.prefilter.as_ref()
@@ -833,10 +857,11 @@ where
             // SAFETY: pos < bytes.len() and pos sits on a valid character boundary.
             let (c, char_len) = unsafe { decode_char_unchecked(bytes, pos) };
 
-            if let Some(code) = self.pma.mapper.get(c) {
+            if let Some(code) = mapper.get(c) {
                 loop {
                     // SAFETY: state_id is a valid state index.
                     let state = unsafe { states.get_unchecked(state_id as usize) };
+                    // FIXME: if base is state.none, it is leaf node? possible to reach a leaf node with a new c?
                     if let Some(child_id) =
                         unsafe { step_child(states, state.base(), state_id, code) }
                     {
@@ -846,14 +871,14 @@ where
                     if state_id == ROOT_STATE_IDX {
                         break;
                     }
-                    state_id = Self::get_fail(state);
+                    state_id = state.fail();
                     if let Some(ep) = state.output_pos() {
-                        let m = extract_emits(&self.pma.emits, ep, pos, &mut self.buf);
+                        let m = extract_emits(emits, ep, pos, &mut self.buf);
+                        // FIXME: simpl explaination here
                         if state_id == ROOT_STATE_IDX {
-                            let base =
-                                unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
+                            // FIXME: question: inner branch cost? Can compiler ensure root_Base is not none?
                             self.state_id =
-                                unsafe { step_child(states, base, ROOT_STATE_IDX, code) }
+                                unsafe { step_child(states, root_base, ROOT_STATE_IDX, code) }
                                     .unwrap_or(ROOT_STATE_IDX);
                             self.pos = pos + char_len;
                         } else {
@@ -863,81 +888,67 @@ where
                         return Some(m);
                     }
                 }
-            } else if let Some(m) =
-                Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, &mut pos, char_len)
-            {
-                self.pos = pos;
-                self.state_id = state_id;
-                return Some(m);
+            } else {
+                let (next_state, m) =
+                    drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
+                if let Some(m) = m {
+                    self.pos = pos;
+                    self.state_id = next_state;
+                    return Some(m);
+                }
+                state_id = ROOT_STATE_IDX;
             }
 
             pos += char_len;
         }
 
-        if let Some(m) = Self::drain_fail_at(self.pma, &mut self.buf, &mut state_id, &mut pos, 0) {
-            self.pos = pos;
-            self.state_id = state_id;
-            return Some(m);
-        }
-
+        let (next_state, m) = drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
         self.pos = pos;
-        self.state_id = state_id;
-        None
+        self.state_id = next_state;
+        m
     }
 
-    /// Drains failure links from `*state_id` at `pos`, buffering the first state with an output,
-    /// or skipping directly to `ROOT_STATE_IDX` if no failure ancestor has an emit.
     #[inline(always)]
-    fn drain_fail_at(
-        pma: &CharwiseDoubleArrayAhoCorasick<V>,
-        buf: &mut alloc::vec::Vec<Match<V>>,
-        state_id: &mut u32,
-        pos: &mut usize,
-        char_len: usize,
-    ) -> Option<Match<V>> {
-        let states = &pma.states;
-        while *state_id != ROOT_STATE_IDX {
-            // SAFETY: *state_id is guaranteed to be a valid state index by construction.
-            let state = unsafe { states.get_unchecked(*state_id as usize) };
-            if BORROW_BIT && !state.fail_has_emit() {
-                *state_id = ROOT_STATE_IDX;
-                break;
-            }
-            *state_id = Self::get_fail(state);
-            if let Some(ep) = state.output_pos() {
-                let m = extract_emits(&pma.emits, ep, *pos, buf);
-                if *state_id == ROOT_STATE_IDX {
-                    *pos += char_len;
-                }
+    fn find_next(&mut self) -> Option<Match<V>> {
+        if self.pma.prefilter.is_some() && self.gate.is_enabled() {
+            self.find_next_match::<true>()
+        } else {
+            self.find_next_match::<false>()
+        }
+    }
+}
+
+impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
+where
+    P: AsRef<str>,
+    V: Copy,
+{
+    type Item = Match<V>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        // 1. Fast path for regular dictionary matching (when empty pattern "" is absent):
+        let Some(ep) = self.epsilon_emit_pos else {
+            if let Some(m) = self.buf.pop() {
                 return Some(m);
             }
-        }
-        None
-    }
+            return self.find_next();
+        };
 
-    /// Isolated handler for empty pattern ("") interleaving when present in the automaton.
-    #[inline(never)]
-    fn next_with_epsilon(&mut self) -> Option<Match<V>> {
-        let ep = self.epsilon_emit_pos?;
-        let epsilon = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
-
+        // 2. Interleave zero-length matches ("") into unconsumed text gaps at the end of next():
         if self.buf.is_empty() {
-            let next_m = if self.pma.prefilter.is_some() && self.gate.is_enabled() {
-                self.find_next_match::<true>()
-            } else {
-                self.find_next_match::<false>()
-            };
-            if let Some(m) = next_m {
+            if let Some(m) = self.find_next() {
                 self.buf.push(m);
             }
         }
 
         let bytes = self.haystack.as_ref().as_bytes();
+        let target = self.buf.last().map_or(bytes.len(), |m| m.start());
+        let epsilon = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
+
         debug_assert_eq!(epsilon.length, 0);
         debug_assert_eq!(epsilon.gap, 0);
         debug_assert!(epsilon.pred.is_none());
-
-        let target = self.buf.last().map_or(bytes.len(), |m| m.start());
 
         if self.epsilon_cursor < target {
             let cursor = self.epsilon_cursor;
@@ -966,298 +977,7 @@ where
     }
 }
 
-impl<P, V, const BORROW_BIT: bool> Iterator for LeftmostFindIteratorExperimental<'_, P, V, BORROW_BIT>
-where
-    P: AsRef<str>,
-    V: Copy,
-{
-    type Item = Match<V>;
 
-    #[inline(always)]
-    fn next(&mut self) -> Option<Self::Item> {
-        // 1. Delegate to epsilon engine if the empty pattern "" is present in patterns
-        if self.epsilon_emit_pos.is_some() {
-            return self.next_with_epsilon();
-        }
-
-        // 2. Drain pending matches from an emit chain
-        if let Some(m) = self.buf.pop() {
-            return Some(m);
-        }
-
-        // 3. Fast streaming scan returning matches directly
-        if self.pma.prefilter.is_some() && self.gate.is_enabled() {
-            self.find_next_match::<true>()
-        } else {
-            self.find_next_match::<false>()
-        }
-    }
-}
-
-const UNMAPPED_CODE: u32 = 0x00FF_FFFF;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub(crate) struct Token(pub(crate) u32);
-
-impl Token {
-    #[inline(always)]
-    pub(crate) const fn empty() -> Self {
-        Self(0)
-    }
-
-    #[inline(always)]
-    pub(crate) const fn is_valid(self) -> bool {
-        self.0 != 0
-    }
-
-    #[inline(always)]
-    pub(crate) const fn new(code: Option<u32>, len: usize) -> Self {
-        let c = match code {
-            Some(v) => v & UNMAPPED_CODE,
-            None => UNMAPPED_CODE,
-        };
-        Self(((len as u32) << 24) | c)
-    }
-
-    #[inline(always)]
-    pub(crate) const fn code(self) -> Option<u32> {
-        let c = self.0 & UNMAPPED_CODE;
-        if c != UNMAPPED_CODE {
-            Some(c)
-        } else {
-            None
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) const fn len(self) -> usize {
-        (self.0 >> 24) as usize
-    }
-}
-
-#[doc(hidden)]
-pub struct LeftmostFindIteratorGeneric<
-    'a,
-    P,
-    V,
-    const DIRECT_RET: bool,
-    const ROOT_STEP: bool,
-    const TOKEN_CACHE: bool,
-> {
-    pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
-    pub(crate) haystack: P,
-    pub(crate) pos: usize,
-    pub(crate) state_id: u32,
-    pub(crate) buf: alloc::vec::Vec<Match<V>>,
-    pub(crate) gate: PrefilterGate,
-    pub(crate) cached_token: Token,
-}
-
-impl<'a, P, V, const DIRECT_RET: bool, const ROOT_STEP: bool, const TOKEN_CACHE: bool>
-    LeftmostFindIteratorGeneric<'a, P, V, DIRECT_RET, ROOT_STEP, TOKEN_CACHE>
-where
-    P: AsRef<str>,
-    V: Copy,
-{
-    pub(crate) fn new(pma: &'a CharwiseDoubleArrayAhoCorasick<V>, haystack: P) -> Self {
-        Self {
-            pma,
-            haystack,
-            pos: 0,
-            state_id: ROOT_STATE_IDX,
-            buf: alloc::vec::Vec::new(),
-            gate: PrefilterGate::new(),
-            cached_token: Token::empty(),
-        }
-    }
-
-    #[inline(always)]
-    fn emit_match(&mut self, ep: NonZeroU32, pos: usize) -> Match<V> {
-        if DIRECT_RET {
-            extract_emits(&self.pma.emits, ep, pos, &mut self.buf)
-        } else {
-            self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
-            self.buf.pop().unwrap()
-        }
-    }
-
-    #[inline(always)]
-    fn find_next_match<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
-        let haystack = self.haystack.as_ref();
-        let bytes = haystack.as_bytes();
-        let mut pos = self.pos;
-        let mut state_id = self.state_id;
-        let states = &self.pma.states;
-
-        if TOKEN_CACHE && self.cached_token.is_valid() {
-            let token = self.cached_token;
-            self.cached_token = Token::empty();
-            let char_len = token.len();
-
-            if let Some(code) = token.code() {
-                loop {
-                    let state = unsafe { states.get_unchecked(state_id as usize) };
-                    if let Some(child_id) =
-                        unsafe { step_child(states, state.base(), state_id, code) }
-                    {
-                        state_id = child_id;
-                        break;
-                    }
-                    if state_id == ROOT_STATE_IDX {
-                        break;
-                    }
-                    state_id = state.fail();
-                    if let Some(ep) = state.output_pos() {
-                        let m = self.emit_match(ep, pos);
-                        if ROOT_STEP && state_id == ROOT_STATE_IDX {
-                            let base =
-                                unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
-                            self.state_id =
-                                unsafe { step_child(states, base, ROOT_STATE_IDX, code) }
-                                    .unwrap_or(ROOT_STATE_IDX);
-                            self.pos = pos + char_len;
-                        } else {
-                            if TOKEN_CACHE && state_id != ROOT_STATE_IDX {
-                                self.cached_token = Token::new(Some(code), char_len);
-                            }
-                            self.state_id = state_id;
-                            self.pos = pos;
-                        }
-                        return Some(m);
-                    }
-                }
-            } else {
-                while state_id != ROOT_STATE_IDX {
-                    let state = unsafe { states.get_unchecked(state_id as usize) };
-                    state_id = state.fail();
-                    if let Some(ep) = state.output_pos() {
-                        let m = self.emit_match(ep, pos);
-                        if TOKEN_CACHE && state_id != ROOT_STATE_IDX {
-                            self.cached_token = Token::new(None, char_len);
-                        }
-                        self.pos = pos;
-                        self.state_id = state_id;
-                        return Some(m);
-                    }
-                }
-            }
-            pos += char_len;
-        }
-
-        let mut prefilter = if FILTERED {
-            self.pma.prefilter.as_ref()
-        } else {
-            None
-        };
-
-        while pos < bytes.len() {
-            if let Some(pf) = prefilter {
-                if state_id == ROOT_STATE_IDX {
-                    let candidate_pos = pf.next_position_at_char_boundary(haystack, pos);
-                    self.gate.record(candidate_pos - pos);
-                    pos = candidate_pos;
-                    if !self.gate.is_enabled() {
-                        prefilter = None;
-                    }
-                    if pos >= bytes.len() {
-                        break;
-                    }
-                }
-            }
-
-            let (c, char_len) = unsafe { decode_char_unchecked(bytes, pos) };
-
-            if let Some(code) = self.pma.mapper.get(c) {
-                loop {
-                    let state = unsafe { states.get_unchecked(state_id as usize) };
-                    if let Some(child_id) =
-                        unsafe { step_child(states, state.base(), state_id, code) }
-                    {
-                        state_id = child_id;
-                        break;
-                    }
-                    if state_id == ROOT_STATE_IDX {
-                        break;
-                    }
-                    state_id = state.fail();
-                    if let Some(ep) = state.output_pos() {
-                        let m = self.emit_match(ep, pos);
-                        if ROOT_STEP && state_id == ROOT_STATE_IDX {
-                            let base =
-                                unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
-                            self.state_id =
-                                unsafe { step_child(states, base, ROOT_STATE_IDX, code) }
-                                    .unwrap_or(ROOT_STATE_IDX);
-                            self.pos = pos + char_len;
-                        } else {
-                            if TOKEN_CACHE && state_id != ROOT_STATE_IDX {
-                                self.cached_token = Token::new(Some(code), char_len);
-                            }
-                            self.state_id = state_id;
-                            self.pos = pos;
-                        }
-                        return Some(m);
-                    }
-                }
-            } else {
-                let fail_pos = pos;
-                let mut fail_state = state_id;
-                while fail_state != ROOT_STATE_IDX {
-                    let state = unsafe { states.get_unchecked(fail_state as usize) };
-                    fail_state = state.fail();
-                    if let Some(ep) = state.output_pos() {
-                        let m = self.emit_match(ep, fail_pos);
-                        if TOKEN_CACHE && fail_state != ROOT_STATE_IDX {
-                            self.cached_token = Token::new(None, char_len);
-                        }
-                        self.pos = fail_pos;
-                        self.state_id = fail_state;
-                        return Some(m);
-                    }
-                }
-                state_id = ROOT_STATE_IDX;
-            }
-            pos += char_len;
-        }
-
-        while state_id != ROOT_STATE_IDX {
-            let state = unsafe { states.get_unchecked(state_id as usize) };
-            state_id = state.fail();
-            if let Some(ep) = state.output_pos() {
-                let m = self.emit_match(ep, pos);
-                self.state_id = state_id;
-                self.pos = pos;
-                return Some(m);
-            }
-        }
-
-        self.state_id = ROOT_STATE_IDX;
-        self.pos = pos;
-        None
-    }
-}
-
-impl<P, V, const DIRECT_RET: bool, const ROOT_STEP: bool, const TOKEN_CACHE: bool> Iterator
-    for LeftmostFindIteratorGeneric<'_, P, V, DIRECT_RET, ROOT_STEP, TOKEN_CACHE>
-where
-    P: AsRef<str>,
-    V: Copy,
-{
-    type Item = Match<V>;
-
-    #[inline(always)]
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(m) = self.buf.pop() {
-            return Some(m);
-        }
-        if self.pma.prefilter.is_some() && self.gate.is_enabled() {
-            self.find_next_match::<true>()
-        } else {
-            self.find_next_match::<false>()
-        }
-    }
-}
 
 /// Helper to extract emits in forward order as originally implemented in commit `6695258`.
 #[inline(always)]

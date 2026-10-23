@@ -17,7 +17,7 @@ use crate::charwise::iter::{
     PatternIterator,
 };
 pub use crate::charwise::iter::{
-    LeftmostFindIterator, LeftmostFindIteratorExperimental, LeftmostFindIteratorGeneric,
+    LeftmostFindIterator, LeftmostFindIteratorExperimental,
     LeftmostLongestFindIteratorV6695258,
 };
 use crate::charwise::mapper::CodeMapper;
@@ -628,7 +628,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     pub fn leftmost_find_iter_experimental<P>(
         &self,
         haystack: P,
-    ) -> LeftmostFindIteratorExperimental<'_, P, V, true>
+    ) -> LeftmostFindIteratorExperimental<'_, P, V>
     where
         P: AsRef<str>,
         V: Copy,
@@ -640,21 +640,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         LeftmostFindIteratorExperimental::new(self, haystack)
     }
 
-    #[doc(hidden)]
-    pub fn leftmost_find_iter_borrow_bit<const BORROW_BIT: bool, P>(
-        &self,
-        haystack: P,
-    ) -> LeftmostFindIteratorExperimental<'_, P, V, BORROW_BIT>
-    where
-        P: AsRef<str>,
-        V: Copy,
-    {
-        assert!(
-            self.match_kind.is_experimental(),
-            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
-        );
-        LeftmostFindIteratorExperimental::new(self, haystack)
-    }
 
     #[doc(hidden)]
     pub fn leftmost_find_iter_v6695258<P>(
@@ -672,26 +657,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         LeftmostLongestFindIteratorV6695258::new(self, haystack)
     }
 
-    #[doc(hidden)]
-    pub fn leftmost_find_iter_factorial<
-        const DIRECT_RET: bool,
-        const ROOT_STEP: bool,
-        const TOKEN_CACHE: bool,
-        P,
-    >(
-        &self,
-        haystack: P,
-    ) -> LeftmostFindIteratorGeneric<'_, P, V, DIRECT_RET, ROOT_STEP, TOKEN_CACHE>
-    where
-        P: AsRef<str>,
-        V: Copy,
-    {
-        assert!(
-            self.match_kind.is_experimental(),
-            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
-        );
-        LeftmostFindIteratorGeneric::new(self, haystack)
-    }
 
     /// Returns a stepper of non-overlapping matches that consumes characters one by one.
     ///
@@ -1108,19 +1073,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             + self.depths.len() * mem::size_of::<u32>()
     }
 
-    /// TEST-ONLY: number of emit nodes (deduped vs raw).
-    #[doc(hidden)]
-    #[must_use]
-    pub fn __test_only_emits_len(&self) -> usize {
-        self.emits.len()
-    }
-
-    /// TEST-ONLY: number of output nodes (legacy path).
-    #[doc(hidden)]
-    #[must_use]
-    pub fn __test_only_outputs_len(&self) -> usize {
-        self.outputs.len()
-    }
 
     /// Serializes the automaton into a [`Vec`].
     ///
@@ -1529,6 +1481,17 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 pub struct State {
     base: Option<NonZeroU32>,
     check: u32,
+    /// Failure transition state index and emit reachability flag.
+    ///
+    /// # Bit Layout
+    /// - `bits 0..30`: Target failure state index (`DEAD_STATE_IDX`, `ROOT_STATE_IDX`, or a valid index `<= 0x7FFF_FFFF`).
+    /// - `bit 31` (borrow bit): Reachability flag (`fail_has_emit`).
+    ///   - `1`: Indicates that this state or at least one ancestor along its failure chain has a pattern emit (`output_pos.is_some()`).
+    ///   - `0`: Guaranteed that neither this state nor any of its failure ancestors has an emit.
+    ///
+    /// This bit packing allows the zero-rewind leftmost matching engine to immediately terminate unmapped character
+    /// loops and EOF flushes in `O(1)` without traversing failure pointers up to `ROOT_STATE_IDX`, while keeping
+    /// `State` at exactly 16 bytes (preserving 4 states per 64-byte cache line).
     fail: u32,
     /// 1-based index pointing to the head of the output/emit chain.
     ///
@@ -1562,11 +1525,13 @@ impl State {
         self.check
     }
 
+    /// Returns the target failure state index with the reachability flag (bit 31) masked out.
     #[inline(always)]
     pub const fn fail(&self) -> u32 {
         self.fail & 0x7FFF_FFFF
     }
 
+    /// Returns `true` if this state or any ancestor along its failure chain has a match emit.
     #[inline(always)]
     pub const fn fail_has_emit(&self) -> bool {
         (self.fail & 0x8000_0000) != 0

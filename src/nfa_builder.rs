@@ -70,7 +70,6 @@ pub struct NfaBuilder<L, V> {
     pub(crate) emits: Vec<Emit<V>>,     // emits for leftmost-longest matching.
     pub(crate) len: usize,
     pub(crate) match_kind: MatchKind,
-    pub(crate) use_borrow_bit: bool,
 }
 
 impl<L, V> NfaBuilder<L, V>
@@ -88,13 +87,7 @@ where
             emits: vec![],
             len: 0,
             match_kind,
-            use_borrow_bit: false,
         }
-    }
-
-    pub(crate) fn use_borrow_bit(mut self, yes: bool) -> Self {
-        self.use_borrow_bit = yes;
-        self
     }
 
     #[inline(always)]
@@ -117,6 +110,9 @@ where
             if let Some(next_state_id) = self.child_id(state_id, c) {
                 state_id = next_state_id;
             } else if let Ok(next_state_id) = u32::try_from(self.states.len()) {
+                if self.match_kind.is_experimental() && next_state_id > 0x7FFF_FFFF {
+                    return Err(DaachorseError::automaton_scale("state_id", 0x7FFF_FFFF));
+                }
                 self.states[usize::from_u32(state_id)]
                     .edges
                     .insert(c, next_state_id);
@@ -328,15 +324,6 @@ where
     ///   3. **Head Gap Expansion**:
     ///      If no new matches were cons'd, the parent's head match gap simply expands by `|c|` bytes.
     pub(crate) fn build_fails_and_emits_leftmost_experimental(&mut self) {
-        self.build_fails_and_emits_leftmost_experimental_inner(true);
-    }
-
-    /// TEST-ONLY: same as above but with dedup disabled (always pushes).
-    pub(crate) fn build_fails_and_emits_leftmost_experimental_no_dedup(&mut self) {
-        self.build_fails_and_emits_leftmost_experimental_inner(false);
-    }
-
-    pub(crate) fn build_fails_and_emits_leftmost_experimental_inner(&mut self, use_dedup: bool) {
         let num_states = self.states.len();
         let mut q = Vec::with_capacity(num_states);
         let mut parents = vec![ROOT_STATE_ID; num_states];
@@ -363,7 +350,7 @@ where
         }
 
         // Construction-time store for deduplicating and indexing emit nodes.
-        let mut store = EmitStore::with_capacity_and_dedup(q.len(), use_dedup);
+        let mut store = EmitStore::with_capacity(q.len());
 
         // If ROOT has an output (empty pattern ""), register its emit node.
         if let Some(&pat) = self.states[usize::from_u32(ROOT_STATE_ID)].output.first() {
@@ -463,8 +450,9 @@ where
             self.states[state_id as usize].fail.set(fail_state);
         }
 
-        // Stage 3: Compute reachability to emits along the fail chain (has_emit DP) if borrow bit is requested.
-        if self.use_borrow_bit {
+        // Stage 3: Compute reachability to emits along the fail chain (has_emit DP)
+        // to populate bit 31 (borrow bit) for O(1) failure chain skips.
+        {
             let mut has_emit = alloc::vec![false; self.states.len()];
             if self.states[ROOT_STATE_ID as usize]
                 .output_pos
@@ -790,34 +778,19 @@ struct DedupKey {
 /// recorded on every insert (even with dedup disabled) so ancestor lookups work.
 /// Hash-consing keys never touches `V`, hence only `V: Copy` is required.
 ///
-/// TEST-ONLY: `use_dedup=false` disables hash-consing (always pushes) so benchmarks
-/// can compare emits count / conversion speed with and without dedup.
 struct EmitStore<V> {
     emits: Vec<Emit<V>>,
     keys: Vec<DedupKey>,
     dedup: EmitDedup,
-    use_dedup: bool,
 }
 
 impl<V: Copy> EmitStore<V> {
     /// Creates an empty store with initial capacity.
-    #[allow(dead_code)]
     fn with_capacity(cap: usize) -> Self {
         Self {
             emits: Vec::with_capacity(cap),
             keys: Vec::with_capacity(cap),
             dedup: EmitDedup::with_capacity(cap),
-            use_dedup: true,
-        }
-    }
-
-    /// TEST-ONLY: creates a store with dedup explicitly enabled/disabled.
-    fn with_capacity_and_dedup(cap: usize, use_dedup: bool) -> Self {
-        Self {
-            emits: Vec::with_capacity(cap),
-            keys: Vec::with_capacity(cap),
-            dedup: EmitDedup::with_capacity(cap),
-            use_dedup,
         }
     }
 
@@ -836,20 +809,14 @@ impl<V: Copy> EmitStore<V> {
     /// Inserts an [`Emit`] node with deduplication, returning its canonical 1-based index.
     #[inline(always)]
     fn insert(&mut self, emit: Emit<V>, key: DedupKey) -> NonZeroU32 {
-        if self.use_dedup {
-            if let Some(pos) = self.dedup.get(&key) {
-                return pos;
-            }
-            self.emits.push(emit);
-            self.keys.push(key);
-            let pos = NonZeroU32::new(u32::try_from(self.emits.len()).unwrap()).unwrap();
-            self.dedup.insert(key, pos);
-            pos
-        } else {
-            self.emits.push(emit);
-            self.keys.push(key);
-            NonZeroU32::new(u32::try_from(self.emits.len()).unwrap()).unwrap()
+        if let Some(pos) = self.dedup.get(&key) {
+            return pos;
         }
+        self.emits.push(emit);
+        self.keys.push(key);
+        let pos = NonZeroU32::new(u32::try_from(self.emits.len()).unwrap()).unwrap();
+        self.dedup.insert(key, pos);
+        pos
     }
 
     /// Returns an iterator over matches along a chain from head to tail.

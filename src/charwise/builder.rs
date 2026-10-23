@@ -20,9 +20,6 @@ pub struct CharwiseDoubleArrayAhoCorasickBuilder {
     match_kind: MatchKind,
     corpus: Vec<String>,
     use_prefilter: bool,
-    use_borrow_bit: bool,
-    /// TEST-ONLY: disable emit dedup for experimental builds.
-    test_no_dedup: bool,
 }
 
 impl Default for CharwiseDoubleArrayAhoCorasickBuilder {
@@ -62,25 +59,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
             match_kind: MatchKind::Standard,
             corpus: vec![],
             use_prefilter: true,
-            use_borrow_bit: true,
-            test_no_dedup: false,
         }
-    }
-
-    /// TEST-ONLY: enable/disable borrowing bit 31 of fail for failure chain emit skip.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn use_borrow_bit(mut self, yes: bool) -> Self {
-        self.use_borrow_bit = yes;
-        self
-    }
-
-    /// TEST-ONLY: disable emit dedup for experimental leftmost builds.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn __test_no_dedup(mut self, yes: bool) -> Self {
-        self.test_no_dedup = yes;
-        self
     }
 
     /// Specifies [`MatchKind`] to build.
@@ -305,7 +284,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
         P: AsRef<str>,
         V: Copy,
     {
-        let mut nfa = CharwiseNfaBuilder::new(self.match_kind).use_borrow_bit(self.use_borrow_bit);
+        let mut nfa = CharwiseNfaBuilder::new(self.match_kind);
         let mut prefilter_builder = self.use_prefilter.then(PrefilterBuilder::new);
         let mut freqs = vec![];
         {
@@ -335,11 +314,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
                 nfa.build_outputs(&nfa.build_fails_leftmost())
             }
             MatchKind::LeftmostLongestExperimental | MatchKind::LeftmostFirstExperimental => {
-                if self.test_no_dedup {
-                    nfa.build_fails_and_emits_leftmost_experimental_no_dedup()
-                } else {
-                    nfa.build_fails_and_emits_leftmost_experimental()
-                }
+                nfa.build_fails_and_emits_leftmost_experimental()
             }
         };
         Ok((nfa, prefilter_builder.and_then(PrefilterBuilder::build)))
@@ -377,6 +352,10 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
         let groups = nfa.sibling_groups(profile, |c| self.mapper.get(c).unwrap());
         let helper = BuildHelper::new(&groups, nfa.states.len(), block_len, false)?;
 
+        if self.match_kind.is_experimental() && helper.num_elements() > 0x7FFF_FFFF {
+            return Err(DaachorseError::automaton_scale("states.len()", 0x7FFF_FFFF));
+        }
+
         self.states
             .resize(usize::from_u32(helper.num_elements()), State::default());
         for group in &groups {
@@ -410,7 +389,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
             self.states[idx].set_output_pos(s.output_pos.get());
 
             let raw_fail = s.fail.get();
-            let (emit_bit, fail_id) = if self.use_borrow_bit {
+            let (emit_bit, fail_id) = if self.match_kind.is_experimental() {
                 (raw_fail & 0x8000_0000, raw_fail & 0x7FFF_FFFF)
             } else {
                 (0, raw_fail)
