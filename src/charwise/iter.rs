@@ -890,10 +890,6 @@ where
         while *state_id != ROOT_STATE_IDX {
             // SAFETY: *state_id is guaranteed to be a valid state index by construction.
             let state = unsafe { states.get_unchecked(*state_id as usize) };
-            if !state.fail_has_emit() {
-                *state_id = ROOT_STATE_IDX;
-                break;
-            }
             *state_id = state.fail();
             if let Some(ep) = state.output_pos() {
                 let m = extract_emits(&pma.emits, ep, *pos, buf);
@@ -977,6 +973,271 @@ where
         }
 
         // 3. Fast streaming scan returning matches directly
+        if self.pma.prefilter.is_some() && self.gate.is_enabled() {
+            self.find_next_match::<true>()
+        } else {
+            self.find_next_match::<false>()
+        }
+    }
+}
+
+const UNMAPPED_CODE: u32 = 0x00FF_FFFF;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct Token(pub(crate) u32);
+
+impl Token {
+    #[inline(always)]
+    pub(crate) const fn empty() -> Self {
+        Self(0)
+    }
+
+    #[inline(always)]
+    pub(crate) const fn is_valid(self) -> bool {
+        self.0 != 0
+    }
+
+    #[inline(always)]
+    pub(crate) const fn new(code: Option<u32>, len: usize) -> Self {
+        let c = match code {
+            Some(v) => v & UNMAPPED_CODE,
+            None => UNMAPPED_CODE,
+        };
+        Self(((len as u32) << 24) | c)
+    }
+
+    #[inline(always)]
+    pub(crate) const fn code(self) -> Option<u32> {
+        let c = self.0 & UNMAPPED_CODE;
+        if c != UNMAPPED_CODE {
+            Some(c)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) const fn len(self) -> usize {
+        (self.0 >> 24) as usize
+    }
+}
+
+#[doc(hidden)]
+pub struct LeftmostFindIteratorGeneric<
+    'a,
+    P,
+    V,
+    const DIRECT_RET: bool,
+    const ROOT_STEP: bool,
+    const TOKEN_CACHE: bool,
+> {
+    pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
+    pub(crate) haystack: P,
+    pub(crate) pos: usize,
+    pub(crate) state_id: u32,
+    pub(crate) buf: alloc::vec::Vec<Match<V>>,
+    pub(crate) gate: PrefilterGate,
+    pub(crate) cached_token: Token,
+}
+
+impl<'a, P, V, const DIRECT_RET: bool, const ROOT_STEP: bool, const TOKEN_CACHE: bool>
+    LeftmostFindIteratorGeneric<'a, P, V, DIRECT_RET, ROOT_STEP, TOKEN_CACHE>
+where
+    P: AsRef<str>,
+    V: Copy,
+{
+    pub(crate) fn new(pma: &'a CharwiseDoubleArrayAhoCorasick<V>, haystack: P) -> Self {
+        Self {
+            pma,
+            haystack,
+            pos: 0,
+            state_id: ROOT_STATE_IDX,
+            buf: alloc::vec::Vec::new(),
+            gate: PrefilterGate::new(),
+            cached_token: Token::empty(),
+        }
+    }
+
+    #[inline(always)]
+    fn emit_match(&mut self, ep: NonZeroU32, pos: usize) -> Match<V> {
+        if DIRECT_RET {
+            extract_emits(&self.pma.emits, ep, pos, &mut self.buf)
+        } else {
+            self.buf.extend(unsafe { self.pma.iter_emits(ep, pos) });
+            self.buf.pop().unwrap()
+        }
+    }
+
+    #[inline(always)]
+    fn find_next_match<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
+        let haystack = self.haystack.as_ref();
+        let bytes = haystack.as_bytes();
+        let mut pos = self.pos;
+        let mut state_id = self.state_id;
+        let states = &self.pma.states;
+
+        if TOKEN_CACHE && self.cached_token.is_valid() {
+            let token = self.cached_token;
+            self.cached_token = Token::empty();
+            let char_len = token.len();
+
+            if let Some(code) = token.code() {
+                loop {
+                    let state = unsafe { states.get_unchecked(state_id as usize) };
+                    if let Some(child_id) =
+                        unsafe { step_child(states, state.base(), state_id, code) }
+                    {
+                        state_id = child_id;
+                        break;
+                    }
+                    if state_id == ROOT_STATE_IDX {
+                        break;
+                    }
+                    state_id = state.fail();
+                    if let Some(ep) = state.output_pos() {
+                        let m = self.emit_match(ep, pos);
+                        if ROOT_STEP && state_id == ROOT_STATE_IDX {
+                            let base =
+                                unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
+                            self.state_id =
+                                unsafe { step_child(states, base, ROOT_STATE_IDX, code) }
+                                    .unwrap_or(ROOT_STATE_IDX);
+                            self.pos = pos + char_len;
+                        } else {
+                            if TOKEN_CACHE && state_id != ROOT_STATE_IDX {
+                                self.cached_token = Token::new(Some(code), char_len);
+                            }
+                            self.state_id = state_id;
+                            self.pos = pos;
+                        }
+                        return Some(m);
+                    }
+                }
+            } else {
+                while state_id != ROOT_STATE_IDX {
+                    let state = unsafe { states.get_unchecked(state_id as usize) };
+                    state_id = state.fail();
+                    if let Some(ep) = state.output_pos() {
+                        let m = self.emit_match(ep, pos);
+                        if TOKEN_CACHE && state_id != ROOT_STATE_IDX {
+                            self.cached_token = Token::new(None, char_len);
+                        }
+                        self.pos = pos;
+                        self.state_id = state_id;
+                        return Some(m);
+                    }
+                }
+            }
+            pos += char_len;
+        }
+
+        let mut prefilter = if FILTERED {
+            self.pma.prefilter.as_ref()
+        } else {
+            None
+        };
+
+        while pos < bytes.len() {
+            if let Some(pf) = prefilter {
+                if state_id == ROOT_STATE_IDX {
+                    let candidate_pos = pf.next_position_at_char_boundary(haystack, pos);
+                    self.gate.record(candidate_pos - pos);
+                    pos = candidate_pos;
+                    if !self.gate.is_enabled() {
+                        prefilter = None;
+                    }
+                    if pos >= bytes.len() {
+                        break;
+                    }
+                }
+            }
+
+            let (c, char_len) = unsafe { decode_char_unchecked(bytes, pos) };
+
+            if let Some(code) = self.pma.mapper.get(c) {
+                loop {
+                    let state = unsafe { states.get_unchecked(state_id as usize) };
+                    if let Some(child_id) =
+                        unsafe { step_child(states, state.base(), state_id, code) }
+                    {
+                        state_id = child_id;
+                        break;
+                    }
+                    if state_id == ROOT_STATE_IDX {
+                        break;
+                    }
+                    state_id = state.fail();
+                    if let Some(ep) = state.output_pos() {
+                        let m = self.emit_match(ep, pos);
+                        if ROOT_STEP && state_id == ROOT_STATE_IDX {
+                            let base =
+                                unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
+                            self.state_id =
+                                unsafe { step_child(states, base, ROOT_STATE_IDX, code) }
+                                    .unwrap_or(ROOT_STATE_IDX);
+                            self.pos = pos + char_len;
+                        } else {
+                            if TOKEN_CACHE && state_id != ROOT_STATE_IDX {
+                                self.cached_token = Token::new(Some(code), char_len);
+                            }
+                            self.state_id = state_id;
+                            self.pos = pos;
+                        }
+                        return Some(m);
+                    }
+                }
+            } else {
+                let fail_pos = pos;
+                let mut fail_state = state_id;
+                while fail_state != ROOT_STATE_IDX {
+                    let state = unsafe { states.get_unchecked(fail_state as usize) };
+                    fail_state = state.fail();
+                    if let Some(ep) = state.output_pos() {
+                        let m = self.emit_match(ep, fail_pos);
+                        if TOKEN_CACHE && fail_state != ROOT_STATE_IDX {
+                            self.cached_token = Token::new(None, char_len);
+                        }
+                        self.pos = fail_pos;
+                        self.state_id = fail_state;
+                        return Some(m);
+                    }
+                }
+                state_id = ROOT_STATE_IDX;
+            }
+            pos += char_len;
+        }
+
+        while state_id != ROOT_STATE_IDX {
+            let state = unsafe { states.get_unchecked(state_id as usize) };
+            state_id = state.fail();
+            if let Some(ep) = state.output_pos() {
+                let m = self.emit_match(ep, pos);
+                self.state_id = state_id;
+                self.pos = pos;
+                return Some(m);
+            }
+        }
+
+        self.state_id = ROOT_STATE_IDX;
+        self.pos = pos;
+        None
+    }
+}
+
+impl<P, V, const DIRECT_RET: bool, const ROOT_STEP: bool, const TOKEN_CACHE: bool> Iterator
+    for LeftmostFindIteratorGeneric<'_, P, V, DIRECT_RET, ROOT_STEP, TOKEN_CACHE>
+where
+    P: AsRef<str>,
+    V: Copy,
+{
+    type Item = Match<V>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(m) = self.buf.pop() {
+            return Some(m);
+        }
         if self.pma.prefilter.is_some() && self.gate.is_enabled() {
             self.find_next_match::<true>()
         } else {

@@ -457,29 +457,6 @@ where
         }
 
         // Stage 3: Compute reachability to emits along the fail chain (has_emit DP).
-        // Since `q` is topologically ordered by state depth, any proper suffix `fail(u)`
-        // has depth strictly less than `u` and was processed earlier in `q`.
-        let mut has_emit = alloc::vec![false; self.states.len()];
-        if self.states[ROOT_STATE_ID as usize]
-            .output_pos
-            .get()
-            .is_some()
-        {
-            has_emit[ROOT_STATE_ID as usize] = true;
-        }
-        for &state_id in &q[1..] {
-            let u = state_id as usize;
-            let fail_id = self.states[u].fail.get() as usize;
-            if self.states[u].output_pos.get().is_some() || has_emit[fail_id] {
-                has_emit[u] = true;
-            }
-        }
-        for (i, state) in self.states.iter().enumerate() {
-            if has_emit[i] {
-                state.fail.set(state.fail.get() | 0x8000_0000);
-            }
-        }
-
         self.emits = store.into_emits();
     }
 }
