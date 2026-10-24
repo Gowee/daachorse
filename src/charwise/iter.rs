@@ -981,29 +981,37 @@ where
                 // meaning no pattern in the dictionary can transition on or extend through `c`.
                 //
                 // Any active in-flight match chains must be flushed before advancing past `c`.
-                // `drain_fail_chain` inspects bit 31 (`fail_has_emit`) to skip non-emitting failure
-                // chains in O(1).
-                let (next_state, m) =
-                    drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
-                if let Some(m) = m {
-                    // Match found in the active suffix. Retain `self.pos = pos` so that any additional
-                    // matches along deeper failure links can be drained on subsequent calls.
-                    self.pos = pos;
-                    self.state_id = next_state;
-                    return Some(m);
+                // If sitting at ROOT_STATE_IDX, there are no active suffixes to drain, skipping immediately.
+                // Otherwise, `drain_fail_chain` inspects bit 31 (`fail_has_emit`) to skip non-emitting
+                // failure chains in O(1).
+                if state_id != ROOT_STATE_IDX {
+                    let (next_state, m) =
+                        drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
+                    if let Some(m) = m {
+                        // Match found in the active suffix. Retain `self.pos = pos` so that any additional
+                        // matches along deeper failure links can be drained on subsequent calls.
+                        self.pos = pos;
+                        self.state_id = next_state;
+                        return Some(m);
+                    }
+                    // All pending failure matches drained; reset to ROOT to consume `c`.
+                    state_id = ROOT_STATE_IDX;
                 }
-                // All pending failure matches drained; reset to ROOT to consume `c`.
-                state_id = ROOT_STATE_IDX;
             }
 
             pos += char_len;
         }
 
         // Text boundary reached (EOF). Drain any remaining matches residing in trailing active suffixes.
-        let (next_state, m) = drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
+        if state_id != ROOT_STATE_IDX {
+            let (next_state, m) = drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
+            self.pos = pos;
+            self.state_id = next_state;
+            return m;
+        }
         self.pos = pos;
-        self.state_id = next_state;
-        m
+        self.state_id = ROOT_STATE_IDX;
+        None
     }
 
     #[inline(always)]
