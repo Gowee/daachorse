@@ -884,12 +884,14 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 
     /// Returns a reference to the internal code mapper.
     #[inline(always)]
+    #[doc(hidden)]
     pub fn mapper(&self) -> &CodeMapper {
         &self.mapper
     }
 
     /// Returns a slice of the internal double-array states.
     #[inline(always)]
+    #[doc(hidden)]
     pub fn states(&self) -> &[State] {
         &self.states
     }

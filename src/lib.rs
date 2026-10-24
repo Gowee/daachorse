@@ -347,9 +347,9 @@ where
     }
 }
 
-/// An output node used in leftmost-longest matching with gap chaining.
+/// An output node used in zero-rewind leftmost matching with gap chaining.
 ///
-/// In zero-rewind leftmost-longest matching, each state commits a sequence of non-overlapping
+/// In zero-rewind leftmost matching, each state commits a sequence of non-overlapping
 /// matches `[M_1, M_2, ..., M_k]`. These matches are linked in reverse chronological order
 /// (`M_k -> M_{k-1} -> ... -> M_1`) via `pred`.
 ///
