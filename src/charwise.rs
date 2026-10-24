@@ -1217,7 +1217,12 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
                     return Err(DaachorseError::invalid_automaton());
                 }
             };
-            if usize::from_u32(state.fail()) >= states_len {
+            let fail_id = if pma.match_kind.is_experimental() {
+                state.fail() & 0x7FFF_FFFF
+            } else {
+                state.fail()
+            };
+            if usize::from_u32(fail_id) >= states_len {
                 return Err(DaachorseError::invalid_automaton());
             }
             if let Some(output_pos) = state.output_pos() {
@@ -1485,17 +1490,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 pub struct State {
     base: Option<NonZeroU32>,
     check: u32,
-    /// Failure transition state index and emit reachability flag.
-    ///
-    /// # Bit Layout
-    /// - `bits 0..30`: Target failure state index (`DEAD_STATE_IDX`, `ROOT_STATE_IDX`, or a valid index `<= 0x7FFF_FFFF`).
-    /// - `bit 31` (borrow bit): Reachability flag (`fail_has_emit`).
-    ///   - `1`: Indicates that this state or at least one ancestor along its failure chain has a pattern emit (`output_pos.is_some()`).
-    ///   - `0`: Guaranteed that neither this state nor any of its failure ancestors has an emit.
-    ///
-    /// This bit packing allows the zero-rewind leftmost matching engine to immediately terminate unmapped character
-    /// loops and EOF flushes in `O(1)` without traversing failure pointers up to `ROOT_STATE_IDX`, while keeping
-    /// `State` at exactly 16 bytes (preserving 4 states per 64-byte cache line).
+    /// Failure transition state index.
     fail: u32,
     /// 1-based index pointing to the head of the output/emit chain.
     ///
@@ -1529,16 +1524,10 @@ impl State {
         self.check
     }
 
-    /// Returns the target failure state index with the reachability flag (bit 31) masked out.
+    /// Returns the target failure state index.
     #[inline(always)]
     pub const fn fail(&self) -> u32 {
-        self.fail & 0x7FFF_FFFF
-    }
-
-    /// Returns `true` if this state or any ancestor along its failure chain has a match emit.
-    #[inline(always)]
-    pub const fn fail_has_emit(&self) -> bool {
-        (self.fail & 0x8000_0000) != 0
+        self.fail
     }
 
     #[inline(always)]

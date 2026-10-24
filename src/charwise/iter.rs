@@ -722,7 +722,7 @@ where
 ///    Transitions from `ROOT_STATE_IDX` immediately step into the next character using `step_root`,
 ///    which accesses the root base to advance in the same cycle without re-entering the matching loop.
 /// 4. **Bit-31 Borrow-Bit Reachability Skips**:
-///    Unmapped characters and EOF flushes inspect `state.fail_has_emit()`. If false, failure pointer traversal is
+///    Unmapped characters and EOF flushes inspect `Self::fail_has_emit(state)`. If false, failure pointer traversal is
 ///    aborted immediately in $O(1)$, avoiding redundant hops to the root.
 pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
@@ -740,6 +740,21 @@ where
     P: AsRef<str>,
     V: Copy,
 {
+    const FAIL_STATE_MASK: u32 = 0x7FFF_FFFF;
+    const FAIL_HAS_EMIT_BIT: u32 = 0x8000_0000;
+
+    /// Returns the target failure state index with the reachability flag (bit 31) masked out.
+    #[inline(always)]
+    const fn fail_id(state: &State) -> u32 {
+        state.fail() & Self::FAIL_STATE_MASK
+    }
+
+    /// Returns `true` if this state or any ancestor along its failure chain has a match emit.
+    #[inline(always)]
+    const fn fail_has_emit(state: &State) -> bool {
+        (state.fail() & Self::FAIL_HAS_EMIT_BIT) != 0
+    }
+
     pub(crate) fn new(pma: &'a CharwiseDoubleArrayAhoCorasick<V>, haystack: P) -> Self {
         // Invariant: if root has no base, the trie has 0 character edges (either empty pattern set
         // or only ""). Setting pos = len skips the character scanning engine entirely while preserving
@@ -848,7 +863,7 @@ where
                         // Break from the inner transition loop so the outer loop advances to the next character.
                         break;
                     }
-                    state_id = state.fail();
+                    state_id = Self::fail_id(state);
                     if let Some(ep) = state.output_pos() {
                         // Mismatch occurred at `state`, but this path carries pre-committed matches (`ep`)
                         // that occurred *before* the active suffix `state.fail()`.
@@ -993,9 +1008,10 @@ where
     ///
     /// # Fast O(1) Skip via Borrow Bit (Bit 31)
     ///
-    /// During automaton construction, bit 31 of each state's `fail` field (`fail_has_emit`) is set
-    /// to 1 if and only if that state or any ancestor along its failure chain has an emit (`output_pos.is_some()`).
-    /// If `!state.fail_has_emit()`, this function aborts the traversal immediately in O(1) without
+    /// During automaton construction, bit 31 of each state's `fail` field is borrowed as an emit
+    /// reachability flag set to 1 if and only if that state or any ancestor along its failure chain
+    /// has an emit (`output_pos.is_some()`).
+    /// If `!Self::fail_has_emit(state)`, this function aborts the traversal immediately in O(1) without
     /// hopping through failure pointers, returning `(ROOT_STATE_IDX, None)`.
     ///
     /// # Arguments
@@ -1021,10 +1037,10 @@ where
     ) -> (u32, Option<Match<V>>) {
         while state_id != ROOT_STATE_IDX {
             let state = unsafe { states.get_unchecked(state_id as usize) };
-            if !state.fail_has_emit() {
+            if !Self::fail_has_emit(state) {
                 break;
             }
-            state_id = state.fail();
+            state_id = Self::fail_id(state);
             if let Some(ep) = state.output_pos() {
                 let m = Self::extract_emits(emits, ep, pos, buf);
                 return (state_id, Some(m));

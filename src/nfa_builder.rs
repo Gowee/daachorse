@@ -458,7 +458,7 @@ where
         // ROOT holds the empty pattern ("") which is handled specially via cursor interpolation
         // in the iterator. Draining failure links stops at ROOT and never extracts empty matches.
         // Setting bit 31 on ROOT would cause all states whose failure links lead to ROOT to inherit
-        // fail_has_emit = true, destroying O(1) skips whenever an empty pattern is present.
+        // emit reachability = true, destroying O(1) skips whenever an empty pattern is present.
         for &state_id in &q[1..] {
             let state = &self.states[state_id as usize];
             let fail_id = state.fail.get();
