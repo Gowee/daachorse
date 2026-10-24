@@ -36,18 +36,19 @@ impl EdgeLabel for char {
 pub struct NfaBuilderState<L, V> {
     pub(crate) edges: EdgeMap<L>,
     pub(crate) fail: Cell<u32>,
-    /// Patterns terminating at this state: `(value, pattern_length)`.
+    /// Pattern outputs terminating at this state: `(value, pattern_length)`.
     ///
-    /// For standard Aho-Corasick, multiple patterns may terminate at the same state.
-    /// In `LeftmostLongestExperimental`, only the longest pattern terminating here (at most one)
-    /// is kept and inspected.
+    /// In a Trie, distinct pattern strings follow distinct paths and terminate at distinct states.
+    /// This vector contains more than one entry only if duplicate pattern strings were added.
+    /// For leftmost matching, duplicate patterns share the identical span, so only the canonical
+    /// first entry is tracked.
     pub(crate) output: Vec<(V, u32)>,
     /// 1-based index pointing to the head of the output/emit chain.
     ///
     /// This field has dual semantics depending on `MatchKind`:
-    /// - **Standard / LeftmostFirst**: 1-based index into `outputs: Vec<Output<V>>`,
+    /// - **Standard / LeftmostFirst / LeftmostLongest**: 1-based index into `outputs: Vec<Output<V>>`,
     ///   forming a dictionary suffix link chain (traversed via `Output::parent()`).
-    /// - **LeftmostLongestExperimental**: 1-based index into `emits: Vec<Emit<V>>`,
+    /// - **LeftmostLongestExperimental / LeftmostFirstExperimental**: 1-based index into `emits: Vec<Emit<V>>`,
     ///   forming a reverse delta-encoded pre-committed match chain (traversed via `Emit::pred()`).
     pub(crate) output_pos: Cell<Option<NonZeroU32>>,
 }
@@ -353,10 +354,10 @@ where
         let mut store = EmitStore::with_capacity(q.len());
 
         // If ROOT has an output (empty pattern ""), register its emit node.
-        if let Some(&pat) = self.states[usize::from_u32(ROOT_STATE_ID)].output.first() {
-            let emit = Emit::from_output(pat, 0, None);
+        if let Some(&output) = self.states[usize::from_u32(ROOT_STATE_ID)].output.first() {
+            let emit = Emit::from_output(output, 0, None);
             let key = DedupKey {
-                pat_state: ROOT_STATE_ID,
+                output_state_id: ROOT_STATE_ID,
                 gap: 0,
                 pred: None,
             };
@@ -373,10 +374,11 @@ where
             // Fast Path: Root-Covered Pattern (Barrier Reset).
             // If `state_id` itself is a complete pattern from ROOT, under leftmost-longest priority
             // it supersedes any suffix fallback. `fail` is reset to ROOT and `gap` is 0.
-            if let Some(&pat) = self.states[state_id as usize].output.first() {
-                let emit = Emit::from_output(pat, 0, None);
+            if let Some(&output) = self.states[state_id as usize].output.first() {
+                let emit = Emit::from_output(output, 0, None);
+                // DedupKey identifies the emit by output_state_id so hash-consing never touches `V` (only V: Copy is required).
                 let key = DedupKey {
-                    pat_state: state_id,
+                    output_state_id: state_id,
                     gap: 0,
                     pred: None,
                 };
@@ -402,7 +404,7 @@ where
                 self.states[parent_id as usize].output_pos.get().map(|pos| {
                     (
                         store.get(pos).with_incremented_gap(ch.num_bytes()),
-                        store.key_of(pos).pat_state,
+                        store.key_of(pos).output_state_id,
                     )
                 })
             };
@@ -414,7 +416,7 @@ where
             // its branch has failed. Any pre-committed non-overlapping matches
             // along `curr`'s prefix are appended onto `chain`.
             let mut curr = self.states[parent_id as usize].fail.get();
-            let mut next_child = Self::child_id_from_states(&self.states, curr, ch);
+            let mut next_child = self.child_id(curr, ch);
             while curr != ROOT_STATE_ID && next_child.is_none() {
                 if let Some(curr_head) = self.states[curr as usize].output_pos.get() {
                     scratch_buffer.clear();
@@ -425,7 +427,7 @@ where
                     chain.extend_from(&scratch_buffer, &mut store);
                 }
                 curr = self.states[curr as usize].fail.get();
-                next_child = Self::child_id_from_states(&self.states, curr, ch);
+                next_child = self.child_id(curr, ch);
             }
 
             // 2. Active Suffix Transition & Leaf Match Decision:
@@ -437,8 +439,8 @@ where
                         fail_state = child_id;
                     } else {
                         // Suffix completes a leaf pattern at the very end of `state_id`.
-                        let pat = self.states[child_id as usize].output[0];
-                        chain.push_leaf(pat, child_id, &mut store);
+                        let leaf_output = self.states[child_id as usize].output[0];
+                        chain.push_leaf(leaf_output, child_id, &mut store);
                         fail_state = ROOT_STATE_ID;
                     }
                 }
@@ -450,28 +452,19 @@ where
             self.states[state_id as usize].fail.set(fail_state);
         }
 
-        // Stage 3: Compute reachability to emits along the fail chain (has_emit DP)
-        // to populate bit 31 (borrow bit) for O(1) failure chain skips.
-        {
-            let mut has_emit = alloc::vec![false; self.states.len()];
-            if self.states[ROOT_STATE_ID as usize]
-                .output_pos
-                .get()
-                .is_some()
-            {
-                has_emit[ROOT_STATE_ID as usize] = true;
-            }
-            for &state_id in &q[1..] {
-                let u = state_id as usize;
-                let fail_id = self.states[u].fail.get() as usize;
-                if self.states[u].output_pos.get().is_some() || has_emit[fail_id] {
-                    has_emit[u] = true;
-                }
-            }
-            for (i, state) in self.states.iter().enumerate() {
-                if has_emit[i] {
-                    state.fail.set(state.fail.get() | 0x8000_0000);
-                }
+        // Stage 3: In-place propagation of emit reachability (bit 31) along the failure chain.
+        //
+        // Note: ROOT_STATE_ID is intentionally excluded from setting bit 31.
+        // ROOT holds the empty pattern ("") which is handled specially via cursor interpolation
+        // in the iterator. Draining failure links stops at ROOT and never extracts empty matches.
+        // Setting bit 31 on ROOT would cause all states whose failure links lead to ROOT to inherit
+        // fail_has_emit = true, destroying O(1) skips whenever an empty pattern is present.
+        for &state_id in &q[1..] {
+            let state = &self.states[state_id as usize];
+            let fail_id = state.fail.get();
+            let fail_has_emit = (self.states[fail_id as usize].fail.get() & 0x8000_0000) != 0;
+            if state.output_pos.get().is_some() || fail_has_emit {
+                state.fail.set(fail_id | 0x8000_0000);
             }
         }
 
@@ -507,12 +500,7 @@ where
 
     #[inline(always)]
     fn child_id(&self, state_id: u32, c: L) -> Option<u32> {
-        Self::child_id_from_states(&self.states, state_id, c)
-    }
-
-    #[inline(always)]
-    fn child_id_from_states(states: &[NfaBuilderState<L, V>], state_id: u32, c: L) -> Option<u32> {
-        states[usize::from_u32(state_id)].edges.get(&c).copied()
+        self.states[usize::from_u32(state_id)].edges.get(&c).copied()
     }
 
     fn profile_step(
@@ -692,7 +680,7 @@ impl<V: Copy> EmitChain<V> {
             Some(store.insert(
                 prev.with_gap(inter_gap),
                 DedupKey {
-                    pat_state: prev_state,
+                    output_state_id: prev_state,
                     gap: inter_gap,
                     pred: prev.pred,
                 },
@@ -706,7 +694,7 @@ impl<V: Copy> EmitChain<V> {
             pred = Some(store.insert(
                 Emit::new(em.value, em.length, em.gap, pred),
                 DedupKey {
-                    pat_state: key.pat_state,
+                    output_state_id: key.output_state_id,
                     gap: em.gap,
                     pred,
                 },
@@ -714,12 +702,12 @@ impl<V: Copy> EmitChain<V> {
         }
 
         // Install M_k as the new in-flight head:
-        self.head = Some((emits[0].0.with_pred(pred), emits[0].1.pat_state));
+        self.head = Some((emits[0].0.with_pred(pred), emits[0].1.output_state_id));
     }
 
     /// Appends a newly completed leaf pattern ending at the current state.
     #[inline(always)]
-    fn push_leaf(&mut self, output: (V, u32), pat_state: u32, store: &mut EmitStore<V>) {
+    fn push_leaf(&mut self, output: (V, u32), output_state_id: u32, store: &mut EmitStore<V>) {
         let pred = if let Some((prev, prev_state)) = self.head {
             debug_assert!(
                 prev.gap >= output.1,
@@ -729,7 +717,7 @@ impl<V: Copy> EmitChain<V> {
             Some(store.insert(
                 prev.with_gap(inter_gap),
                 DedupKey {
-                    pat_state: prev_state,
+                    output_state_id: prev_state,
                     gap: inter_gap,
                     pred: prev.pred,
                 },
@@ -737,17 +725,17 @@ impl<V: Copy> EmitChain<V> {
         } else {
             None
         };
-        self.head = Some((Emit::from_output(output, 0, pred), pat_state));
+        self.head = Some((Emit::from_output(output, 0, pred), output_state_id));
     }
 
     /// Finalizes the match chain by committing the in-flight head to `store`.
     #[inline(always)]
     fn finish(self, store: &mut EmitStore<V>) -> Option<NonZeroU32> {
-        self.head.map(|(h, pat_state)| {
+        self.head.map(|(h, output_state_id)| {
             store.insert(
                 h,
                 DedupKey {
-                    pat_state,
+                    output_state_id,
                     gap: h.gap,
                     pred: h.pred,
                 },
@@ -761,10 +749,10 @@ impl<V: Copy> EmitChain<V> {
 /// Identifies an emit node by its originating pattern state instead of its value,
 /// so hash-consing never touches `V` and the builder only requires `V: Copy`.
 /// Each pattern corresponds to exactly one terminal trie state, hence
-/// `pat_state` determines `(value, length)` and the key is canonical.
+/// `output_state_id` determines `(value, length)` and the key is canonical.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 struct DedupKey {
-    pat_state: u32,
+    output_state_id: u32,
     gap: u32,
     pred: Option<NonZeroU32>,
 }
@@ -859,7 +847,7 @@ impl<'a, V: Copy> Iterator for ChainIter<'a, V> {
 ///
 /// In leftmost-longest matching, multiple states across divergent branches frequently produce
 /// identical [`Emit`] configurations. This deduplication table provides hash-consing over
-/// [`DedupKey`] (`pat_state` identifies the pattern, hence `(value, length)`), unifying
+/// [`DedupKey`] (`output_state_id` identifies the pattern, hence `(value, length)`), unifying
 /// identical `(pattern, gap, pred)` tuples into a single canonical index.
 ///
 /// Deduplication is cleanly separated from emit list storage: [`EmitDedup`] acts as a lookup
@@ -984,7 +972,7 @@ fn hash_key(key: &DedupKey) -> usize {
     // FxHash-style mixer over plain u32 fields; no `V` involved.
     const SEED: u64 = 0x517c_c1b7_2722_0a95;
     let mut h: u64 = 0;
-    h = (h.rotate_left(5) ^ u64::from(key.pat_state)).wrapping_mul(SEED);
+    h = (h.rotate_left(5) ^ u64::from(key.output_state_id)).wrapping_mul(SEED);
     h = (h.rotate_left(5) ^ u64::from(key.gap)).wrapping_mul(SEED);
     h = (h.rotate_left(5) ^ u64::from(key.pred.map_or(0, NonZeroU32::get))).wrapping_mul(SEED);
     h as usize

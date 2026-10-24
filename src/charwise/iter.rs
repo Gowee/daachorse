@@ -690,141 +690,37 @@ where
     }
 }
 
-/// Computes the child state transition from `ROOT_STATE_IDX` on a mapped character `code`.
-///
-/// If a valid outgoing transition from root exists for `code` (i.e. `ROOT_STATE_IDX` has a base,
-/// `child_idx = (base ^ code)` is within bounds of `states`, and `states[child_idx].check() == ROOT_STATE_IDX`),
-/// returns `child_idx as u32`. Otherwise, falls back to `ROOT_STATE_IDX`.
-///
-/// This primitive eliminates loop re-entry overhead when resetting to root, allowing
-/// the iterator to immediately step on the current character in the same cycle.
-///
-/// # Safety
-///
-/// - `states` must contain at least `ROOT_STATE_IDX + 1` elements.
-/// - `states` must be a valid double-array table constructed by `CharwiseDoubleArrayAhoCorasickBuilder`,
-///   ensuring that for any valid `base` in `states` and any mapped alphabet `code`, `(base.get() ^ code) as usize`
-///   is strictly within the bounds of `states`.
-#[inline(always)]
-unsafe fn step_root(states: &[State], code: u32) -> u32 {
-    if let Some(base) = states.get_unchecked(ROOT_STATE_IDX as usize).base() {
-        let child_idx = (base.get() ^ code) as usize;
-        if states.get_unchecked(child_idx).check() == ROOT_STATE_IDX {
-            return child_idx as u32;
-        }
-    }
-    ROOT_STATE_IDX
-}
-
-/// Extracts pre-committed leftmost matches along the predecessor chain in chronological order.
-///
-/// In zero-rewind leftmost matching, each state's `output_pos` points to the head of a
-/// reverse-linked chain of non-overlapping matches: `Match_k -> Match_{k-1} -> ... -> Match_1`.
-///
-/// This function walks the chain starting from `head_pos`, calculating absolute text offsets
-/// from `anchor` using the reverse delta-encoded `gap` and `length` fields.
-///
-/// # Execution Strategy
-///
-/// - Single-match chains (>99% of occurrences in practice):
-///   The match is returned directly in CPU registers without any heap or buffer operations.
-/// - Multi-match chains:
-///   Subsequent matches (`Match_{k-1} .. Match_1`) are extracted and pushed into `buf`.
-///   Because the chain is walked from head (latest) to predecessor (earliest), matches are
-///   pushed in reverse order such that subsequent `buf.pop()` calls yield them in exact
-///   chronological order (`Match_2 .. Match_k`), while the earliest match (`Match_1`) is
-///   returned immediately.
-///
-/// # Safety
-///
-/// - `head_pos` and all reachable `pred` indices must be valid 1-based indices into `emits`.
-/// - `anchor` must be greater than or equal to the total span length of the chain.
-#[inline(always)]
-fn extract_emits<V: Copy>(
-    emits: &[crate::Emit<V>],
-    head_pos: NonZeroU32,
-    mut anchor: usize,
-    buf: &mut alloc::vec::Vec<Match<V>>,
-) -> Match<V> {
-    let mut curr_ep = head_pos;
-    loop {
-        // SAFETY: head_pos and all chained pred links are valid 1-based indices in emits.
-        let emit = unsafe { emits.get_unchecked(curr_ep.get() as usize - 1) };
-        let end = anchor - emit.gap as usize;
-        anchor = end - emit.length as usize;
-        let m = emit.to_match(end);
-        let Some(pred) = emit.pred else {
-            return m;
-        };
-        buf.push(m);
-        curr_ep = pred;
-    }
-}
-
-/// Drains failure links from `state_id` at `pos`, emitting the first reachable match if any,
-/// or skipping directly to `ROOT_STATE_IDX` in O(1) if no failure ancestor has an emit.
-///
-/// When an unmapped character is encountered or EOF is reached, the in-flight prefix represented
-/// by `state_id` cannot transition forward. Any pending non-overlapping matches that reside
-/// inside trailing active suffixes along the failure chain must be flushed.
-///
-/// # Fast O(1) Skip via Borrow Bit (Bit 31)
-///
-/// During automaton construction, bit 31 of each state's `fail` field (`fail_has_emit`) is set
-/// to 1 if and only if that state or any ancestor along its failure chain has an emit (`output_pos.is_some()`).
-/// If `!state.fail_has_emit()`, this function aborts the traversal immediately in O(1) without
-/// hopping through failure pointers, returning `(ROOT_STATE_IDX, None)`.
-///
-/// # Arguments
-///
-/// - `states`: Double-array state table.
-/// - `emits`: Pre-committed match emit pool.
-/// - `buf`: Match buffer for storing multi-match chains.
-/// - `mut state_id`: Current active state ID.
-/// - `pos`: Current text byte position serving as the match anchor.
-///
-/// # Returns
-///
-/// A tuple `(next_state_id, Option<Match<V>>)`:
-/// - If a match is found, returns the next failure state and `Some(match)`.
-/// - If no further matches exist along the failure chain, returns `(ROOT_STATE_IDX, None)`.
-#[inline(always)]
-fn drain_fail_chain<V: Copy>(
-    states: &[State],
-    emits: &[crate::Emit<V>],
-    buf: &mut alloc::vec::Vec<Match<V>>,
-    mut state_id: u32,
-    pos: usize,
-) -> (u32, Option<Match<V>>) {
-    while state_id != ROOT_STATE_IDX {
-        let state = unsafe { states.get_unchecked(state_id as usize) };
-        if !state.fail_has_emit() {
-            break;
-        }
-        state_id = state.fail();
-        if let Some(ep) = state.output_pos() {
-            let m = extract_emits(emits, ep, pos, buf);
-            return (state_id, Some(m));
-        }
-    }
-    (ROOT_STATE_IDX, None)
-}
-
 /// Dedicated zero-rewind streaming iterator created by [`CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()`].
 ///
 /// This iterator executes non-overlapping leftmost pattern matching in strictly guaranteed linear time $O(N)$
 /// over the input text, completely eliminating input text backtracking and buffer re-scanning.
 ///
-/// # Architecture & Acceleration Pillars
+/// # Core Mechanism
+///
+/// Unlike traditional leftmost search algorithms that rewind input text upon completing a pattern or
+/// reaching a mismatch, this iterator models matching as a single forward pass over an Aho-Corasick NFA.
+///
+/// At each step during streaming, the scanned prefix is partitioned into two components:
+/// 1. **Committed Matches**: Non-overlapping leftmost patterns identified so far along the current path,
+///    stored in a reverse delta-encoded chain (`Emit`).
+/// 2. **Active Suffix**: The longest surviving suffix that could potentially extend into a longer pattern,
+///    tracked by the current automaton state ID.
+///
+/// When an active branch fails or reaches EOF, any pre-committed matches along the failure chain are
+/// flushed chronologically, while the surviving suffix transitions immediately to the next candidate state
+/// without text rewinding.
+///
+/// # Key Accelerations
+///
 /// 1. **Reverse Delta-Encoded Match Chains (`Emit<V>`)**:
-///    Pre-commits leftmost matches during DFA construction. Emits encode relative distances (`gap` and `length`),
-///    allowing constant-time single-pass stream matching without rewinding `pos`.
+///    Emits encode relative inter-match distances (`gap` and `length`), allowing constant-time single-pass
+///    stream matching without rewinding `pos`.
 /// 2. **Inlined Direct Register Return**:
 ///    Single-match patterns (the overwhelmingly common case) bypass intermediate buffer allocations and are returned
 ///    directly in CPU registers `(start, end, value)`, avoiding stack spills and pointer indirections.
 /// 3. **Dynamic Root Single-Step Hoisting**:
 ///    Transitions from `ROOT_STATE_IDX` immediately step into the next character using `step_root`,
-///    which accesses the L1-pinned root base to advance in the same cycle without re-entering the matching loop.
+///    which accesses the root base to advance in the same cycle without re-entering the matching loop.
 /// 4. **Bit-31 Borrow-Bit Reachability Skips**:
 ///    Unmapped characters and EOF flushes inspect `state.fail_has_emit()`. If false, failure pointer traversal is
 ///    aborted immediately in $O(1)$, avoiding redundant hops to the root.
@@ -865,10 +761,9 @@ where
         }
     }
 
-
     /// Core scanning engine that advances the automaton forward until a match is found or EOF is reached.
     #[inline(always)]
-    fn find_next_match<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
+    fn scan_impl<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
         let haystack = self.haystack.as_ref();
         let bytes = haystack.as_bytes();
 
@@ -906,17 +801,17 @@ where
 
             if let Some(code) = mapper.get(c) {
                 // Character `c` is mapped to alphabet `code`.
-                // Traverse transitions forward or follow failure links on mismatch.
+                // Advance down the trie if transition exists on alphabet code, or follow failure links on mismatch.
                 loop {
                     // SAFETY: state_id is a valid state index.
                     let state = unsafe { states.get_unchecked(state_id as usize) };
                     if let Some(base) = state.base() {
-                        // Double-array child transition lookup: child_idx = base ^ code
-                        let child_idx = (base.get() ^ code) as usize;
-                        if unsafe { states.get_unchecked(child_idx).check() } == state_id {
+                        // Double-array child transition lookup: child_id = base ^ code
+                        let child_id = base.get() ^ code;
+                        if unsafe { states.get_unchecked(child_id as usize).check() } == state_id {
                             // Child transition found: advance state and break out of inner loop
                             // to consume `char_len` bytes in the text.
-                            state_id = child_idx as u32;
+                            state_id = child_id;
                             break;
                         }
                     } else {
@@ -943,7 +838,7 @@ where
                         //    loop re-entry and stack spills.
                         let ep = unsafe { state.output_pos().unwrap_unchecked() };
                         let emit = unsafe { emits.get_unchecked(ep.get() as usize - 1) };
-                        self.state_id = unsafe { step_root(states, code) };
+                        self.state_id = unsafe { Self::step_root(states, code) };
                         self.pos = pos + char_len;
                         return Some(emit.to_match(pos));
                     }
@@ -959,12 +854,12 @@ where
                         // that occurred *before* the active suffix `state.fail()`.
                         // Extract all matches in the chain: the earliest match is returned directly,
                         // and any subsequent matches are buffered into `self.buf` for LIFO popping.
-                        let m = extract_emits(emits, ep, pos, &mut self.buf);
+                        let m = Self::extract_emits(emits, ep, pos, &mut self.buf);
                         if state_id == ROOT_STATE_IDX {
                             // Active suffix collapsed to ROOT (empty trailing suffix).
                             // Greedily step `ROOT` on the current character `code` in the same cycle
                             // and advance past `c` (`pos + char_len`).
-                            self.state_id = unsafe { step_root(states, code) };
+                            self.state_id = unsafe { Self::step_root(states, code) };
                             self.pos = pos + char_len;
                         } else {
                             // Active suffix is a non-root state. Character `c` at `pos` has NOT been consumed
@@ -985,13 +880,13 @@ where
                 // Otherwise, `drain_fail_chain` inspects bit 31 (`fail_has_emit`) to skip non-emitting
                 // failure chains in O(1).
                 if state_id != ROOT_STATE_IDX {
-                    let (next_state, m) =
-                        drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
+                    let (next_state_id, m) =
+                        Self::drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
                     if let Some(m) = m {
                         // Match found in the active suffix. Retain `self.pos = pos` so that any additional
                         // matches along deeper failure links can be drained on subsequent calls.
                         self.pos = pos;
-                        self.state_id = next_state;
+                        self.state_id = next_state_id;
                         return Some(m);
                     }
                     // All pending failure matches drained; reset to ROOT to consume `c`.
@@ -1003,19 +898,139 @@ where
         }
 
         // Text boundary reached (EOF). Drain any remaining matches residing in trailing active suffixes.
-        let (next_state, m) = drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
+        let (next_state_id, m) = Self::drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
         self.pos = pos;
-        self.state_id = next_state;
+        self.state_id = next_state_id;
         m
     }
 
     #[inline(always)]
-    fn find_next(&mut self) -> Option<Match<V>> {
+    fn scan(&mut self) -> Option<Match<V>> {
         if self.pma.prefilter.is_some() && self.gate.is_enabled() {
-            self.find_next_match::<true>()
+            self.scan_impl::<true>()
         } else {
-            self.find_next_match::<false>()
+            self.scan_impl::<false>()
         }
+    }
+
+    /// Single-cycle transition from `ROOT_STATE_IDX` on alphabet `code`.
+    ///
+    /// If a valid outgoing transition from root exists for `code` (i.e. `ROOT_STATE_IDX` has a base,
+    /// `child_id = (base ^ code)` is within bounds of `states`, and `states[child_id].check() == ROOT_STATE_IDX`),
+    /// returns `child_id`. Otherwise, falls back to `ROOT_STATE_IDX`.
+    ///
+    /// This primitive eliminates loop re-entry overhead when resetting to root, allowing
+    /// the iterator to immediately step on the current character in the same cycle.
+    ///
+    /// # Safety
+    ///
+    /// - `states` must contain at least `ROOT_STATE_IDX + 1` elements.
+    /// - `states` must be a valid double-array table constructed by `CharwiseDoubleArrayAhoCorasickBuilder`,
+    ///   ensuring that for any valid `base` in `states` and any mapped alphabet `code`, `(base.get() ^ code) as usize`
+    ///   is strictly within the bounds of `states`.
+    #[inline(always)]
+    unsafe fn step_root(states: &[State], code: u32) -> u32 {
+        if let Some(base) = states.get_unchecked(ROOT_STATE_IDX as usize).base() {
+            let child_id = base.get() ^ code;
+            if states.get_unchecked(child_id as usize).check() == ROOT_STATE_IDX {
+                return child_id;
+            }
+        }
+        ROOT_STATE_IDX
+    }
+
+    /// Extracts pre-committed leftmost matches along the predecessor chain in chronological order.
+    ///
+    /// In zero-rewind leftmost matching, each state's `output_pos` points to the head of a
+    /// reverse-linked chain of non-overlapping matches: `Match_k -> Match_{k-1} -> ... -> Match_1`.
+    ///
+    /// This function walks the chain starting from `head_pos`, calculating absolute text offsets
+    /// from `anchor` using the reverse delta-encoded `gap` and `length` fields.
+    ///
+    /// # Execution Strategy
+    ///
+    /// - Single-match chains (>99% of occurrences in practice):
+    ///   The match is returned directly in CPU registers without any heap or buffer operations.
+    /// - Multi-match chains:
+    ///   Subsequent matches (`Match_{k-1} .. Match_1`) are extracted and pushed into `buf`.
+    ///   Because the chain is walked from head (latest) to predecessor (earliest), matches are
+    ///   pushed in reverse order such that subsequent `buf.pop()` calls yield them in exact
+    ///   chronological order (`Match_2 .. Match_k`), while the earliest match (`Match_1`) is
+    ///   returned immediately.
+    ///
+    /// # Safety
+    ///
+    /// - `head_pos` and all reachable `pred` indices must be valid 1-based indices into `emits`.
+    /// - `anchor` must be greater than or equal to the total span length of the chain.
+    #[inline(always)]
+    fn extract_emits(
+        emits: &[crate::Emit<V>],
+        head_pos: NonZeroU32,
+        mut anchor: usize,
+        buf: &mut alloc::vec::Vec<Match<V>>,
+    ) -> Match<V> {
+        let mut curr_ep = head_pos;
+        loop {
+            // SAFETY: head_pos and all chained pred links are valid 1-based indices in emits.
+            let emit = unsafe { emits.get_unchecked(curr_ep.get() as usize - 1) };
+            let end = anchor - emit.gap as usize;
+            anchor = end - emit.length as usize;
+            let m = emit.to_match(end);
+            let Some(pred) = emit.pred else {
+                return m;
+            };
+            buf.push(m);
+            curr_ep = pred;
+        }
+    }
+
+    /// Drains failure links from `state_id` at `pos`, emitting the first reachable match if any,
+    /// or skipping directly to `ROOT_STATE_IDX` in O(1) if no failure ancestor has an emit.
+    ///
+    /// When an unmapped character is encountered or EOF is reached, the in-flight prefix represented
+    /// by `state_id` cannot transition forward. Any pending non-overlapping matches that reside
+    /// inside trailing active suffixes along the failure chain must be flushed.
+    ///
+    /// # Fast O(1) Skip via Borrow Bit (Bit 31)
+    ///
+    /// During automaton construction, bit 31 of each state's `fail` field (`fail_has_emit`) is set
+    /// to 1 if and only if that state or any ancestor along its failure chain has an emit (`output_pos.is_some()`).
+    /// If `!state.fail_has_emit()`, this function aborts the traversal immediately in O(1) without
+    /// hopping through failure pointers, returning `(ROOT_STATE_IDX, None)`.
+    ///
+    /// # Arguments
+    ///
+    /// - `states`: Double-array state table.
+    /// - `emits`: Pre-committed match emit pool.
+    /// - `buf`: Match buffer for storing multi-match chains.
+    /// - `mut state_id`: Current active state ID.
+    /// - `pos`: Current text byte position serving as the match anchor.
+    ///
+    /// # Returns
+    ///
+    /// A tuple `(next_state_id, Option<Match<V>>)`:
+    /// - If a match is found, returns the next failure state and `Some(match)`.
+    /// - If no further matches exist along the failure chain, returns `(ROOT_STATE_IDX, None)`.
+    #[inline(always)]
+    fn drain_fail_chain(
+        states: &[State],
+        emits: &[crate::Emit<V>],
+        buf: &mut alloc::vec::Vec<Match<V>>,
+        mut state_id: u32,
+        pos: usize,
+    ) -> (u32, Option<Match<V>>) {
+        while state_id != ROOT_STATE_IDX {
+            let state = unsafe { states.get_unchecked(state_id as usize) };
+            if !state.fail_has_emit() {
+                break;
+            }
+            state_id = state.fail();
+            if let Some(ep) = state.output_pos() {
+                let m = Self::extract_emits(emits, ep, pos, buf);
+                return (state_id, Some(m));
+            }
+        }
+        (ROOT_STATE_IDX, None)
     }
 }
 
@@ -1035,7 +1050,7 @@ where
             if let Some(m) = self.buf.pop() {
                 return Some(m);
             }
-            return self.find_next();
+            return self.scan();
         };
 
         // 2. Epsilon Match Interpolation (when empty pattern "" is present in dictionary):
@@ -1043,7 +1058,7 @@ where
         // boundary not spanned by a non-empty match. We interleave zero-length matches into
         // unconsumed text gaps using `epsilon_cursor`.
         if self.buf.is_empty() {
-            if let Some(m) = self.find_next() {
+            if let Some(m) = self.scan() {
                 self.buf.push(m);
             }
         }
@@ -1085,8 +1100,6 @@ where
         None
     }
 }
-
-
 
 /// Helper to extract emits in forward order as originally implemented in commit `6695258`.
 #[inline(always)]

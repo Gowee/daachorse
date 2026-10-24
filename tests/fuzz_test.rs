@@ -359,7 +359,134 @@ fn test_fuzz_unmapped_characters() {
             }
         }
 
+        println!("Calling differential_fuzz_round");
         differential_fuzz_round(&patterns, &haystack, round);
+        println!("Calling differential_fuzz_round_leftmost_first");
         differential_fuzz_round_leftmost_first(&patterns, &haystack, round);
+    }
+}
+
+/// Fuzz tests leftmost matching when the dictionary contains the empty pattern `""`.
+///
+/// Under leftmost matching semantics:
+/// 1. A dictionary containing only `[""]` matches at every UTF-8 character boundary (offset 0 to EOF).
+/// 2. For `LeftmostLongest`, every non-empty pattern has length >= 1 and strictly longer than `""`.
+///    Therefore, under `LeftmostLongest`, non-empty patterns strictly take precedence over `""`,
+///    so the sequence of non-empty matches must be identical whether `""` is in the dictionary or not.
+/// 3. For `LeftmostFirst`:
+///    - If `""` is at index 0 (highest priority), it matches at every character boundary across the text.
+#[test]
+fn test_fuzz_with_empty_pattern() {
+    let mut rng = Rng::new(0xee91_1001);
+    let alphabet = ['a', 'b', 'c', '中', '文'];
+
+    // 1. Edge Case: Dictionary with ONLY the empty pattern.
+    {
+        let patterns = vec![String::new()];
+        for haystack in ["", "a", "abc", "中文测试", "a中b文c"] {
+            differential_fuzz_round(&patterns, haystack, 0);
+            differential_fuzz_round_leftmost_first(&patterns, haystack, 0);
+
+            let pma: CharwiseDoubleArrayAhoCorasick<usize> =
+                CharwiseDoubleArrayAhoCorasickBuilder::new()
+                    .match_kind(MatchKind::LeftmostLongestExperimental)
+                    .build(&patterns)
+                    .unwrap();
+            let boundaries: Vec<usize> = haystack
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(core::iter::once(haystack.len()))
+                .collect();
+            let matches: Vec<(usize, usize, usize)> = pma
+                .leftmost_find_iter_experimental(haystack)
+                .map(|m| (m.start(), m.end(), m.value()))
+                .collect();
+            assert_eq!(matches.len(), boundaries.len());
+            for (&b, &m) in boundaries.iter().zip(matches.iter()) {
+                assert_eq!(m, (b, b, 0));
+            }
+        }
+    }
+
+    // 2. Invariant Fuzzing: Empty pattern combined with random patterns.
+    for _round in 0..500 {
+        let num_pats = rng.gen_range(1, 15);
+        let mut pats = Vec::with_capacity(num_pats);
+        for _ in 0..num_pats {
+            let p = rng.gen_string(&alphabet, 1, 6);
+            if !pats.contains(&p) {
+                pats.push(p);
+            }
+        }
+
+        let haystack = rng.gen_string(&alphabet, 0, 200);
+
+        // A. LeftmostLongest Invariant:
+        // Adding "" must not change the sequence of non-empty matches:
+        let pma_no_empty: CharwiseDoubleArrayAhoCorasick<usize> =
+            CharwiseDoubleArrayAhoCorasickBuilder::new()
+                .match_kind(MatchKind::LeftmostLongestExperimental)
+                .build(&pats)
+                .unwrap();
+        let expected_non_empty: Vec<(usize, usize, usize)> = pma_no_empty
+            .leftmost_find_iter_experimental(&haystack)
+            .map(|m| (m.start(), m.end(), m.value()))
+            .collect();
+
+        let mut pats_with_empty = vec![String::new()];
+        pats_with_empty.extend(pats.clone());
+
+        let pma_with_empty: CharwiseDoubleArrayAhoCorasick<usize> =
+            CharwiseDoubleArrayAhoCorasickBuilder::new()
+                .match_kind(MatchKind::LeftmostLongestExperimental)
+                .build(&pats_with_empty)
+                .unwrap();
+        let all_matches: Vec<(usize, usize, usize)> = pma_with_empty
+            .leftmost_find_iter_experimental(&haystack)
+            .map(|m| (m.start(), m.end(), m.value()))
+            .collect();
+
+        // 1. Matches must be monotonically ordered and non-overlapping:
+        let mut last_end = 0;
+        for &m in &all_matches {
+            assert!(m.0 <= m.1, "match start <= end");
+            assert!(m.0 >= last_end, "non-overlapping order");
+            if m.0 < m.1 {
+                assert_eq!(&haystack[m.0..m.1], &pats_with_empty[m.2]);
+            } else {
+                assert_eq!(m.2, 0);
+            }
+            last_end = m.1;
+        }
+
+        // 2. Non-empty matches must match the non-empty run exactly:
+        let actual_non_empty: Vec<(usize, usize, usize)> = all_matches
+            .iter()
+            .copied()
+            .filter(|m| m.0 < m.1)
+            .map(|(s, e, v)| (s, e, v - 1))
+            .collect();
+        assert_eq!(actual_non_empty, expected_non_empty);
+
+        // B. LeftmostFirst Invariant:
+        // If "" is at index 0, it has highest priority and matches every char boundary:
+        let pma_first_empty: CharwiseDoubleArrayAhoCorasick<usize> =
+            CharwiseDoubleArrayAhoCorasickBuilder::new()
+                .match_kind(MatchKind::LeftmostFirstExperimental)
+                .build(&pats_with_empty)
+                .unwrap();
+        let first_empty_matches: Vec<(usize, usize, usize)> = pma_first_empty
+            .leftmost_find_iter_experimental(&haystack)
+            .map(|m| (m.start(), m.end(), m.value()))
+            .collect();
+        let all_boundaries: Vec<usize> = haystack
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(core::iter::once(haystack.len()))
+            .collect();
+        assert_eq!(first_empty_matches.len(), all_boundaries.len());
+        for (&b, &m) in all_boundaries.iter().zip(first_empty_matches.iter()) {
+            assert_eq!(m, (b, b, 0));
+        }
     }
 }

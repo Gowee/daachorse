@@ -314,7 +314,10 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
                 nfa.build_outputs(&nfa.build_fails_leftmost())
             }
             MatchKind::LeftmostLongestExperimental | MatchKind::LeftmostFirstExperimental => {
-                nfa.build_fails_and_emits_leftmost_experimental()
+                // In zero-rewind leftmost matching, failure transitions and match emit chains are
+                // mutually co-dependent (leaf pattern completions trigger barrier resets on fail,
+                // while candidate harvesting depends on transition mismatches), requiring a joint pass.
+                nfa.build_fails_and_emits_leftmost_experimental();
             }
         };
         Ok((nfa, prefilter_builder.and_then(PrefilterBuilder::build)))

@@ -60,7 +60,9 @@ use crate::{Emit, Match, MatchKind, Output, DEAD_STATE_IDX, ROOT_STATE_IDX};
 pub struct CharwiseDoubleArrayAhoCorasick<V> {
     states: Vec<State>,
     mapper: CodeMapper,
+    /// Dictionary suffix link outputs used by standard and legacy leftmost matching.
     outputs: Vec<Output<V>>,
+    /// Pre-committed match chains used exclusively by experimental zero-rewind leftmost matching.
     emits: Vec<Emit<V>>,
     match_kind: MatchKind,
     num_states: u32,
