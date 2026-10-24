@@ -1003,15 +1003,10 @@ where
         }
 
         // Text boundary reached (EOF). Drain any remaining matches residing in trailing active suffixes.
-        if state_id != ROOT_STATE_IDX {
-            let (next_state, m) = drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
-            self.pos = pos;
-            self.state_id = next_state;
-            return m;
-        }
+        let (next_state, m) = drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
         self.pos = pos;
-        self.state_id = ROOT_STATE_IDX;
-        None
+        self.state_id = next_state;
+        m
     }
 
     #[inline(always)]
