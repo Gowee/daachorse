@@ -343,9 +343,9 @@ where
             let state_id = q[qi];
             qi += 1;
 
-            for &(ch, child_id) in self.states[state_id as usize].edges.iter() {
-                parents[child_id as usize] = state_id;
-                edge_labels[child_id as usize] = Some(ch);
+            for &(ch, child_id) in self.states[usize::from_u32(state_id)].edges.iter() {
+                parents[usize::from_u32(child_id)] = state_id;
+                edge_labels[usize::from_u32(child_id)] = Some(ch);
                 q.push(child_id);
             }
         }
@@ -374,7 +374,7 @@ where
             // Fast Path: Root-Covered Pattern (Barrier Reset).
             // If `state_id` itself is a complete pattern from ROOT, under leftmost-longest priority
             // it supersedes any suffix fallback. `fail` is reset to ROOT and `gap` is 0.
-            if let Some(&output) = self.states[state_id as usize].output.first() {
+            if let Some(&output) = self.states[usize::from_u32(state_id)].output.first() {
                 let emit = Emit::from_output(output, 0, None);
                 // DedupKey identifies the emit by output_state_id so hash-consing never touches `V` (only V: Copy is required).
                 let key = DedupKey {
@@ -382,10 +382,12 @@ where
                     gap: 0,
                     pred: None,
                 };
-                self.states[state_id as usize]
+                self.states[usize::from_u32(state_id)]
                     .output_pos
                     .set(Some(store.insert(emit, key)));
-                self.states[state_id as usize].fail.set(ROOT_STATE_ID);
+                self.states[usize::from_u32(state_id)]
+                    .fail
+                    .set(ROOT_STATE_ID);
                 continue;
             }
 
@@ -393,20 +395,23 @@ where
             // S = P · c inherits P's in-flight head match.
             // Note: We maintain the chain head's gap directly against the state's byte depth.
             // Advancing from P to S via `ch` increments the trailing gap by |c| bytes.
-            let parent_id = parents[state_id as usize];
-            let ch = edge_labels[state_id as usize].unwrap();
+            let parent_id = parents[usize::from_u32(state_id)];
+            let ch = edge_labels[usize::from_u32(state_id)].unwrap();
             // Direct children of ROOT start with an empty match chain (initial_head = None).
             // Even if ROOT holds an output for the empty pattern (""), child transitions
             // pursue non-empty extensions whose prefix does not commit the empty pattern.
             let initial_head = if parent_id == ROOT_STATE_ID {
                 None
             } else {
-                self.states[parent_id as usize].output_pos.get().map(|pos| {
-                    (
-                        store.get(pos).with_incremented_gap(ch.num_bytes()),
-                        store.key_of(pos).output_state_id,
-                    )
-                })
+                self.states[usize::from_u32(parent_id)]
+                    .output_pos
+                    .get()
+                    .map(|pos| {
+                        (
+                            store.get(pos).with_incremented_gap(ch.num_bytes()),
+                            store.key_of(pos).output_state_id,
+                        )
+                    })
             };
 
             let mut chain = EmitChain::new(initial_head);
@@ -415,10 +420,10 @@ where
             // When an active suffix `curr = fail(parent_id)` cannot transition on `ch`,
             // its branch has failed. Any pre-committed non-overlapping matches
             // along `curr`'s prefix are appended onto `chain`.
-            let mut curr = self.states[parent_id as usize].fail.get();
+            let mut curr = self.states[usize::from_u32(parent_id)].fail.get();
             let mut next_child = self.child_id(curr, ch);
             while curr != ROOT_STATE_ID && next_child.is_none() {
-                if let Some(curr_head) = self.states[curr as usize].output_pos.get() {
+                if let Some(curr_head) = self.states[usize::from_u32(curr)].output_pos.get() {
                     scratch_buffer.clear();
                     scratch_buffer.extend(store.iter_chain(curr_head));
                     // Matches along curr's prefix ended at P; advance the head gap by |c| to align with S:
@@ -426,7 +431,7 @@ where
                     scratch_buffer[0].1.gap += u32::try_from(ch.num_bytes()).unwrap();
                     chain.extend_from(&scratch_buffer, &mut store);
                 }
-                curr = self.states[curr as usize].fail.get();
+                curr = self.states[usize::from_u32(curr)].fail.get();
                 next_child = self.child_id(curr, ch);
             }
 
@@ -434,12 +439,12 @@ where
             let mut fail_state = ROOT_STATE_ID;
             if parent_id != ROOT_STATE_ID {
                 if let Some(child_id) = next_child {
-                    if !self.states[child_id as usize].edges.is_empty() {
+                    if !self.states[usize::from_u32(child_id)].edges.is_empty() {
                         // Extend active suffix along child.
                         fail_state = child_id;
                     } else {
                         // Suffix completes a leaf pattern at the very end of `state_id`.
-                        let leaf_output = self.states[child_id as usize].output[0];
+                        let leaf_output = self.states[usize::from_u32(child_id)].output[0];
                         chain.push_leaf(leaf_output, child_id, &mut store);
                         fail_state = ROOT_STATE_ID;
                     }
@@ -448,8 +453,10 @@ where
 
             // 3. Finalize match chain:
             let final_pos = chain.finish(&mut store);
-            self.states[state_id as usize].output_pos.set(final_pos);
-            self.states[state_id as usize].fail.set(fail_state);
+            self.states[usize::from_u32(state_id)]
+                .output_pos
+                .set(final_pos);
+            self.states[usize::from_u32(state_id)].fail.set(fail_state);
         }
 
         // Stage 3: In-place propagation of emit reachability (bit 31) along the failure chain.
@@ -460,9 +467,10 @@ where
         // Setting bit 31 on ROOT would cause all states whose failure links lead to ROOT to inherit
         // emit reachability = true, destroying O(1) skips whenever an empty pattern is present.
         for &state_id in &q[1..] {
-            let state = &self.states[state_id as usize];
+            let state = &self.states[usize::from_u32(state_id)];
             let fail_id = state.fail.get();
-            let fail_has_emit = (self.states[fail_id as usize].fail.get() & 0x8000_0000) != 0;
+            let fail_has_emit =
+                (self.states[usize::from_u32(fail_id)].fail.get() & 0x8000_0000) != 0;
             if state.output_pos.get().is_some() || fail_has_emit {
                 state.fail.set(fail_id | 0x8000_0000);
             }
@@ -500,7 +508,10 @@ where
 
     #[inline(always)]
     fn child_id(&self, state_id: u32, c: L) -> Option<u32> {
-        self.states[usize::from_u32(state_id)].edges.get(&c).copied()
+        self.states[usize::from_u32(state_id)]
+            .edges
+            .get(&c)
+            .copied()
     }
 
     fn profile_step(
@@ -809,7 +820,7 @@ impl<V: Copy> EmitStore<V> {
 
     /// Returns an iterator over matches along a chain from head to tail.
     #[inline(always)]
-    fn iter_chain(&self, head: NonZeroU32) -> ChainIter<'_, V> {
+    const fn iter_chain(&self, head: NonZeroU32) -> ChainIter<'_, V> {
         ChainIter {
             store: self,
             pos: Some(head),
@@ -968,6 +979,7 @@ impl EmitDedup {
 }
 
 #[inline(always)]
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
 fn hash_key(key: &DedupKey) -> usize {
     // FxHash-style mixer over plain u32 fields; no `V` involved.
     const SEED: u64 = 0x517c_c1b7_2722_0a95;

@@ -257,10 +257,7 @@ use core::num::NonZeroU32;
 use alloc::vec::Vec;
 
 pub use crate::bytewise::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
-pub use crate::charwise::{
-    CharwiseDoubleArrayAhoCorasick, CharwiseDoubleArrayAhoCorasickBuilder, LeftmostFindIterator,
-    LeftmostFindIteratorExperimental, LeftmostLongestFindIteratorV6695258,
-};
+pub use crate::charwise::{CharwiseDoubleArrayAhoCorasick, CharwiseDoubleArrayAhoCorasickBuilder};
 use crate::errors::DaachorseError;
 pub use crate::errors::Result;
 pub use crate::serializer::Serializable;

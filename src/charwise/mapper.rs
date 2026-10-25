@@ -36,15 +36,10 @@ impl CodeMapper {
     /// Returns the mapped compact code for character `c`, or `None` if `c` is not in the alphabet.
     #[inline(always)]
     pub fn get(&self, c: char) -> Option<u32> {
-        let idx = usize::from_u32(u32::from(c));
-        if idx < self.table.len() {
-            // SAFETY: idx is verified to be within table bounds.
-            let code = unsafe { *self.table.get_unchecked(idx) };
-            if code != INVALID_CODE {
-                return Some(code);
-            }
+        match self.table.get(usize::from_u32(u32::from(c))) {
+            Some(&code) if code != INVALID_CODE => Some(code),
+            _ => None,
         }
-        None
     }
 
     #[inline(always)]

@@ -311,7 +311,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
         match self.match_kind {
             MatchKind::Standard => nfa.build_outputs(&nfa.build_fails()),
             MatchKind::LeftmostFirst | MatchKind::LeftmostLongest => {
-                nfa.build_outputs(&nfa.build_fails_leftmost())
+                nfa.build_outputs(&nfa.build_fails_leftmost());
             }
             MatchKind::LeftmostLongestExperimental | MatchKind::LeftmostFirstExperimental => {
                 // In zero-rewind leftmost matching, failure transitions and match emit chains are

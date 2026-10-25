@@ -16,16 +16,13 @@ use crate::charwise::iter::{
     FindOverlappingSliceIterator, FindOverlappingStepper, FindSliceIterator, FindStepper,
     PatternIterator,
 };
-pub use crate::charwise::iter::{
-    LeftmostFindIterator, LeftmostFindIteratorExperimental,
-    LeftmostLongestFindIteratorV6695258,
-};
+pub use crate::charwise::iter::{LeftmostFindIterator, LeftmostFindIteratorExperimental};
 use crate::charwise::mapper::CodeMapper;
 use crate::errors::{DaachorseError, Result};
 use crate::prefilter::{Prefilter, PrefilterGate};
 use crate::serializer::{Serializable, SerializableVec};
 use crate::utils::FromU32;
-use crate::{Emit, Match, MatchKind, Output, DEAD_STATE_IDX, ROOT_STATE_IDX};
+use crate::{Emit, MatchKind, Output, DEAD_STATE_IDX, ROOT_STATE_IDX};
 
 /// A fast multiple pattern match automaton implemented with the Aho-Corasick algorithm and
 /// character-wise double-array data structure.
@@ -642,24 +639,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         LeftmostFindIteratorExperimental::new(self, haystack)
     }
 
-
-    #[doc(hidden)]
-    pub fn leftmost_find_iter_v6695258<P>(
-        &self,
-        haystack: P,
-    ) -> LeftmostLongestFindIteratorV6695258<'_, P, V>
-    where
-        P: AsRef<str>,
-        V: Copy,
-    {
-        assert!(
-            self.match_kind.is_experimental(),
-            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
-        );
-        LeftmostLongestFindIteratorV6695258::new(self, haystack)
-    }
-
-
     /// Returns a stepper of non-overlapping matches that consumes characters one by one.
     ///
     /// The algorithm used is the same as the [`CharwiseDoubleArrayAhoCorasick::find_iter()`]
@@ -884,20 +863,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         }
     }
 
-    /// Returns a reference to the internal code mapper.
-    #[inline(always)]
-    #[doc(hidden)]
-    pub fn mapper(&self) -> &CodeMapper {
-        &self.mapper
-    }
-
-    /// Returns a slice of the internal double-array states.
-    #[inline(always)]
-    #[doc(hidden)]
-    pub fn states(&self) -> &[State] {
-        &self.states
-    }
-
     /// Returns the match kind for this automaton.
     ///
     /// # Examples
@@ -1077,7 +1042,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             + self.depths.len() * mem::size_of::<u32>()
     }
 
-
     /// Serializes the automaton into a [`Vec`].
     ///
     /// # Examples
@@ -1126,7 +1090,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
     /// This function verifies that the input automaton data will not cause out-of-bounds memory
     /// access within this crate; however, it does not verify that the data is a valid
     /// Aho-Corasick automaton. Consequently, if malformed data is provided, it may lead to
-    /// infinite loops or cause [`Match`] to return inaccurate ranges. Use this
+    /// infinite loops or cause [`Match`](crate::Match) to return inaccurate ranges. Use this
     /// function only if you can tolerate such errors.
     ///
     /// # Arguments
@@ -1356,58 +1320,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         }
     }
 
-    /// Returns an iterator yielding matches from the reverse-linked [`Emit`] chain
-    /// in reverse chronological order (head/latest to predecessor/earliest).
-    ///
-    /// # Architecture and Invariants
-    ///
-    /// During automaton construction, any prefix string $W$ that matches patterns
-    /// decomposes into a sequence of non-overlapping committed matches:
-    /// $M_1 \text{ (earliest)} \to M_2 \to \dots \to M_k \text{ (latest)}$,
-    /// followed by an active in-flight suffix represented by `state.fail()`.
-    ///
-    /// Because `state.output_pos()` stores matches occurring *before* the active suffix,
-    /// any mismatch or EOF condition must also drain `state.fail()` to flush pending
-    /// non-overlapping matches that reside inside the trailing active suffix.
-    ///
-    /// In the emit pool, these matches are stored in reverse chronological order:
-    /// `head` is $M_k$, which links via `pred` to $M_{k-1}$, and eventually to $M_1$ (`pred == None`).
-    ///
-    /// # Backward Inductive Recurrence
-    ///
-    /// Given the scan position $P = \text{pos}$ at mismatch:
-    ///
-    /// - **Base anchor**: $\text{anchor}_k = P$
-    /// - **Head match $M_k$**: $\text{end}(M_k) = \text{anchor}_k - M_k.\text{gap}$, $\text{start}(M_k) = \text{end}(M_k) - M_k.\text{length}$
-    /// - **Inductive step for $M_{i-1}$**: $\text{anchor}_{i-1} = \text{start}(M_i)$
-    /// - **Predecessor match $M_{i-1}$**: $\text{end}(M_{i-1}) = \text{anchor}_{i-1} - M_{i-1}.\text{gap}$, $\text{start}(M_{i-1}) = \text{end}(M_{i-1}) - M_{i-1}.\text{length}$
-    ///
-    /// # Safety
-    ///
-    /// - `head_pos` and all chained `pred` links must point to valid entries in `self.emits`.
-    /// - `anchor` must be greater than or equal to the total span length of the chain.
-    #[inline(always)]
-    #[doc(hidden)]
-    pub unsafe fn iter_emits(
-        &self,
-        head_pos: NonZeroU32,
-        mut anchor: usize,
-    ) -> impl Iterator<Item = Match<V>> + '_
-    where
-        V: Copy,
-    {
-        let mut curr = Some(head_pos);
-        core::iter::from_fn(move || {
-            let idx = curr?;
-            // SAFETY: caller guarantees head_pos and all chained pred links are valid indices in self.emits.
-            let emit = unsafe { self.emits.get_unchecked(idx.get() as usize - 1) };
-            let end = anchor - emit.gap as usize;
-            anchor = end - emit.length as usize;
-            curr = emit.pred;
-            Some(emit.to_match(end))
-        })
-    }
-
     /// # Safety
     ///
     /// `state_id` must be smaller than the length of states.
@@ -1486,8 +1398,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[doc(hidden)]
-pub struct State {
+struct State {
     base: Option<NonZeroU32>,
     check: u32,
     /// Failure transition state index.
@@ -1514,22 +1425,26 @@ impl Default for State {
 }
 
 impl State {
+    #[must_use]
     #[inline(always)]
     pub const fn base(&self) -> Option<NonZeroU32> {
         self.base
     }
 
+    #[must_use]
     #[inline(always)]
     pub const fn check(&self) -> u32 {
         self.check
     }
 
     /// Returns the target failure state index.
+    #[must_use]
     #[inline(always)]
     pub const fn fail(&self) -> u32 {
         self.fail
     }
 
+    #[must_use]
     #[inline(always)]
     pub const fn output_pos(&self) -> Option<NonZeroU32> {
         self.output_pos

@@ -404,6 +404,7 @@ fn charwise_serialization_roundtrip_experimental() {
             .collect();
         assert_eq!(expected, actual);
 
+        // SAFETY: `bytes` was produced by `pma.serialize()` from a valid automaton.
         let (other_unchecked, _) =
             unsafe { CharwiseDoubleArrayAhoCorasick::<u32>::deserialize_unchecked(&bytes) };
         let actual_unchecked: Vec<_> = other_unchecked

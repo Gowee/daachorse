@@ -819,11 +819,15 @@ where
                 // Advance down the trie if transition exists on alphabet code, or follow failure links on mismatch.
                 loop {
                     // SAFETY: state_id is a valid state index.
-                    let state = unsafe { states.get_unchecked(state_id as usize) };
+                    let state = unsafe { states.get_unchecked(usize::from_u32(state_id)) };
                     if let Some(base) = state.base() {
                         // Double-array child transition lookup: child_id = base ^ code
                         let child_id = base.get() ^ code;
-                        if unsafe { states.get_unchecked(child_id as usize).check() } == state_id {
+                        // SAFETY: In a double-array trie, for any allocated state with `base`,
+                        // child_id = base ^ code is guaranteed to fall strictly within the allocated bounds of `states`.
+                        if unsafe { states.get_unchecked(usize::from_u32(child_id)).check() }
+                            == state_id
+                        {
                             // Child transition found: advance state and break out of inner loop
                             // to consume `char_len` bytes in the text.
                             state_id = child_id;
@@ -851,8 +855,10 @@ where
                         //    we immediately attempt to transition from `ROOT_STATE_IDX` on `code` using `step_root`.
                         //    This consumes `c` in the same cycle (`self.pos = pos + char_len`), avoiding redundant
                         //    loop re-entry and stack spills.
+                        // SAFETY: Invariants 1-3 guarantee that every leaf state has a valid `output_pos` pointing
+                        // to a single-match emit node in `emits`. `states` has ROOT_STATE_IDX and `code` is in alphabet.
                         let ep = unsafe { state.output_pos().unwrap_unchecked() };
-                        let emit = unsafe { emits.get_unchecked(ep.get() as usize - 1) };
+                        let emit = unsafe { emits.get_unchecked(usize::from_u32(ep.get()) - 1) };
                         self.state_id = unsafe { Self::step_root(states, code) };
                         self.pos = pos + char_len;
                         return Some(emit.to_match(pos));
@@ -869,11 +875,13 @@ where
                         // that occurred *before* the active suffix `state.fail()`.
                         // Extract all matches in the chain: the earliest match is returned directly,
                         // and any subsequent matches are buffered into `self.buf` for LIFO popping.
-                        let m = Self::extract_emits(emits, ep, pos, &mut self.buf);
+                        // SAFETY: `ep` is a valid emit index from `state.output_pos()`, and `pos >= pattern_length`.
+                        let m = unsafe { Self::extract_emits(emits, ep, pos, &mut self.buf) };
                         if state_id == ROOT_STATE_IDX {
                             // Active suffix collapsed to ROOT (empty trailing suffix).
                             // Greedily step `ROOT` on the current character `code` in the same cycle
                             // and advance past `c` (`pos + char_len`).
+                            // SAFETY: `states` has ROOT_STATE_IDX and `code` is in alphabet.
                             self.state_id = unsafe { Self::step_root(states, code) };
                             self.pos = pos + char_len;
                         } else {
@@ -895,8 +903,10 @@ where
                 // Otherwise, `drain_fail_chain` inspects bit 31 (`fail_has_emit`) to skip non-emitting
                 // failure chains in O(1).
                 if state_id != ROOT_STATE_IDX {
-                    let (next_state_id, m) =
-                        Self::drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
+                    // SAFETY: `state_id` is a valid state index, and pos sits on a valid character boundary.
+                    let (next_state_id, m) = unsafe {
+                        Self::drain_fail_chain(states, emits, &mut self.buf, state_id, pos)
+                    };
                     if let Some(m) = m {
                         // Match found in the active suffix. Retain `self.pos = pos` so that any additional
                         // matches along deeper failure links can be drained on subsequent calls.
@@ -913,7 +923,9 @@ where
         }
 
         // Text boundary reached (EOF). Drain any remaining matches residing in trailing active suffixes.
-        let (next_state_id, m) = Self::drain_fail_chain(states, emits, &mut self.buf, state_id, pos);
+        // SAFETY: `state_id` is a valid state index, and pos sits on a valid character boundary.
+        let (next_state_id, m) =
+            unsafe { Self::drain_fail_chain(states, emits, &mut self.buf, state_id, pos) };
         self.pos = pos;
         self.state_id = next_state_id;
         m
@@ -945,9 +957,14 @@ where
     ///   is strictly within the bounds of `states`.
     #[inline(always)]
     unsafe fn step_root(states: &[State], code: u32) -> u32 {
-        if let Some(base) = states.get_unchecked(ROOT_STATE_IDX as usize).base() {
+        // SAFETY: caller guarantees `states` contains at least `ROOT_STATE_IDX + 1` elements.
+        if let Some(base) = unsafe { states.get_unchecked(usize::from_u32(ROOT_STATE_IDX)).base() }
+        {
             let child_id = base.get() ^ code;
-            if states.get_unchecked(child_id as usize).check() == ROOT_STATE_IDX {
+            // SAFETY: caller guarantees `states` is a valid double-array table, ensuring that for any
+            // valid `base` and mapped `code`, `child_id` falls strictly within the allocated bounds of `states`.
+            if unsafe { states.get_unchecked(usize::from_u32(child_id)).check() } == ROOT_STATE_IDX
+            {
                 return child_id;
             }
         }
@@ -978,7 +995,7 @@ where
     /// - `head_pos` and all reachable `pred` indices must be valid 1-based indices into `emits`.
     /// - `anchor` must be greater than or equal to the total span length of the chain.
     #[inline(always)]
-    fn extract_emits(
+    unsafe fn extract_emits(
         emits: &[crate::Emit<V>],
         head_pos: NonZeroU32,
         mut anchor: usize,
@@ -987,9 +1004,9 @@ where
         let mut curr_ep = head_pos;
         loop {
             // SAFETY: head_pos and all chained pred links are valid 1-based indices in emits.
-            let emit = unsafe { emits.get_unchecked(curr_ep.get() as usize - 1) };
-            let end = anchor - emit.gap as usize;
-            anchor = end - emit.length as usize;
+            let emit = unsafe { emits.get_unchecked(usize::from_u32(curr_ep.get()) - 1) };
+            let end = anchor - usize::from_u32(emit.gap);
+            anchor = end - usize::from_u32(emit.length);
             let m = emit.to_match(end);
             let Some(pred) = emit.pred else {
                 return m;
@@ -1027,8 +1044,14 @@ where
     /// A tuple `(next_state_id, Option<Match<V>>)`:
     /// - If a match is found, returns the next failure state and `Some(match)`.
     /// - If no further matches exist along the failure chain, returns `(ROOT_STATE_IDX, None)`.
+    ///
+    /// # Safety
+    ///
+    /// - `state_id` must be a valid state index in `states`.
+    /// - All failure links reachable from `state_id` must be valid state indices in `states`.
+    /// - Any `output_pos` on reachable states must satisfy the safety contract of [`Self::extract_emits()`].
     #[inline(always)]
-    fn drain_fail_chain(
+    unsafe fn drain_fail_chain(
         states: &[State],
         emits: &[crate::Emit<V>],
         buf: &mut alloc::vec::Vec<Match<V>>,
@@ -1036,13 +1059,15 @@ where
         pos: usize,
     ) -> (u32, Option<Match<V>>) {
         while state_id != ROOT_STATE_IDX {
-            let state = unsafe { states.get_unchecked(state_id as usize) };
+            // SAFETY: caller guarantees state_id is a valid state index in states.
+            let state = unsafe { states.get_unchecked(usize::from_u32(state_id)) };
             if !Self::fail_has_emit(state) {
                 break;
             }
             state_id = Self::fail_id(state);
             if let Some(ep) = state.output_pos() {
-                let m = Self::extract_emits(emits, ep, pos, buf);
+                // SAFETY: caller guarantees states and emits invariants are preserved.
+                let m = unsafe { Self::extract_emits(emits, ep, pos, buf) };
                 return (state_id, Some(m));
             }
         }
@@ -1080,8 +1105,9 @@ where
         }
 
         let bytes = self.haystack.as_ref().as_bytes();
-        let target = self.buf.last().map_or(bytes.len(), |m| m.start());
-        let epsilon = unsafe { self.pma.emits.get_unchecked(ep.get() as usize - 1) };
+        let target = self.buf.last().map_or(bytes.len(), Match::start);
+        // SAFETY: `ep` is verified during automaton construction to point to a valid emit node for the empty pattern.
+        let epsilon = unsafe { self.pma.emits.get_unchecked(usize::from_u32(ep.get()) - 1) };
 
         debug_assert_eq!(epsilon.length, 0);
         debug_assert_eq!(epsilon.gap, 0);
@@ -1090,6 +1116,7 @@ where
         // Emit zero-length matches at character boundaries prior to the start of the next non-empty match:
         if self.epsilon_cursor < target {
             let cursor = self.epsilon_cursor;
+            // SAFETY: `self.epsilon_cursor < target <= bytes.len()`, and cursor sits on a valid UTF-8 character boundary.
             let (_, char_len) = unsafe { decode_char_unchecked(bytes, self.epsilon_cursor) };
             self.epsilon_cursor += char_len;
             return Some(epsilon.to_match(cursor));
@@ -1098,6 +1125,7 @@ where
         // Emit the non-empty match and advance cursor past its end:
         if let Some(m) = self.buf.pop() {
             self.epsilon_cursor = if m.end() < bytes.len() {
+                // SAFETY: guarded by `m.end() < bytes.len()`, and match boundaries in UTF-8 automata sit on character boundaries.
                 let (_, char_len) = unsafe { decode_char_unchecked(bytes, m.end()) };
                 m.end() + char_len
             } else {
@@ -1114,180 +1142,6 @@ where
 
         self.epsilon_emit_pos = None;
         None
-    }
-}
-
-/// Helper to extract emits in forward order as originally implemented in commit `6695258`.
-#[inline(always)]
-fn extract_emits_v6695258<V: Copy>(
-    emits: &[crate::Emit<V>],
-    head_pos: u32,
-    pos: usize,
-    buf: &mut alloc::vec::Vec<Match<V>>,
-) -> Match<V> {
-    let first_emit = unsafe { emits.get_unchecked(head_pos as usize - 1) };
-    let end = pos - first_emit.gap as usize;
-    let start = end - first_emit.length as usize;
-    let first_match = first_emit.to_match(end);
-
-    let Some(pred) = first_emit.pred else {
-        return first_match;
-    };
-
-    buf.push(first_match);
-    let mut last_start = start;
-    let mut curr_ep = pred;
-    loop {
-        let em = unsafe { emits.get_unchecked(curr_ep.get() as usize - 1) };
-        let end = last_start - em.gap as usize;
-        let start = end - em.length as usize;
-        let m = em.to_match(end);
-        if let Some(next_pred) = em.pred {
-            buf.push(m);
-            last_start = start;
-            curr_ep = next_pred;
-        } else {
-            return m;
-        }
-    }
-}
-
-/// Helper to transition from ROOT on character `c` as originally implemented in commit `6695258`.
-#[inline(always)]
-fn step_root_v6695258(
-    mapped_c: Option<u32>,
-    root_base: Option<core::num::NonZeroU32>,
-    states: &[crate::charwise::State],
-) -> u32 {
-    if let (Some(code), Some(base)) = (mapped_c, root_base) {
-        let child_idx = (base.get() ^ code) as usize;
-        if child_idx < states.len()
-            && unsafe { states.get_unchecked(child_idx).check() } == ROOT_STATE_IDX
-        {
-            return child_idx as u32;
-        }
-    }
-    ROOT_STATE_IDX
-}
-
-/// Advances the zero-rewind leftmost-longest match iterator by one match, exactly as in commit `6695258`.
-#[inline(always)]
-pub(crate) fn next_leftmost_longest_match_v6695258<V: Copy>(
-    pma: &CharwiseDoubleArrayAhoCorasick<V>,
-    haystack: &str,
-    pos: &mut usize,
-    state_id: &mut u32,
-    buf: &mut alloc::vec::Vec<Match<V>>,
-) -> Option<Match<V>> {
-    if let Some(m) = buf.pop() {
-        return Some(m);
-    }
-
-    let bytes = haystack.as_bytes();
-    let text_len = bytes.len();
-    let states = pma.states.as_slice();
-    let states_len = states.len();
-    let root_base = unsafe { states.get_unchecked(ROOT_STATE_IDX as usize).base() };
-
-    while *pos < text_len {
-        let (c, char_len) = unsafe { decode_char_unchecked(bytes, *pos) };
-        let mapped_c = pma.mapper.get(c);
-
-        if *state_id == ROOT_STATE_IDX {
-            *state_id = step_root_v6695258(mapped_c, root_base, states);
-            *pos += char_len;
-            continue;
-        }
-
-        'step: loop {
-            if let Some(code) = mapped_c {
-                if let Some(base) = unsafe { states.get_unchecked(*state_id as usize).base() } {
-                    let child_idx = (base.get() ^ code) as usize;
-                    if child_idx < states_len
-                        && unsafe { states.get_unchecked(child_idx).check() } == *state_id
-                    {
-                        *state_id = child_idx as u32;
-                        *pos += char_len;
-                        break 'step;
-                    }
-                }
-            }
-
-            let emit_pos = unsafe { states.get_unchecked(*state_id as usize).output_pos() };
-            let target_state = unsafe { states.get_unchecked(*state_id as usize).fail() };
-            *state_id = target_state;
-
-            if let Some(ep) = emit_pos {
-                let first_match = extract_emits_v6695258(&pma.emits, ep.get(), *pos, buf);
-                if *state_id == ROOT_STATE_IDX {
-                    *state_id = step_root_v6695258(mapped_c, root_base, states);
-                    *pos += char_len;
-                }
-                return Some(first_match);
-            }
-
-            if *state_id == ROOT_STATE_IDX {
-                *state_id = step_root_v6695258(mapped_c, root_base, states);
-                *pos += char_len;
-                break 'step;
-            }
-        }
-    }
-
-    while *state_id != ROOT_STATE_IDX {
-        let emit_pos = unsafe { states.get_unchecked(*state_id as usize).output_pos() };
-        let target_state = unsafe { states.get_unchecked(*state_id as usize).fail() };
-        *state_id = target_state;
-        if let Some(ep) = emit_pos {
-            let first_match = extract_emits_v6695258(&pma.emits, ep.get(), *pos, buf);
-            return Some(first_match);
-        }
-    }
-
-    None
-}
-
-/// Dedicated iterator for leftmost-longest searching as originally implemented in commit `6695258b6cebf7ce8c784f03bbf0362b7a989e8e`.
-pub struct LeftmostLongestFindIteratorV6695258<'a, P, V> {
-    pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
-    pub(crate) haystack: P,
-    pub(crate) pos: usize,
-    pub(crate) state_id: u32,
-    pub(crate) buf: alloc::vec::Vec<Match<V>>,
-}
-
-impl<'a, P, V> LeftmostLongestFindIteratorV6695258<'a, P, V>
-where
-    P: AsRef<str>,
-    V: Copy,
-{
-    pub(crate) fn new(pma: &'a CharwiseDoubleArrayAhoCorasick<V>, haystack: P) -> Self {
-        Self {
-            pma,
-            haystack,
-            pos: 0,
-            state_id: ROOT_STATE_IDX,
-            buf: alloc::vec::Vec::new(),
-        }
-    }
-}
-
-impl<P, V> Iterator for LeftmostLongestFindIteratorV6695258<'_, P, V>
-where
-    P: AsRef<str>,
-    V: Copy,
-{
-    type Item = Match<V>;
-
-    #[inline(always)]
-    fn next(&mut self) -> Option<Self::Item> {
-        next_leftmost_longest_match_v6695258(
-            self.pma,
-            self.haystack.as_ref(),
-            &mut self.pos,
-            &mut self.state_id,
-            &mut self.buf,
-        )
     }
 }
 
