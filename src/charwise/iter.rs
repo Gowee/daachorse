@@ -1275,14 +1275,27 @@ where
             // The output list of a state contains patterns ending at that state, followed by
             // shorter patterns registered for its suffixes, which must be skipped.
             if let Some(output_pos) = self.output_pos.take() {
-                let Some(out) = self.pma.outputs.get(usize::from_u32(output_pos.get() - 1)) else {
-                    // Reached only by malformed automata. Stops iteration permanently.
-                    self.stack.clear();
-                    return None;
-                };
-                if usize::from_u32(out.length) == self.pattern.len() {
-                    self.output_pos = out.parent();
-                    return Some((self.pattern.clone(), out.value()));
+                if self.pma.match_kind.is_experimental() {
+                    let Some(emit) = self.pma.emits.get(usize::from_u32(output_pos.get() - 1))
+                    else {
+                        // Reached only by malformed automata. Stops iteration permanently.
+                        self.stack.clear();
+                        return None;
+                    };
+                    if emit.gap == 0 && usize::from_u32(emit.length) == self.pattern.len() {
+                        return Some((self.pattern.clone(), emit.value));
+                    }
+                } else {
+                    let Some(out) = self.pma.outputs.get(usize::from_u32(output_pos.get() - 1))
+                    else {
+                        // Reached only by malformed automata. Stops iteration permanently.
+                        self.stack.clear();
+                        return None;
+                    };
+                    if usize::from_u32(out.length) == self.pattern.len() {
+                        self.output_pos = out.parent();
+                        return Some((self.pattern.clone(), out.value()));
+                    }
                 }
             }
             let (base, next, end) = self.stack.last_mut()?;

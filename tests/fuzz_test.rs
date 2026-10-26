@@ -490,3 +490,135 @@ fn test_fuzz_with_empty_pattern() {
         }
     }
 }
+
+#[test]
+fn test_fuzz_iter_pattern_reconstruction() {
+    let alphabets: &[(&str, &[char])] = &[
+        ("binary", &['a', 'b']),
+        ("small_ascii", &['a', 'b', 'c', 'd', 'e']),
+        ("cjk_emoji", &['中', '文', '字', '符', '🦀', '🚀']),
+        (
+            "unicode_boundaries",
+            &[
+                '\u{0}',
+                'a',
+                '\u{7f}',
+                '\u{80}',
+                '\u{7ff}',
+                '\u{800}',
+                '\u{ffff}',
+                '\u{10000}',
+                '\u{10ffff}',
+            ],
+        ),
+    ];
+
+    let mut rng = Rng::new(0x1337_c0de_cafe_babe);
+
+    for (name, alphabet) in alphabets {
+        for round in 0..500 {
+            let num_pats = rng.gen_range(0, 30);
+            let mut patvals: Vec<(String, u32)> = Vec::with_capacity(num_pats);
+
+            for v in 0..num_pats {
+                // Generate pattern, with occasional empty string or duplicate strings
+                let p = if v == 0 && rng.gen_range(0, 5) == 0 {
+                    String::new()
+                } else if !patvals.is_empty() && rng.gen_range(0, 6) == 0 {
+                    // Introduce deliberate duplicate with distinct value
+                    let idx = rng.gen_range(0, patvals.len());
+                    patvals[idx].0.clone()
+                } else {
+                    rng.gen_string(alphabet, 0, 10)
+                };
+                patvals.push((p, u32::try_from(v).unwrap()));
+            }
+
+            // Ground truth for LeftmostLongestExperimental:
+            // Deduplicated by pattern string (first registered value wins), sorted lexicographically.
+            let mut expected_longest: Vec<(String, u32)> = Vec::new();
+            for (p, val) in &patvals {
+                if !expected_longest.iter().any(|(x, _)| x == p) {
+                    expected_longest.push((p.clone(), *val));
+                }
+            }
+            expected_longest.sort_by(|a, b| a.0.cmp(&b.0));
+
+            // 1. Invariant: LeftmostLongestExperimental iter() matches deduplicated ground truth
+            let pma_exp_longest: CharwiseDoubleArrayAhoCorasick<u32> =
+                CharwiseDoubleArrayAhoCorasickBuilder::new()
+                    .match_kind(MatchKind::LeftmostLongestExperimental)
+                    .build_with_values(patvals.clone())
+                    .unwrap();
+
+            let actual_longest: Vec<(String, u32)> = pma_exp_longest.iter().collect();
+            assert_eq!(
+                actual_longest, expected_longest,
+                "[{}] Round {}: LeftmostLongestExperimental iter() mismatch against ground truth",
+                name, round
+            );
+
+            // 2. Invariant: Serialization roundtrip preserves iter()
+            let bytes = pma_exp_longest.serialize();
+            let (pma_deser, _) =
+                CharwiseDoubleArrayAhoCorasick::<u32>::deserialize(&bytes).unwrap();
+            let actual_deser: Vec<(String, u32)> = pma_deser.iter().collect();
+            assert_eq!(
+                actual_deser, expected_longest,
+                "[{}] Round {}: Deserialized iter() mismatch against ground truth",
+                name, round
+            );
+
+            // 3. Invariant: Prefilter on vs off yields identical iter()
+            let pma_prefiltered: CharwiseDoubleArrayAhoCorasick<u32> =
+                CharwiseDoubleArrayAhoCorasickBuilder::new()
+                    .match_kind(MatchKind::LeftmostLongestExperimental)
+                    .use_prefilter(true)
+                    .build_with_values(patvals.clone())
+                    .unwrap();
+            let actual_prefiltered: Vec<(String, u32)> = pma_prefiltered.iter().collect();
+            assert_eq!(
+                actual_prefiltered, expected_longest,
+                "[{}] Round {}: Prefiltered iter() mismatch",
+                name, round
+            );
+
+            // 4. Invariant: When there are no duplicate patterns, experimental matches legacy exactly
+            let has_duplicates = patvals.len() != expected_longest.len();
+            if !has_duplicates {
+                // A. LeftmostLongest: Legacy vs Experimental
+                let pma_legacy_longest: CharwiseDoubleArrayAhoCorasick<u32> =
+                    CharwiseDoubleArrayAhoCorasickBuilder::new()
+                        .match_kind(MatchKind::LeftmostLongest)
+                        .build_with_values(patvals.clone())
+                        .unwrap();
+                let legacy_longest: Vec<(String, u32)> = pma_legacy_longest.iter().collect();
+                assert_eq!(
+                    actual_longest, legacy_longest,
+                    "[{}] Round {}: LeftmostLongestExperimental vs legacy iter() mismatch",
+                    name, round
+                );
+
+                // B. LeftmostFirst: Legacy vs Experimental
+                let pma_legacy_first: CharwiseDoubleArrayAhoCorasick<u32> =
+                    CharwiseDoubleArrayAhoCorasickBuilder::new()
+                        .match_kind(MatchKind::LeftmostFirst)
+                        .build_with_values(patvals.clone())
+                        .unwrap();
+                let pma_exp_first: CharwiseDoubleArrayAhoCorasick<u32> =
+                    CharwiseDoubleArrayAhoCorasickBuilder::new()
+                        .match_kind(MatchKind::LeftmostFirstExperimental)
+                        .build_with_values(patvals.clone())
+                        .unwrap();
+
+                let legacy_first: Vec<(String, u32)> = pma_legacy_first.iter().collect();
+                let exp_first: Vec<(String, u32)> = pma_exp_first.iter().collect();
+                assert_eq!(
+                    exp_first, legacy_first,
+                    "[{}] Round {}: LeftmostFirstExperimental vs legacy iter() mismatch",
+                    name, round
+                );
+            }
+        }
+    }
+}

@@ -915,9 +915,10 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 
     /// Returns an iterator that yields all registered pattern-value pairs in lexicographical order.
     ///
-    /// When using [`MatchKind::LeftmostFirst`], patterns registered after any of their proper
-    /// prefixes can never be matched. Consequently, they are not stored in the automaton and
-    /// will not be yielded.
+    /// When using [`MatchKind::LeftmostFirst`] or [`MatchKind::LeftmostFirstExperimental`], patterns
+    /// registered after any of their proper prefixes can never be matched. Consequently, they are
+    /// not stored in the automaton and will not be yielded. Under experimental leftmost matching,
+    /// duplicate pattern strings yield only the first-registered value.
     ///
     /// # Examples
     ///
