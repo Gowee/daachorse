@@ -1058,7 +1058,6 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             self.states.serialized_bytes()
                 + self.mapper.serialized_bytes()
                 + self.outputs.serialized_bytes()
-                + self.emits.serialized_bytes()
                 + MatchKind::serialized_bytes()
                 + u32::serialized_bytes()
                 // A serialized None is a single flag byte; see the Serializable impl of Option.
@@ -1067,15 +1066,22 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
                     .as_ref()
                     .map_or_else(u8::serialized_bytes, |_| {
                         Option::<Prefilter>::serialized_bytes()
-                    }),
+                    })
+                + if self.match_kind.is_experimental() {
+                    self.emits.serialized_bytes()
+                } else {
+                    0
+                },
         );
         self.states.serialize_to_vec(&mut result);
         self.mapper.serialize_to_vec(&mut result);
         self.outputs.serialize_to_vec(&mut result);
-        self.emits.serialize_to_vec(&mut result);
         self.match_kind.serialize_to_vec(&mut result);
         self.num_states.serialize_to_vec(&mut result);
         self.prefilter.serialize_to_vec(&mut result);
+        if self.match_kind.is_experimental() {
+            self.emits.serialize_to_vec(&mut result);
+        }
         result
     }
 
@@ -1132,10 +1138,14 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         let (states, source) = Vec::<State>::deserialize_from_slice(source)?;
         let (mapper, source) = CodeMapper::deserialize_from_slice(source)?;
         let (outputs, source) = Vec::<Output<V>>::deserialize_from_slice(source)?;
-        let (emits, source) = Vec::<Emit<V>>::deserialize_from_slice(source)?;
         let (match_kind, source) = MatchKind::deserialize_from_slice(source)?;
         let (num_states, source) = u32::deserialize_from_slice(source)?;
         let (prefilter, source) = Option::<Prefilter>::deserialize_from_slice(source)?;
+        let (emits, source) = if match_kind.is_experimental() {
+            Vec::<Emit<V>>::deserialize_from_slice(source)?
+        } else {
+            (vec![], source)
+        };
         let pma = Self {
             states,
             mapper,
@@ -1258,11 +1268,15 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         let (states, source) = Vec::<State>::deserialize_from_slice(source).unwrap_unchecked();
         let (mapper, source) = CodeMapper::deserialize_from_slice(source).unwrap_unchecked();
         let (outputs, source) = Vec::<Output<V>>::deserialize_from_slice(source).unwrap_unchecked();
-        let (emits, source) = Vec::<Emit<V>>::deserialize_from_slice(source).unwrap_unchecked();
         let (match_kind, source) = MatchKind::deserialize_from_slice(source).unwrap_unchecked();
         let (num_states, source) = u32::deserialize_from_slice(source).unwrap_unchecked();
         let (prefilter, source) =
             Option::<Prefilter>::deserialize_from_slice(source).unwrap_unchecked();
+        let (emits, source) = if match_kind.is_experimental() {
+            Vec::<Emit<V>>::deserialize_from_slice(source).unwrap_unchecked()
+        } else {
+            (vec![], source)
+        };
         (
             Self {
                 states,
