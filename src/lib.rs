@@ -354,11 +354,13 @@ where
 /// between the end of this match and the start of the next match.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Emit<V> {
+    /// Value associated with the pattern.
     pub(crate) value: V,
+    /// Pattern length in bytes.
     pub(crate) length: u32,
-    // Relative byte distance to the state boundary (head) or next match (predecessor).
+    /// Relative byte distance to the state boundary (head) or next match (predecessor).
     pub(crate) gap: u32,
-    // 1-based index pointing to the preceding match in this chain.
+    /// 1-based index pointing to the preceding match in this chain.
     pub(crate) pred: Option<NonZeroU32>,
 }
 
@@ -489,7 +491,8 @@ where
 }
 
 /// A search option of the Aho-Corasick automaton
-/// specified in [`DoubleArrayAhoCorasickBuilder::match_kind`].
+/// specified in [`DoubleArrayAhoCorasickBuilder::match_kind`] or
+/// [`CharwiseDoubleArrayAhoCorasickBuilder::match_kind`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum MatchKind {
@@ -517,12 +520,16 @@ pub enum MatchKind {
     ///
     /// This enables [`leftmost_find_iter_experimental()`](CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()).
     /// When multiple patterns start at the same position, the longest pattern is reported.
+    ///
+    /// Note: Currently supported only on [`CharwiseDoubleArrayAhoCorasick`].
     LeftmostLongestExperimental = 3,
 
     /// Experimental leftmost-first match semantics guaranteeing worst-case linear time $\mathcal{O}(N)$.
     ///
     /// This enables [`leftmost_find_iter_experimental()`](CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()).
     /// When multiple patterns start at the same position, the pattern that was registered earlier is reported.
+    ///
+    /// Note: Currently supported only on [`CharwiseDoubleArrayAhoCorasick`].
     LeftmostFirstExperimental = 4,
 }
 
@@ -644,6 +651,22 @@ mod tests {
         x.serialize_to_vec(&mut data);
         assert_eq!(data.len(), MatchKind::serialized_bytes());
         let (y, rest) = MatchKind::deserialize_from_slice(&data).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(x, y);
+    }
+
+    #[test]
+    fn test_serialize_emit() {
+        let x = Emit {
+            value: 42u32,
+            length: 57,
+            gap: 10,
+            pred: NonZeroU32::new(13),
+        };
+        let mut data = vec![];
+        x.serialize_to_vec(&mut data);
+        assert_eq!(data.len(), Emit::<u32>::serialized_bytes());
+        let (y, rest) = Emit::deserialize_from_slice(&data).unwrap();
         assert!(rest.is_empty());
         assert_eq!(x, y);
     }
