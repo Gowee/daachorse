@@ -57,9 +57,8 @@ use crate::{Emit, MatchKind, Output, DEAD_STATE_IDX, ROOT_STATE_IDX};
 pub struct CharwiseDoubleArrayAhoCorasick<V> {
     states: Vec<State>,
     mapper: CodeMapper,
-    /// Dictionary suffix link outputs used by standard and legacy leftmost matching.
     outputs: Vec<Output<V>>,
-    /// Pre-committed match chains used exclusively by experimental zero-rewind leftmost matching.
+    /// Committed match chains for experimental leftmost matching.
     emits: Vec<Emit<V>>,
     match_kind: MatchKind,
     num_states: u32,
@@ -574,7 +573,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         assert!(
             self.match_kind == MatchKind::LeftmostFirst
                 || self.match_kind == MatchKind::LeftmostLongest,
-            "Error: match_kind must be leftmost_first or leftmost_longest. For experimental matching, use leftmost_find_iter_experimental()."
+            "Error: match_kind must be leftmost_first or leftmost_longest. For experimental leftmost, use leftmost_find_iter_experimental()."
         );
         LeftmostFindIterator {
             pma: self,
@@ -590,12 +589,9 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         }
     }
 
-    /// Returns an iterator of non-overlapping leftmost matches in the input text using
-    /// the experimental zero-rewind algorithm.
+    /// Returns an iterator of non-overlapping leftmost matches in the input text.
     ///
-    /// This method uses a zero-rewind forward-only stream matching algorithm with reverse
-    /// delta-encoded match chains, guaranteeing worst-case linear time $O(N)$
-    /// over the text length.
+    /// Matches are evaluated in a single forward pass in worst-case linear time $\mathcal{O}(N)$.
     ///
     /// # Arguments
     ///
@@ -1401,15 +1397,9 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 struct State {
     base: Option<NonZeroU32>,
     check: u32,
-    /// Failure transition state index.
+    // Failure state index. In experimental leftmost matching, bit 31 flags if the failure chain has emits.
     fail: u32,
-    /// 1-based index pointing to the head of the output/emit chain.
-    ///
-    /// This field has dual semantics depending on `MatchKind` to keep `State` at exactly 16 bytes:
-    /// - **Standard / LeftmostFirst / LeftmostLongest**: 1-based index into `outputs: Vec<Output<V>>`
-    ///   (dictionary suffix link chain, traversed via `Output::parent()`).
-    /// - **LeftmostLongestExperimental / LeftmostFirstExperimental**: 1-based index into `emits: Vec<Emit<V>>`
-    ///   (reverse delta-encoded pre-committed match chain, traversed via `Emit::pred()`).
+    // 1-based index into `outputs` (standard/legacy) or `emits` (experimental).
     output_pos: Option<NonZeroU32>,
 }
 

@@ -344,42 +344,21 @@ where
     }
 }
 
-/// An output node used in zero-rewind leftmost matching with gap chaining.
+/// An emit node representing a committed match in experimental leftmost matching.
 ///
-/// In zero-rewind leftmost matching, each state commits a sequence of non-overlapping
-/// matches `[M_1, M_2, ..., M_k]`. These matches are linked in reverse chronological order
-/// (`M_k -> M_{k-1} -> ... -> M_1`) via `pred`.
+/// Matches are linked in reverse order via `pred`, allowing different trie branches to
+/// share common predecessor chains.
 ///
-/// # Field Semantics
-///
-/// - `value`: The payload / value associated with this matched pattern.
-/// - `length`: The matched pattern's length in bytes.
-/// - `gap`: The byte distance from this match to the next reference point:
-///   - For the latest match `M_k` (the head of the chain):
-///     `gap = total_prefix_bytes - end_byte(M_k)`
-///   - For any predecessor match `M_i` (where `i < k`):
-///     `gap = start_byte(M_{i+1}) - end_byte(M_i)`
-/// - `pred`: Pointer (1-based index) to the preceding non-overlapping match `M_{i-1}`
-///   in this prefix, or `None` if this is the earliest match `M_1`.
-///
-/// This relative delta-encoding allows computing exact match offsets in O(1) time
-/// during single-pass streaming without retaining past text buffers.
-///
-/// # Structural Sharing & Space Complexity
-///
-/// While states inherit and extend match chains via functional `cons`, the total number of
-/// unique `Emit` nodes across the entire automaton is bounded to `Ω(|P|) ~ O(|V|)`
-/// (where `|P|` is the number of patterns and `|V|` is the number of Trie states).
-/// This is guaranteed because:
-/// 1. Non-overlapping matches along any path of depth `D` cannot exceed `D`.
-/// 2. Suffix harvesting only copies the localized suffix candidate slice, while ancestor
-///    matches are 100% structurally shared without copying.
-/// 3. Identical `Emit` value nodes are collapsed into a canonical DAG via hash deduplication.
+/// For the head of a chain, `gap` is the byte distance from the state's boundary (the mismatch
+/// position) to the end of the match. For a predecessor match, `gap` is the byte distance
+/// between the end of this match and the start of the next match.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Emit<V> {
     pub(crate) value: V,
     pub(crate) length: u32,
+    // Relative byte distance to the state boundary (head) or next match (predecessor).
     pub(crate) gap: u32,
+    // 1-based index pointing to the preceding match in this chain.
     pub(crate) pred: Option<NonZeroU32>,
 }
 
@@ -423,6 +402,7 @@ where
         }
     }
 
+    /// Converts this emit into a [`Match`] ending at `end`.
     #[inline(always)]
     pub(crate) fn to_match(self, end: usize) -> Match<V> {
         Match {
@@ -533,18 +513,16 @@ pub enum MatchKind {
     /// reported.
     LeftmostFirst = 2,
 
-    /// Experimental leftmost-longest match semantics using a zero-rewind automaton with delta-encoded match chains.
+    /// Experimental leftmost-longest match semantics guaranteeing worst-case linear time $\mathcal{O}(N)$.
     ///
-    /// This enables [`leftmost_find_iter_experimental()`](CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()),
-    /// executing single-pass forward streaming matching in guaranteed $O(N)$ worst-case time without
-    /// text rewinding or backtracking.
+    /// This enables [`leftmost_find_iter_experimental()`](CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()).
+    /// When multiple patterns start at the same position, the longest pattern is reported.
     LeftmostLongestExperimental = 3,
 
-    /// Experimental leftmost-first match semantics using a zero-rewind automaton with delta-encoded match chains.
+    /// Experimental leftmost-first match semantics guaranteeing worst-case linear time $\mathcal{O}(N)$.
     ///
-    /// This enables [`leftmost_find_iter_experimental()`](CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()),
-    /// executing single-pass forward streaming matching in guaranteed $O(N)$ worst-case time without
-    /// text rewinding or backtracking.
+    /// This enables [`leftmost_find_iter_experimental()`](CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()).
+    /// When multiple patterns start at the same position, the pattern that was registered earlier is reported.
     LeftmostFirstExperimental = 4,
 }
 

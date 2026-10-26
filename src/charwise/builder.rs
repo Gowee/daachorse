@@ -314,9 +314,8 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
                 nfa.build_outputs(&nfa.build_fails_leftmost());
             }
             MatchKind::LeftmostLongestExperimental | MatchKind::LeftmostFirstExperimental => {
-                // In zero-rewind leftmost matching, failure transitions and match emit chains are
-                // mutually co-dependent (leaf pattern completions trigger barrier resets on fail,
-                // while candidate harvesting depends on transition mismatches), requiring a joint pass.
+                // In experimental leftmost matching, failure transitions and match emit chains are
+                // mutually dependent, requiring a joint pass.
                 nfa.build_fails_and_emits_leftmost_experimental();
             }
         };
@@ -355,8 +354,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
         let groups = nfa.sibling_groups(profile, |c| self.mapper.get(c).unwrap());
         let helper = BuildHelper::new(&groups, nfa.states.len(), block_len, false)?;
 
-        // In experimental leftmost matching, bit 31 of the 32-bit `fail` field is borrowed as an emit reachability
-        // flag. Therefore, the maximum number of states supported is 0x7FFF_FFFF (2,147,483,647).
+        // Bit 31 of `fail` is used to flag whether the failure chain has emits, limiting states to 0x7FFF_FFFF.
         if self.match_kind.is_experimental() && helper.num_elements() > 0x7FFF_FFFF {
             return Err(DaachorseError::automaton_scale("states.len()", 0x7FFF_FFFF));
         }
@@ -380,11 +378,6 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
     }
 
     /// Maps NFA failure transitions and output positions into the double-array states.
-    ///
-    /// For experimental leftmost matching modes:
-    /// - `s.output_pos` points into the pre-committed `emits` pool.
-    /// - `s.fail` packs both the target failure state index (bits 0..30) and the emit reachability flag
-    ///   (bit 31). This bit is preserved and combined with the mapped double-array `fail_idx`.
     fn set_fails_and_outputs<V>(&mut self, nfa: &CharwiseNfaBuilder<V>, state_id_map: &[u32])
     where
         V: Copy,
@@ -399,8 +392,10 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
 
             self.states[idx].set_output_pos(s.output_pos.get());
 
+            // In experimental leftmost matching, bit 31 of `fail` flags whether the failure chain
+            // has emits. Strip it before indexing `state_id_map`, then re-pack it into `fail_idx`.
             let raw_fail = s.fail.get();
-            let (emit_bit, fail_id) = if self.match_kind.is_experimental() {
+            let (fail_has_emit_bit, fail_id) = if self.match_kind.is_experimental() {
                 (raw_fail & 0x8000_0000, raw_fail & 0x7FFF_FFFF)
             } else {
                 (0, raw_fail)
@@ -408,11 +403,11 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
             if fail_id == DEAD_STATE_ID {
                 self.states[idx].set_fail(DEAD_STATE_IDX);
             } else if fail_id == ROOT_STATE_ID {
-                self.states[idx].set_fail(ROOT_STATE_IDX | emit_bit);
+                self.states[idx].set_fail(ROOT_STATE_IDX | fail_has_emit_bit);
             } else {
                 let fail_idx = state_id_map[usize::from_u32(fail_id)];
                 debug_assert_ne!(fail_idx, DEAD_STATE_IDX);
-                self.states[idx].set_fail(fail_idx | emit_bit);
+                self.states[idx].set_fail(fail_idx | fail_has_emit_bit);
             }
         }
     }

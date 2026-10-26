@@ -35,21 +35,10 @@ impl EdgeLabel for char {
 #[derive(Clone)]
 pub struct NfaBuilderState<L, V> {
     pub(crate) edges: EdgeMap<L>,
+    // Failure state index. In experimental leftmost matching, bit 31 flags if the failure chain has emits.
     pub(crate) fail: Cell<u32>,
-    /// Pattern outputs terminating at this state: `(value, pattern_length)`.
-    ///
-    /// In a Trie, distinct pattern strings follow distinct paths and terminate at distinct states.
-    /// This vector contains more than one entry only if duplicate pattern strings were added.
-    /// For leftmost matching, duplicate patterns share the identical span, so only the canonical
-    /// first entry is tracked.
     pub(crate) output: Vec<(V, u32)>,
-    /// 1-based index pointing to the head of the output/emit chain.
-    ///
-    /// This field has dual semantics depending on `MatchKind`:
-    /// - **Standard / LeftmostFirst / LeftmostLongest**: 1-based index into `outputs: Vec<Output<V>>`,
-    ///   forming a dictionary suffix link chain (traversed via `Output::parent()`).
-    /// - **LeftmostLongestExperimental / LeftmostFirstExperimental**: 1-based index into `emits: Vec<Emit<V>>`,
-    ///   forming a reverse delta-encoded pre-committed match chain (traversed via `Emit::pred()`).
+    // 1-based index into `outputs` (standard/legacy) or `emits` (experimental).
     pub(crate) output_pos: Cell<Option<NonZeroU32>>,
 }
 
@@ -68,7 +57,7 @@ impl<L, V> Default for NfaBuilderState<L, V> {
 pub struct NfaBuilder<L, V> {
     pub(crate) states: Vec<NfaBuilderState<L, V>>,
     pub(crate) outputs: Vec<Output<V>>, // in which common parts are merged.
-    pub(crate) emits: Vec<Emit<V>>,     // emits for leftmost-longest matching.
+    pub(crate) emits: Vec<Emit<V>>, // Committed match chains for experimental leftmost matching.
     pub(crate) len: usize,
     pub(crate) match_kind: MatchKind,
 }
@@ -226,104 +215,11 @@ where
     L: EdgeLabel,
     V: Copy,
 {
-    /// Builds failure transitions and match emit chains for zero-rewind leftmost-longest matching.
+    /// Builds failure transitions and match emit chains for experimental leftmost matching.
     ///
-    /// # Overview & Motivation
-    ///
-    /// Standard Aho-Corasick finds all overlapping pattern occurrences. When adapted for leftmost-longest
-    /// matching, conventional engines (like the legacy daachorse search) simulate greedy behavior by:
-    /// 1. Advancing forward in the trie until a mismatch occurs.
-    /// 2. Recording the longest match encountered along the way.
-    /// 3. Resetting state to ROOT and **rewinding the input text position backward** to the end of that match.
-    ///
-    /// On adversarial inputs (e.g. repeated overlapping candidates), rewinding causes worst-case $O(N \times L)$
-    /// scanning overhead.
-    ///
-    /// This builder constructs an automaton that achieves strictly $O(N)$ matching with **zero text rewinding**:
-    /// the text cursor always moves forward monotonically.
-    ///
-    /// # Core Mechanism: Active Suffix and Pre-Committed Match Chain
-    ///
-    /// For any trie state representing a path string from `ROOT`, the consumed prefix is partitioned into
-    /// two distinct regions:
-    ///
-    /// ```text
-    ///                 Prefix string of state `sid`
-    ///   ┌──────────────────────────────────────────────┬──────────────────┐
-    ///   │  Finalized matches in prefix (output_pos)    │ Active suffix    │
-    ///   ├──────────────────────────────────────────────┼──────────────────┤
-    ///   │  [Match 1] ... [Match k] (locked in)         │ fail state       │
-    ///   └──────────────────────────────────────────────┴──────────────────┘
-    /// ```
-    ///
-    /// 1. **Active Suffix (`fail`)**:
-    ///    The longest proper suffix of the current prefix that corresponds to a valid trie state with
-    ///    outgoing edges.
-    ///    - *Why longest?* Under Leftmost Priority, an earlier starting position in the text always takes
-    ///      precedence over a later starting position. A longer suffix starts earlier in the text than a
-    ///      shorter suffix (e.g. offset `pos - len_long` is earlier than `pos - len_short`).
-    ///      Transitioning to the longest extendable suffix guarantees that the automaton will not bypass
-    ///      or miss the earliest potential pattern match. If this longer suffix subsequently fails on future
-    ///      characters, its own fail link will fall back to shorter suffixes in chronological order.
-    ///    - When the next input character mismatches, the automaton transitions directly to this state
-    ///      to continue searching into future characters without rewinding.
-    ///
-    /// 2. **Committed Match Chain (`output_pos`)**:
-    ///    All leftmost-longest matches occurring *before* the active suffix. Because branches starting
-    ///    before the active suffix have already terminated, these matches are permanently finalized:
-    ///    future characters can never alter, invalidate, or merge with them.
-    ///
-    /// # Reverse Delta-Encoded Match Chains
-    ///
-    /// Matches are stored as a reverse singly-linked list in `self.emits`:
-    /// ```text
-    ///   Head (Match k) ──(gap)──> Predecessor (Match k-1) ──(gap)──> ... ──> Match 1 ──> None
-    /// ```
-    /// Each `Emit` node contains:
-    /// - `value`: Pattern value/ID.
-    /// - `length`: Byte length of the pattern.
-    /// - `gap`: Byte distance. For the head node (`Match k`), it is the distance from the end of the
-    ///   state's path to the end of `Match k`. For predecessor nodes (`Match i`), it is the unmatched
-    ///   byte distance from the end of `Match i` to the start of the subsequent match `Match i+1`
-    ///   (`start(Match i+1) - end(Match i)`).
-    /// - `pred`: 1-based index pointing to the preceding match node.
-    ///
-    /// ### Why Reverse Linking?
-    /// Because internal gaps between matches depend only on the text between them, the entire predecessor
-    /// chain `Match k-1 -> ... -> Match 1` is completely invariant and structurally shared across all
-    /// descendant trie branches. When trie branches fork, states share the same predecessor nodes in
-    /// `self.emits` with zero copying.
-    ///
-    /// ### Runtime Match Extraction (O(1) Per Match, Zero Allocations)
-    /// When a mismatch occurs at text cursor `pos`:
-    /// - `end(Match k) = pos - head.gap`, `start(Match k) = end - head.length`.
-    /// - `end(Match k-1) = start(Match k) - em.gap`, `start(Match k-1) = end - em.length`.
-    ///
-    /// Nodes are pushed onto a thread-local LIFO buffer and popped in chronological order `Match 1 .. Match k`.
-    ///
-    /// # Construction Algorithm (BFS Traversal)
-    ///
-    /// States are processed in breadth-first search order. For each state `sid` with parent `parent_id` and edge `c`:
-    ///
-    /// - **Fast Path 1 (Full-Path Pattern / Barrier Reset, O(1))**:
-    ///   If a pattern covers the full path from root to `sid`, no trailing suffix remains.
-    ///   Under leftmost-longest priority, an earlier root match supersedes any proper suffix.
-    ///   `fail` is set to `ROOT`, and `output_pos` points to this single match (`gap = 0`).
-    ///
-    /// - **Universal Recurrence System (Pure Cons List)**:
-    ///   For any state `sid = parent · c`, `sid` inherits the parent's finalized match chain.
-    ///   1. **Failure Path Walk & Broken Candidate Harvesting**:
-    ///      While active suffix candidate `curr` cannot transition on `c` (`child_id(curr, c) == None`),
-    ///      the candidate has broken. Any pre-committed non-overlapping matches along `curr` are
-    ///      harvested and topologically spliced onto `sid`'s chain via reverse functional consing.
-    ///      `curr` then falls back along its own `fail` link.
-    ///   2. **Active Suffix Transition & Leaf Pattern Completion**:
-    ///      If `child_state = child_id(curr, c)` exists:
-    ///      - If `child_state` is non-leaf, active suffix continues in-flight (`fail = child_state`).
-    ///      - If `child_state` is a leaf pattern, it completes at the end of `sid` and commits immediately
-    ///        onto the chain with `gap = 0` (`fail = ROOT`).
-    ///   3. **Head Gap Expansion**:
-    ///      If no new matches were cons'd, the parent's head match gap simply expands by `|c|` bytes.
+    /// Precalculates `fail` (the pending suffix) and `emit` (committed matches) in BFS order.
+    /// When an upcoming character causes a mismatch, the engine emits the committed matches
+    /// and transitions directly to the pending suffix.
     pub(crate) fn build_fails_and_emits_leftmost_experimental(&mut self) {
         let num_states = self.states.len();
         let mut q = Vec::with_capacity(num_states);
@@ -369,14 +265,12 @@ where
         // Reusable scratch buffer for harvesting matches during failure fallback walks.
         let mut scratch_buffer = Vec::new();
 
-        // Stage 2: Resolving Active Suffix Fail Transitions and Committed Match Chains.
+        // Stage 2: Resolving pending suffix fail transitions and committed match chains.
         for &state_id in &q[1..] {
-            // Fast Path: Root-Covered Pattern (Barrier Reset).
-            // If `state_id` itself is a complete pattern from ROOT, under leftmost-longest priority
-            // it supersedes any suffix fallback. `fail` is reset to ROOT and `gap` is 0.
+            // If `state_id` itself is a complete pattern from root, under leftmost-longest priority
+            // it supersedes any suffix fallback.
             if let Some(&output) = self.states[usize::from_u32(state_id)].output.first() {
                 let emit = Emit::from_output(output, 0, None);
-                // DedupKey identifies the emit by output_state_id so hash-consing never touches `V` (only V: Copy is required).
                 let key = DedupKey {
                     output_state_id: state_id,
                     gap: 0,
@@ -391,10 +285,7 @@ where
                 continue;
             }
 
-            // Universal Recurrence System:
-            // S = P · c inherits P's in-flight head match.
-            // Note: We maintain the chain head's gap directly against the state's byte depth.
-            // Advancing from P to S via `ch` increments the trailing gap by |c| bytes.
+            // Inherit the parent's in-flight head match and advance its trailing gap by |c| bytes.
             let parent_id = parents[usize::from_u32(state_id)];
             let ch = edge_labels[usize::from_u32(state_id)].unwrap();
             // Direct children of ROOT start with an empty match chain (initial_head = None).
@@ -416,17 +307,15 @@ where
 
             let mut chain = EmitChain::new(initial_head);
 
-            // 1. Failure Path Walk & Prefix Match Harvesting:
-            // When an active suffix `curr = fail(parent_id)` cannot transition on `ch`,
-            // its branch has failed. Any pre-committed non-overlapping matches
-            // along `curr`'s prefix are appended onto `chain`.
+            // 1. Walk the failure chain: when suffix candidate curr cannot transition on ch,
+            // append its committed matches onto chain.
             let mut curr = self.states[usize::from_u32(parent_id)].fail.get();
             let mut next_child = self.child_id(curr, ch);
             while curr != ROOT_STATE_ID && next_child.is_none() {
                 if let Some(curr_head) = self.states[usize::from_u32(curr)].output_pos.get() {
                     scratch_buffer.clear();
                     scratch_buffer.extend(store.iter_chain(curr_head));
-                    // Matches along curr's prefix ended at P; advance the head gap by |c| to align with S:
+                    // Matches along curr's prefix ended at the parent; advance the head gap by |c| to align with state_id:
                     scratch_buffer[0].0 = scratch_buffer[0].0.with_incremented_gap(ch.num_bytes());
                     scratch_buffer[0].1.gap += u32::try_from(ch.num_bytes()).unwrap();
                     chain.extend_from(&scratch_buffer, &mut store);
@@ -435,12 +324,11 @@ where
                 next_child = self.child_id(curr, ch);
             }
 
-            // 2. Active Suffix Transition & Leaf Match Decision:
+            // 2. Pending suffix transition and leaf match handling:
             let mut fail_state = ROOT_STATE_ID;
             if parent_id != ROOT_STATE_ID {
                 if let Some(child_id) = next_child {
                     if !self.states[usize::from_u32(child_id)].edges.is_empty() {
-                        // Extend active suffix along child.
                         fail_state = child_id;
                     } else {
                         // Suffix completes a leaf pattern at the very end of `state_id`.
@@ -459,13 +347,11 @@ where
             self.states[usize::from_u32(state_id)].fail.set(fail_state);
         }
 
-        // Stage 3: In-place propagation of emit reachability (bit 31) along the failure chain.
+        // Stage 3: Flag whether each state or any state along its failure chain has an emit (bit 31).
         //
-        // Note: ROOT_STATE_ID is intentionally excluded from setting bit 31.
-        // ROOT holds the empty pattern ("") which is handled specially via cursor interpolation
-        // in the iterator. Draining failure links stops at ROOT and never extracts empty matches.
-        // Setting bit 31 on ROOT would cause all states whose failure links lead to ROOT to inherit
-        // emit reachability = true, destroying O(1) skips whenever an empty pattern is present.
+        // ROOT is intentionally excluded: the empty pattern ("") is handled specially via cursor
+        // interpolation in the iterator, whereas failure chain draining stops at ROOT. Setting bit 31
+        // on ROOT would cause all states to set this flag whenever an empty pattern is present.
         for &state_id in &q[1..] {
             let state = &self.states[usize::from_u32(state_id)];
             let fail_id = state.fail.get();
@@ -632,25 +518,11 @@ where
     }
 }
 
-/// An active match chain builder for a state in the leftmost-longest automaton.
+/// Helper for accumulating match emit chains during experimental leftmost construction.
 ///
-/// Tracks an in-flight head match whose trailing gap is maintained relative to the current state's
-/// byte boundary. Inter-match gaps and predecessor links are computed purely via relative delta
-/// offsets, with zero absolute coordinates or depth arrays.
-///
-/// # Invariant
-///
-/// At all times, `chain.head.gap` represents the distance from the **current state's end boundary**
-/// (its byte depth) to the end of the head match.
-///
-/// - Predecessor matches `M_1 .. M_{k-1}` maintain invariant inter-match distances.
-/// - `extend_from(&emits, store)` links incoming matches whose head gap is already relative to the
-///   state boundary, and updates the in-flight head.
-/// - `push_leaf(output, store)` commits a match ending directly at the state boundary (gap = 0).
-/// - `finish(store)` commits the in-flight head directly into `EmitStore` as-is.
-///
-/// The head carries its originating pattern state alongside the detached [`Emit`]
-/// so [`EmitStore`] can hash-cons by [`DedupKey`] without touching `V`.
+/// Tracks an in-flight head match whose trailing gap is maintained relative to the
+/// current state's byte boundary. Inter-match gaps and predecessor links are delta-encoded
+/// so common predecessor chains are structurally shared across trie branches.
 #[derive(Clone, Copy, Debug)]
 struct EmitChain<V> {
     head: Option<(Emit<V>, u32)>,
@@ -664,7 +536,7 @@ impl<V> Default for EmitChain<V> {
 }
 
 impl<V: Copy> EmitChain<V> {
-    /// Initializes an active match chain with an optional in-flight head match.
+    /// Initializes a match chain with an optional in-flight head match.
     #[inline(always)]
     const fn new(head: Option<(Emit<V>, u32)>) -> Self {
         Self { head }
@@ -680,12 +552,12 @@ impl<V: Copy> EmitChain<V> {
             return;
         }
 
-        // Link earliest match M_1 to the previous head:
+        // Link earliest incoming match to the previous head:
         let mut pred = if let Some((prev, prev_state)) = self.head {
             let span: u32 = emits.iter().map(|(em, _)| em.gap + em.length).sum();
             debug_assert!(
                 prev.gap >= span,
-                "candidate match cannot overlap with committed ancestor match"
+                "candidate match cannot overlap with committed match"
             );
             let inter_gap = prev.gap - span;
             Some(store.insert(
@@ -700,7 +572,7 @@ impl<V: Copy> EmitChain<V> {
             None
         };
 
-        // Chain intermediate matches M_1 .. M_{k-1}:
+        // Chain intermediate matches:
         for (em, key) in emits[1..].iter().rev() {
             pred = Some(store.insert(
                 Emit::new(em.value, em.length, em.gap, pred),
@@ -712,7 +584,7 @@ impl<V: Copy> EmitChain<V> {
             ));
         }
 
-        // Install M_k as the new in-flight head:
+        // Install the latest match as the new in-flight head:
         self.head = Some((emits[0].0.with_pred(pred), emits[0].1.output_state_id));
     }
 
@@ -722,7 +594,7 @@ impl<V: Copy> EmitChain<V> {
         let pred = if let Some((prev, prev_state)) = self.head {
             debug_assert!(
                 prev.gap >= output.1,
-                "leaf pattern cannot overlap with committed ancestor match"
+                "leaf pattern cannot overlap with committed match"
             );
             let inter_gap = prev.gap - output.1;
             Some(store.insert(
@@ -758,7 +630,7 @@ impl<V: Copy> EmitChain<V> {
 /// Deduplication key for [`Emit`] nodes.
 ///
 /// Identifies an emit node by its originating pattern state instead of its value,
-/// so hash-consing never touches `V` and the builder only requires `V: Copy`.
+/// so deduplication never touches `V` and the builder only requires `V: Copy`.
 /// Each pattern corresponds to exactly one terminal trie state, hence
 /// `output_state_id` determines `(value, length)` and the key is canonical.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
@@ -768,15 +640,10 @@ struct DedupKey {
     pred: Option<NonZeroU32>,
 }
 
-/// A construction-time store combining emit node storage with open-addressing deduplication.
+/// Storage and deduplication cache for [`Emit`] nodes during construction.
 ///
-/// Encapsulates node allocation, hash-consing lookup, and chain traversal.
-/// When construction is complete, unwraps into the final [`Vec<Emit<V>>`].
-///
-/// `keys` runs parallel to `emits`: `keys[i]` is the [`DedupKey`] of `emits[i]`,
-/// recorded on every insert (even with dedup disabled) so ancestor lookups work.
-/// Hash-consing keys never touches `V`, hence only `V: Copy` is required.
-///
+/// Combines the emit node vector with an open-addressing deduplication table.
+/// Once construction finishes, converts into the finalized `Vec<Emit<V>>`.
 struct EmitStore<V> {
     emits: Vec<Emit<V>>,
     keys: Vec<DedupKey>,
@@ -854,57 +721,10 @@ impl<'a, V: Copy> Iterator for ChainIter<'a, V> {
     }
 }
 
-/// A compact, open-addressing deduplication table for [`Emit`] nodes in `no_std`.
+/// An open-addressing hash table for deduplicating [`Emit`] nodes during construction.
 ///
-/// In leftmost-longest matching, multiple states across divergent branches frequently produce
-/// identical [`Emit`] configurations. This deduplication table provides hash-consing over
-/// [`DedupKey`] (`output_state_id` identifies the pattern, hence `(value, length)`), unifying
-/// identical `(pattern, gap, pred)` tuples into a single canonical index.
-///
-/// Deduplication is cleanly separated from emit list storage: [`EmitDedup`] acts as a lookup
-/// cache mapping `DedupKey -> NonZeroU32`, while [`NfaBuilder::emits`] owns the underlying storage.
-/// Keys never touch `V`, so no `Eq`/`Hash` bound on values is required.
-///
-/// # Where Do Duplicates Arise? (Concrete Examples)
-///
-/// The vast majority of duplicates arise from **different branches committing the same pattern**:
-///
-/// 1. **Cross-Path Pattern Convergence (82.5% of all deduplication hits)**:
-///    - In an Aho-Corasick automaton, many divergent branches in the Trie share common suffixes or
-///      leaf matches.
-///    - Suppose Path 1 (e.g., prefix `xyz...`) and Path 2 (e.g., prefix `abc...`) are entirely disjoint.
-///    - When both paths encounter the same pattern $M$ at the same relative trailing offset without
-///      prior committed matches (`head == None`), both compute the exact same node:
-///      `(M.value, M.length, gap, None)`.
-///    - Even though Path 1 and Path 2 are completely different automaton states, their match records
-///      for pattern $M$ are identical and unified into a single DAG node.
-///
-/// 2. **Sibling Fanout in `finish()` (~75% of deduplicated node count)**:
-///    - Suppose parent state $P$ has an active match chain ending at pattern $M$ with trailing gap $g$.
-///    - $P$ has multiple outgoing child edges $P \xrightarrow{c_1} S_1, P \xrightarrow{c_2} S_2, \dots$
-///      (e.g., diverging on ASCII characters `'a'`, `'b'`, `'c'`).
-///    - If none of these sibling states match a new pattern or harvest a broken suffix, they all
-///      advance $M$'s trailing gap by $|c|$ in `finish()`.
-///    - Because they share the same parent and same character byte length $|c|$, every sibling
-///      computes the identical node: `(M.value, M.length, g + |c|, M.pred)`.
-///    - *Example*: For a 54k-word dictionary, this accounts for **39,000+ deduplicated nodes**.
-///
-/// 3. **Rekeying Previous Head on Chaining (~19% of deduplicated node count)**:
-///    - When a new match $M_{new}$ is committed after an earlier match $M_{prev}$, the previous head
-///      transitions from an active head (trailing gap) to an internal node (inter-match gap).
-///    - Its gap is rekeyed to the inter-match distance ($\text{prev.gap} - \text{span}$ or $\text{prev.gap} - \text{pat.len}$).
-///    - If multiple divergent branches commit pairs of patterns separated by the exact same
-///      inter-match distance (e.g., adjacent words with gap 0), they generate the identical
-///      `(M_{prev}.value, M_{prev}.length, inter_gap, M_{prev}.pred)`.
-///    - *Example*: Accounts for **~10,000 deduplicated nodes** in a 54k dictionary.
-///
-/// # Where Do Duplicates NOT Arise?
-///
-/// - **Along the same path**: Moving down the Trie strictly increases depth at every step ($|c| \ge 1$),
-///   so trailing gap is strictly monotonic ($g \to g+|c| \to g+2|c| \dots$). A single path never duplicates itself.
-/// - **Suffix copying with divergent ancestor histories**: When two branches have different prior committed
-///   matches ($P_A \neq P_B$), path copying forces the earliest copied match to link to $P_A$ and $P_B$
-///   respectively. All downstream matches inherit this divergent `pred`, preventing node reuse.
+/// Unifies identical `(output_state_id, gap, pred)` tuples into a single canonical index
+/// so common predecessor chains are structurally shared across trie branches.
 struct EmitDedup {
     entries: Vec<Option<(DedupKey, NonZeroU32)>>,
     mask: usize,
