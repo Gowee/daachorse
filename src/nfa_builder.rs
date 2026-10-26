@@ -35,8 +35,10 @@ impl EdgeLabel for char {
 #[derive(Clone)]
 pub struct NfaBuilderState<L, V> {
     pub(crate) edges: EdgeMap<L>,
-    // Failure state index. In experimental leftmost matching, bit 31 flags if the failure chain has emits.
+    // Failure state index.
     pub(crate) fail: Cell<u32>,
+    // In experimental leftmost matching, flags if this state or any state along its failure chain has an emit.
+    pub(crate) fail_has_emit: Cell<bool>,
     pub(crate) output: Vec<(V, u32)>,
     // 1-based index into `outputs` (standard/legacy) or `emits` (experimental).
     pub(crate) output_pos: Cell<Option<NonZeroU32>>,
@@ -47,6 +49,7 @@ impl<L, V> Default for NfaBuilderState<L, V> {
         Self {
             edges: EdgeMap::<L>::default(),
             fail: Cell::new(ROOT_STATE_ID),
+            fail_has_emit: Cell::new(false),
             output: vec![],
             output_pos: Cell::new(None),
         }
@@ -347,7 +350,7 @@ where
             self.states[usize::from_u32(state_id)].fail.set(fail_state);
         }
 
-        // Stage 3: Flag whether each state or any state along its failure chain has an emit (bit 31).
+        // Stage 3: Flag whether each state or any state along its failure chain has an emit.
         //
         // ROOT is intentionally excluded: the empty pattern ("") is handled specially via cursor
         // interpolation in the iterator, whereas failure chain draining stops at ROOT. Setting bit 31
@@ -355,10 +358,9 @@ where
         for &state_id in &q[1..] {
             let state = &self.states[usize::from_u32(state_id)];
             let fail_id = state.fail.get();
-            let fail_has_emit =
-                (self.states[usize::from_u32(fail_id)].fail.get() & 0x8000_0000) != 0;
+            let fail_has_emit = self.states[usize::from_u32(fail_id)].fail_has_emit.get();
             if state.output_pos.get().is_some() || fail_has_emit {
-                state.fail.set(fail_id | 0x8000_0000);
+                state.fail_has_emit.set(true);
             }
         }
 

@@ -5,10 +5,10 @@ use crate::build_helper::{BuildHelper, Profile};
 use crate::charwise::{CharwiseDoubleArrayAhoCorasick, CodeMapper, MatchKind, State};
 use crate::errors::{DaachorseError, Result};
 use crate::nfa_builder::NfaBuilder;
-use crate::nfa_builder::{DEAD_STATE_ID, ROOT_STATE_ID};
+use crate::nfa_builder::DEAD_STATE_ID;
 use crate::prefilter::{Prefilter, PrefilterBuilder};
 use crate::utils::FromU32;
-use crate::{DEAD_STATE_IDX, ROOT_STATE_IDX};
+use crate::DEAD_STATE_IDX;
 
 // Specialized [`NfaBuilder`] handling labels of `char`.
 type CharwiseNfaBuilder<V> = NfaBuilder<char, V>;
@@ -392,22 +392,22 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
 
             self.states[idx].set_output_pos(s.output_pos.get());
 
-            // In experimental leftmost matching, bit 31 of `fail` flags whether the failure chain
-            // has emits. Strip it before indexing `state_id_map`, then re-pack it into `fail_idx`.
-            let raw_fail = s.fail.get();
-            let (fail_has_emit_bit, fail_id) = if self.match_kind.is_experimental() {
-                (raw_fail & 0x8000_0000, raw_fail & 0x7FFF_FFFF)
-            } else {
-                (0, raw_fail)
-            };
+            let fail_id = s.fail.get();
             if fail_id == DEAD_STATE_ID {
                 self.states[idx].set_fail(DEAD_STATE_IDX);
-            } else if fail_id == ROOT_STATE_ID {
-                self.states[idx].set_fail(ROOT_STATE_IDX | fail_has_emit_bit);
             } else {
                 let fail_idx = state_id_map[usize::from_u32(fail_id)];
                 debug_assert_ne!(fail_idx, DEAD_STATE_IDX);
-                self.states[idx].set_fail(fail_idx | fail_has_emit_bit);
+                let fail_flag = match self.match_kind {
+                    MatchKind::LeftmostLongestExperimental
+                    | MatchKind::LeftmostFirstExperimental
+                        if s.fail_has_emit.get() =>
+                    {
+                        0x8000_0000
+                    }
+                    _ => 0,
+                };
+                self.states[idx].set_fail(fail_idx | fail_flag);
             }
         }
     }

@@ -539,10 +539,7 @@ impl MatchKind {
     }
 
     fn is_leftmost(self) -> bool {
-        self == Self::LeftmostFirst
-            || self == Self::LeftmostLongest
-            || self == Self::LeftmostLongestExperimental
-            || self == Self::LeftmostFirstExperimental
+        self == Self::LeftmostFirst || self == Self::LeftmostLongest
     }
 
     pub(crate) fn is_leftmost_first(self) -> bool {
