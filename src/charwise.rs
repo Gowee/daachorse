@@ -14,9 +14,8 @@ use crate::charwise::iter::{
     CharWithEndOffsetIterator, FindIterator, FindOverlappingIterator,
     FindOverlappingNoSuffixIterator, FindOverlappingNoSuffixSliceIterator,
     FindOverlappingSliceIterator, FindOverlappingStepper, FindSliceIterator, FindStepper,
-    PatternIterator,
+    LeftmostFindIterator, LeftmostFindIteratorExperimental, PatternIterator,
 };
-pub use crate::charwise::iter::{LeftmostFindIterator, LeftmostFindIteratorExperimental};
 use crate::charwise::mapper::CodeMapper;
 use crate::errors::{DaachorseError, Result};
 use crate::prefilter::{Prefilter, PrefilterGate};
@@ -1430,26 +1429,21 @@ impl Default for State {
 }
 
 impl State {
-    #[must_use]
     #[inline(always)]
     pub const fn base(&self) -> Option<NonZeroU32> {
         self.base
     }
 
-    #[must_use]
     #[inline(always)]
     pub const fn check(&self) -> u32 {
         self.check
     }
 
-    /// Returns the target failure state index.
-    #[must_use]
     #[inline(always)]
     pub const fn fail(&self) -> u32 {
         self.fail
     }
 
-    #[must_use]
     #[inline(always)]
     pub const fn output_pos(&self) -> Option<NonZeroU32> {
         self.output_pos
