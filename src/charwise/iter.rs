@@ -890,6 +890,7 @@ where
     /// # Safety
     ///
     /// - `states` must contain at least `ROOT_STATE_IDX + 1` elements.
+    /// - `code` must be a valid mapped alphabet code (`code < mapper.alphabet_size()`).
     /// - `states` must be a valid double-array table constructed by `CharwiseDoubleArrayAhoCorasickBuilder`.
     #[inline(always)]
     unsafe fn step_root(states: &[State], code: u32) -> u32 {
@@ -937,7 +938,7 @@ where
         }
     }
 
-    /// Drains failure links from `state_id`, returning the next state and the first reachable match if any.
+    /// Drains the failure chain from `state_id`, returning the next state and the first reachable match if any.
     ///
     /// Uses bit 31 of `fail` to skip failure traversal when no states along the chain contain emits.
     ///

@@ -60,7 +60,7 @@ const AC_LEFTMOST_FIRST: TestCollection = &[BASICS, NON_OVERLAPPING, LEFTMOST, L
 
 /// A collection of tests for the Aho-Corasick algorithm that should always be true.
 /// That is, all iterators should produce the same answer.
-const BASICS: &[SearchTest] = &[
+const BASICS: &'static [SearchTest] = &[
     t!(basic000, &[], "", &[]),
     t!(basic_daachorse001, &[], "a", &[]),
     t!(basic_daachorse002, &[], "abc", &[]),
@@ -126,7 +126,7 @@ const BASICS: &[SearchTest] = &[
 /// some do in order to write clearer tests. For example, standard000 will
 /// pass with leftmost-first semantics, but standard010 will not. We write
 /// both to emphasize how the match semantics work.
-const STANDARD: &[SearchTest] = &[
+const STANDARD: &'static [SearchTest] = &[
     t!(standard000, &["ab", "abcd"], "abcd", &[(0, 0, 2)]),
     t!(standard010, &["abcd", "ab"], "abcd", &[(1, 0, 2)]),
     t!(standard020, &["abcd", "ab", "abc"], "abcd", &[(1, 0, 2)]),
@@ -149,7 +149,7 @@ const STANDARD: &[SearchTest] = &[
 /// both leftmost-first and leftmost-longest match kinds. Stated differently,
 /// among ambiguous matches, the longest match and the match that appeared
 /// first when constructing the automaton should always be the same.
-const LEFTMOST: &[SearchTest] = &[
+const LEFTMOST: &'static [SearchTest] = &[
     t!(leftmost000, &["ab", "ab"], "abcd", &[(0, 0, 2)]),
     t!(leftmost010, &["a", ""], "a", &[(0, 0, 1)]),
     t!(leftmost011, &["a", ""], "ab", &[(0, 0, 1), (1, 2, 2)]),
@@ -219,7 +219,7 @@ const LEFTMOST: &[SearchTest] = &[
 /// Tests for non-overlapping leftmost-first match semantics. These tests
 /// should generally be specific to leftmost-first, which means they should
 /// generally fail under leftmost-longest semantics.
-const LEFTMOST_FIRST: &[SearchTest] = &[
+const LEFTMOST_FIRST: &'static [SearchTest] = &[
     t!(leftfirst000, &["ab", "abcd"], "abcd", &[(0, 0, 2)]),
     t!(leftfirst010, &["", "a"], "a", &[(0, 0, 0), (0, 1, 1)]),
     t!(leftfirst011, &["", "a", ""], "a", &[(0, 0, 0), (0, 1, 1),]),
@@ -252,7 +252,7 @@ const LEFTMOST_FIRST: &[SearchTest] = &[
 /// Tests for non-overlapping leftmost-longest match semantics. These tests
 /// should generally be specific to leftmost-longest, which means they should
 /// generally fail under leftmost-first semantics.
-const LEFTMOST_LONGEST: &[SearchTest] = &[
+const LEFTMOST_LONGEST: &'static [SearchTest] = &[
     t!(leftlong000, &["ab", "abcd"], "abcd", &[(1, 0, 4)]),
     t!(leftlong010, &["abcd", "bcd", "cd", "b"], "abcd", &[(0, 0, 4),]),
     t!(leftlong020, &["", "a"], "a", &[(1, 0, 1)]),
@@ -283,7 +283,7 @@ const LEFTMOST_LONGEST: &[SearchTest] = &[
 ///
 /// Generally these tests shouldn't pass when using overlapping semantics.
 /// These should pass for both standard and leftmost match semantics.
-const NON_OVERLAPPING: &[SearchTest] = &[
+const NON_OVERLAPPING: &'static [SearchTest] = &[
     t!(nover010, &["abcd", "bcd", "cd"], "abcd", &[(0, 0, 4),]),
     t!(nover020, &["bcd", "cd", "abcd"], "abcd", &[(2, 0, 4),]),
     t!(nover030, &["abc", "bc"], "zazabcz", &[(0, 3, 6),]),
@@ -303,7 +303,7 @@ const NON_OVERLAPPING: &[SearchTest] = &[
 ///
 /// This only supports standard match semantics, since leftmost-{first,longest}
 /// do not support overlapping matches.
-const OVERLAPPING: &[SearchTest] = &[
+const OVERLAPPING: &'static [SearchTest] = &[
     t!(
         over000,
         &["abcd", "bcd", "cd", "b"],
@@ -635,6 +635,44 @@ testconfig!(
     |_| ()
 );
 
+testconfig!(
+    leftmost,
+    search_leftmost_first_charwise,
+    CharwiseDoubleArrayAhoCorasickBuilder,
+    AC_LEFTMOST_FIRST,
+    LeftmostFirst,
+    |_| ()
+);
+
+fn run_search_tests<F: FnMut(&SearchTest) -> Vec<Match<usize>>>(which: TestCollection, mut f: F) {
+    let get_match_triples = |matches: Vec<Match<usize>>| -> Vec<(usize, usize, usize)> {
+        matches
+            .into_iter()
+            .map(|m| (m.value(), m.start(), m.end()))
+            .collect()
+    };
+    for &tests in which {
+        for test in tests {
+            assert_eq!(
+                test.matches,
+                get_match_triples(f(&test)).as_slice(),
+                "test: {}, patterns: {:?}, haystack: {:?}",
+                test.name,
+                test.patterns,
+                test.haystack
+            );
+        }
+    }
+}
+
+
+fn to_match_triples(matches: impl IntoIterator<Item = Match<usize>>) -> Vec<(usize, usize, usize)> {
+    matches
+        .into_iter()
+        .map(|m| (m.value(), m.start(), m.end()))
+        .collect()
+}
+
 #[test]
 fn search_leftmost_longest_experimental_charwise() {
     for &collection in AC_LEFTMOST_LONGEST {
@@ -647,7 +685,7 @@ fn search_leftmost_longest_experimental_charwise() {
                 pma.leftmost_find_iter_experimental(test.haystack).collect();
             assert_eq!(
                 test.matches,
-                get_match_triples(matches).as_slice(),
+                to_match_triples(matches).as_slice(),
                 "test: {}, patterns: {:?}, haystack: {:?}",
                 test.name,
                 test.patterns,
@@ -669,38 +707,7 @@ fn search_leftmost_first_experimental_charwise() {
                 pma.leftmost_find_iter_experimental(test.haystack).collect();
             assert_eq!(
                 test.matches,
-                get_match_triples(matches).as_slice(),
-                "test: {}, patterns: {:?}, haystack: {:?}",
-                test.name,
-                test.patterns,
-                test.haystack
-            );
-        }
-    }
-}
-
-testconfig!(
-    leftmost,
-    search_leftmost_first_charwise,
-    CharwiseDoubleArrayAhoCorasickBuilder,
-    AC_LEFTMOST_FIRST,
-    LeftmostFirst,
-    |_| ()
-);
-
-fn get_match_triples(matches: Vec<Match<usize>>) -> Vec<(usize, usize, usize)> {
-    matches
-        .into_iter()
-        .map(|m| (m.value(), m.start(), m.end()))
-        .collect()
-}
-
-fn run_search_tests<F: FnMut(&SearchTest) -> Vec<Match<usize>>>(which: TestCollection, mut f: F) {
-    for &tests in which {
-        for test in tests {
-            assert_eq!(
-                test.matches,
-                get_match_triples(f(test)).as_slice(),
+                to_match_triples(matches).as_slice(),
                 "test: {}, patterns: {:?}, haystack: {:?}",
                 test.name,
                 test.patterns,
@@ -720,13 +727,13 @@ fn test_experimental_empty_pattern_with_prefixes() {
             .match_kind(match_kind)
             .build(["", "ab"])
             .unwrap();
-        let matches = get_match_triples(pma.leftmost_find_iter_experimental("").collect());
+        let matches = to_match_triples(pma.leftmost_find_iter_experimental(""));
         assert_eq!(matches, &[(0, 0, 0)]);
 
-        let matches = get_match_triples(pma.leftmost_find_iter_experimental("a").collect());
+        let matches = to_match_triples(pma.leftmost_find_iter_experimental("a"));
         assert_eq!(matches, &[(0, 0, 0), (0, 1, 1)]);
 
-        let matches = get_match_triples(pma.leftmost_find_iter_experimental("ab").collect());
+        let matches = to_match_triples(pma.leftmost_find_iter_experimental("ab"));
         if match_kind == MatchKind::LeftmostLongestExperimental {
             assert_eq!(matches, &[(1, 0, 2)]);
         } else {
@@ -737,7 +744,7 @@ fn test_experimental_empty_pattern_with_prefixes() {
             .match_kind(match_kind)
             .build(["ab", ""])
             .unwrap();
-        let matches = get_match_triples(pma_rev.leftmost_find_iter_experimental("ab").collect());
+        let matches = to_match_triples(pma_rev.leftmost_find_iter_experimental("ab"));
         assert_eq!(matches, &[(0, 0, 2)]);
 
         // 3-char prefix with mismatch halfway
@@ -745,7 +752,7 @@ fn test_experimental_empty_pattern_with_prefixes() {
             .match_kind(match_kind)
             .build(["", "abc"])
             .unwrap();
-        let matches = get_match_triples(pma_abc.leftmost_find_iter_experimental("ab").collect());
+        let matches = to_match_triples(pma_abc.leftmost_find_iter_experimental("ab"));
         assert_eq!(matches, &[(0, 0, 0), (0, 1, 1), (0, 2, 2)]);
 
         // Multi-byte UTF-8 test
@@ -753,8 +760,55 @@ fn test_experimental_empty_pattern_with_prefixes() {
             .match_kind(match_kind)
             .build(["", "你好"])
             .unwrap();
-        let matches = get_match_triples(pma_utf8.leftmost_find_iter_experimental("你").collect());
+        let matches = to_match_triples(pma_utf8.leftmost_find_iter_experimental("你"));
         assert_eq!(matches, &[(0, 0, 0), (0, 3, 3)]);
     }
 }
 
+#[test]
+fn test_experimental_regression_interleaved_fail_links() {
+    let patterns = [
+        "da", "dbacbc", "a", "bbdadd", "d", "dbc", "dbacbd", "bad", "cbac", "cc", "ddacad", "b",
+    ];
+    let haystack = "abbccdbdadbaacbcaacccbdbcbbcccdddbcabdbdbcbdbaaaaaabbddbaccabbddabbcabacaccabbccaddbbaadbbdadbcacbbcbcdabbaccdddbcacaccdccdacbbccbacaddbbcbbaacccacaacadcccbcccbbcdccaaacbcbcddddbabccbbbabbbdbdccdddcabdadbaaacadbdccadbbbdbbadcbaabaddaabddabcbbcbaadbbcdcdadadccccaadaabdddbacbbcdbbdcaabcbbcaaddbddcccbcccaddbdbbbaccdcabcccdbbdddddacbddacaddadcbdaabacdcabababbdbbadaaabbddcbadbbaaaabcccdcdadccddcabcdabbdbaacbaccabaccbbbaacbcdaadacbdbbddcdcacdcacdbbbdbbdddbacbdcccadabccbacaaadbccacbcccdbaacbcaabdabcbbbcdbccdcaadaadbbaddbaaddbcdbbabdbbbdabdabdbdcccccbbcadabaaddbdaadaaaacdddccddcbddcdbaaababdaaddacccbccddadadcdbdabdddccadcccccdcdbccbaabbabdacdabaccdbbbdccbcaaaabdcdacdbbbaadaacadaccbadcdcaddacbacbccbadccbbacbddcbbcbbbddccaabaacbbdccdadaddabdcbbcdcdadddaacacbbcddadbcbcdddcbaabcababbacdcdabbccacbddcbccdcbbcbacdcdaccba";
+
+    let pma_legacy = CharwiseDoubleArrayAhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostLongest)
+        .build::<_, _, usize>(patterns)
+        .unwrap();
+    let pma_experimental = CharwiseDoubleArrayAhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostLongestExperimental)
+        .build::<_, _, usize>(patterns)
+        .unwrap();
+
+    let expected: Vec<_> = pma_legacy.leftmost_find_iter(haystack).collect();
+    let actual: Vec<_> = pma_experimental
+        .leftmost_find_iter_experimental(haystack)
+        .collect();
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn test_experimental_parent_and_candidate_matches() {
+    // Verifies that when an intermediate state on a long pattern branch (e.g. "xybacelong")
+    // experiences candidate failure on transition 'e' (where suffix candidate "bac" breaks),
+    // ancestor matches ("xy") and broken candidate matches ("b", "a") are correctly
+    // spliced and preserved when matching text that diverges (e.g. "xybacex").
+    let patterns = ["xy", "b", "a", "bacd", "xybacelong"];
+    let haystack = "xybacex";
+
+    let pma_legacy = CharwiseDoubleArrayAhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostLongest)
+        .build::<_, _, usize>(patterns)
+        .unwrap();
+    let pma_experimental = CharwiseDoubleArrayAhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostLongestExperimental)
+        .build::<_, _, usize>(patterns)
+        .unwrap();
+
+    let expected: Vec<_> = pma_legacy.leftmost_find_iter(haystack).collect();
+    let actual: Vec<_> = pma_experimental
+        .leftmost_find_iter_experimental(haystack)
+        .collect();
+    assert_eq!(expected, actual);
+}
