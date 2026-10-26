@@ -14,14 +14,14 @@ use crate::charwise::iter::{
     CharWithEndOffsetIterator, FindIterator, FindOverlappingIterator,
     FindOverlappingNoSuffixIterator, FindOverlappingNoSuffixSliceIterator,
     FindOverlappingSliceIterator, FindOverlappingStepper, FindSliceIterator, FindStepper,
-    LeftmostFindIterator, PatternIterator,
+    LeftmostFindIterator, LeftmostFindIteratorExperimental, PatternIterator,
 };
 use crate::charwise::mapper::CodeMapper;
 use crate::errors::{DaachorseError, Result};
 use crate::prefilter::{Prefilter, PrefilterGate};
 use crate::serializer::{Serializable, SerializableVec};
 use crate::utils::FromU32;
-use crate::{MatchKind, Output, DEAD_STATE_IDX, ROOT_STATE_IDX};
+use crate::{Emit, MatchKind, Output, DEAD_STATE_IDX, ROOT_STATE_IDX};
 
 /// A fast multiple pattern match automaton implemented with the Aho-Corasick algorithm and
 /// character-wise double-array data structure.
@@ -57,6 +57,8 @@ pub struct CharwiseDoubleArrayAhoCorasick<V> {
     states: Vec<State>,
     mapper: CodeMapper,
     outputs: Vec<Output<V>>,
+    /// Committed match chains for experimental leftmost matching.
+    emits: Vec<Emit<V>>,
     match_kind: MatchKind,
     num_states: u32,
     prefilter: Option<Prefilter>,
@@ -568,8 +570,9 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         P: AsRef<str>,
     {
         assert!(
-            self.match_kind.is_leftmost(),
-            "Error: match_kind must be leftmost."
+            self.match_kind == MatchKind::LeftmostFirst
+                || self.match_kind == MatchKind::LeftmostLongest,
+            "Error: match_kind must be leftmost_first or leftmost_longest. For experimental leftmost, use leftmost_find_iter_experimental()."
         );
         LeftmostFindIterator {
             pma: self,
@@ -583,6 +586,52 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             skip_empty: false,
             gate: PrefilterGate::new(),
         }
+    }
+
+    /// Returns an iterator of non-overlapping leftmost matches in the input text.
+    ///
+    /// Matches are evaluated in a single forward pass in worst-case linear time `O(N)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `haystack` - A string to search.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the automaton was not constructed with [`MatchKind::LeftmostLongestExperimental`]
+    /// or [`MatchKind::LeftmostFirstExperimental`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use daachorse::{CharwiseDoubleArrayAhoCorasickBuilder, MatchKind};
+    ///
+    /// let patterns = vec!["ab", "abcd"];
+    /// let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
+    ///     .match_kind(MatchKind::LeftmostLongestExperimental)
+    ///     .build(&patterns)
+    ///     .unwrap();
+    ///
+    /// let mut it = pma.leftmost_find_iter_experimental("abcd");
+    ///
+    /// let m = it.next().unwrap();
+    /// assert_eq!((0, 4, 1), (m.start(), m.end(), m.value()));
+    ///
+    /// assert_eq!(None, it.next());
+    /// ```
+    pub fn leftmost_find_iter_experimental<P>(
+        &self,
+        haystack: P,
+    ) -> LeftmostFindIteratorExperimental<'_, P, V>
+    where
+        P: AsRef<str>,
+        V: Copy,
+    {
+        assert!(
+            self.match_kind.is_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        LeftmostFindIteratorExperimental::new(self, haystack)
     }
 
     /// Returns a stepper of non-overlapping matches that consumes characters one by one.
@@ -865,9 +914,10 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 
     /// Returns an iterator that yields all registered pattern-value pairs in lexicographical order.
     ///
-    /// When using [`MatchKind::LeftmostFirst`], patterns registered after any of their proper
-    /// prefixes can never be matched. Consequently, they are not stored in the automaton and
-    /// will not be yielded.
+    /// When using [`MatchKind::LeftmostFirst`] or [`MatchKind::LeftmostFirstExperimental`], patterns
+    /// registered after any of their proper prefixes can never be matched. Consequently, they are
+    /// not stored in the automaton and will not be yielded. Under experimental leftmost matching,
+    /// duplicate pattern strings yield only the first-registered value.
     ///
     /// # Examples
     ///
@@ -983,6 +1033,7 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         self.states.len() * mem::size_of::<State>()
             + self.mapper.heap_bytes()
             + self.outputs.len() * mem::size_of::<Output<V>>()
+            + self.emits.len() * mem::size_of::<Emit<V>>()
             + self.prefilter.as_ref().map_or(0, Prefilter::heap_bytes)
             + self.depths.len() * mem::size_of::<u32>()
     }
@@ -1015,7 +1066,12 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
                     .as_ref()
                     .map_or_else(u8::serialized_bytes, |_| {
                         Option::<Prefilter>::serialized_bytes()
-                    }),
+                    })
+                + if self.match_kind.is_experimental() {
+                    self.emits.serialized_bytes()
+                } else {
+                    0
+                },
         );
         self.states.serialize_to_vec(&mut result);
         self.mapper.serialize_to_vec(&mut result);
@@ -1023,6 +1079,9 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         self.match_kind.serialize_to_vec(&mut result);
         self.num_states.serialize_to_vec(&mut result);
         self.prefilter.serialize_to_vec(&mut result);
+        if self.match_kind.is_experimental() {
+            self.emits.serialize_to_vec(&mut result);
+        }
         result
     }
 
@@ -1082,10 +1141,16 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         let (match_kind, source) = MatchKind::deserialize_from_slice(source)?;
         let (num_states, source) = u32::deserialize_from_slice(source)?;
         let (prefilter, source) = Option::<Prefilter>::deserialize_from_slice(source)?;
+        let (emits, source) = if match_kind.is_experimental() {
+            Vec::<Emit<V>>::deserialize_from_slice(source)?
+        } else {
+            (vec![], source)
+        };
         let pma = Self {
             states,
             mapper,
             outputs,
+            emits,
             match_kind,
             num_states,
             prefilter,
@@ -1111,18 +1176,27 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             return Err(DaachorseError::invalid_automaton());
         }
         let states_len = pma.states.len();
-        let outputs_len = pma.outputs.len();
+        let pool_len = if pma.match_kind.is_experimental() {
+            pma.emits.len()
+        } else {
+            pma.outputs.len()
+        };
         for state in &pma.states {
             if let Some(base) = state.base() {
                 if usize::from_u32(base.get()) >= states_len {
                     return Err(DaachorseError::invalid_automaton());
                 }
             };
-            if usize::from_u32(state.fail()) >= states_len {
+            let fail_id = if pma.match_kind.is_experimental() {
+                state.fail() & 0x7FFF_FFFF
+            } else {
+                state.fail()
+            };
+            if usize::from_u32(fail_id) >= states_len {
                 return Err(DaachorseError::invalid_automaton());
             }
             if let Some(output_pos) = state.output_pos() {
-                if usize::from_u32(output_pos.get() - 1) >= outputs_len {
+                if usize::from_u32(output_pos.get() - 1) >= pool_len {
                     return Err(DaachorseError::invalid_automaton());
                 }
             };
@@ -1130,6 +1204,13 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         for (i, output) in pma.outputs.iter().enumerate() {
             if let Some(parent) = output.parent {
                 if usize::from_u32(parent.get() - 1) >= i {
+                    return Err(DaachorseError::invalid_automaton());
+                }
+            };
+        }
+        for (i, emit) in pma.emits.iter().enumerate() {
+            if let Some(pred) = emit.pred {
+                if usize::from_u32(pred.get() - 1) >= i {
                     return Err(DaachorseError::invalid_automaton());
                 }
             };
@@ -1191,11 +1272,17 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         let (num_states, source) = u32::deserialize_from_slice(source).unwrap_unchecked();
         let (prefilter, source) =
             Option::<Prefilter>::deserialize_from_slice(source).unwrap_unchecked();
+        let (emits, source) = if match_kind.is_experimental() {
+            Vec::<Emit<V>>::deserialize_from_slice(source).unwrap_unchecked()
+        } else {
+            (vec![], source)
+        };
         (
             Self {
                 states,
                 mapper,
                 outputs,
+                emits,
                 match_kind,
                 num_states,
                 prefilter,
@@ -1324,7 +1411,9 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
 struct State {
     base: Option<NonZeroU32>,
     check: u32,
+    // Failure state index. In experimental leftmost matching, bit 31 flags if the failure chain has emits.
     fail: u32,
+    // 1-based index into `outputs` (standard/legacy) or `emits` (experimental).
     output_pos: Option<NonZeroU32>,
 }
 

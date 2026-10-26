@@ -664,3 +664,151 @@ fn run_search_tests<F: FnMut(&SearchTest) -> Vec<Match<usize>>>(which: TestColle
         }
     }
 }
+
+
+fn to_match_triples(matches: impl IntoIterator<Item = Match<usize>>) -> Vec<(usize, usize, usize)> {
+    matches
+        .into_iter()
+        .map(|m| (m.value(), m.start(), m.end()))
+        .collect()
+}
+
+#[test]
+fn search_leftmost_longest_experimental_charwise() {
+    for &collection in AC_LEFTMOST_LONGEST {
+        for test in collection {
+            let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
+                .match_kind(MatchKind::LeftmostLongestExperimental)
+                .build(test.patterns)
+                .unwrap();
+            let matches: Vec<Match<usize>> =
+                pma.leftmost_find_iter_experimental(test.haystack).collect();
+            assert_eq!(
+                test.matches,
+                to_match_triples(matches).as_slice(),
+                "test: {}, patterns: {:?}, haystack: {:?}",
+                test.name,
+                test.patterns,
+                test.haystack
+            );
+        }
+    }
+}
+
+#[test]
+fn search_leftmost_first_experimental_charwise() {
+    for &collection in AC_LEFTMOST_FIRST {
+        for test in collection {
+            let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
+                .match_kind(MatchKind::LeftmostFirstExperimental)
+                .build(test.patterns)
+                .unwrap();
+            let matches: Vec<Match<usize>> =
+                pma.leftmost_find_iter_experimental(test.haystack).collect();
+            assert_eq!(
+                test.matches,
+                to_match_triples(matches).as_slice(),
+                "test: {}, patterns: {:?}, haystack: {:?}",
+                test.name,
+                test.patterns,
+                test.haystack
+            );
+        }
+    }
+}
+
+#[test]
+fn test_experimental_empty_pattern_with_prefixes() {
+    for match_kind in [
+        MatchKind::LeftmostLongestExperimental,
+        MatchKind::LeftmostFirstExperimental,
+    ] {
+        let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(match_kind)
+            .build(["", "ab"])
+            .unwrap();
+        let matches = to_match_triples(pma.leftmost_find_iter_experimental(""));
+        assert_eq!(matches, &[(0, 0, 0)]);
+
+        let matches = to_match_triples(pma.leftmost_find_iter_experimental("a"));
+        assert_eq!(matches, &[(0, 0, 0), (0, 1, 1)]);
+
+        let matches = to_match_triples(pma.leftmost_find_iter_experimental("ab"));
+        if match_kind == MatchKind::LeftmostLongestExperimental {
+            assert_eq!(matches, &[(1, 0, 2)]);
+        } else {
+            assert_eq!(matches, &[(0, 0, 0), (0, 1, 1), (0, 2, 2)]);
+        }
+
+        let pma_rev = CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(match_kind)
+            .build(["ab", ""])
+            .unwrap();
+        let matches = to_match_triples(pma_rev.leftmost_find_iter_experimental("ab"));
+        assert_eq!(matches, &[(0, 0, 2)]);
+
+        // 3-char prefix with mismatch halfway
+        let pma_abc = CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(match_kind)
+            .build(["", "abc"])
+            .unwrap();
+        let matches = to_match_triples(pma_abc.leftmost_find_iter_experimental("ab"));
+        assert_eq!(matches, &[(0, 0, 0), (0, 1, 1), (0, 2, 2)]);
+
+        // Multi-byte UTF-8 test
+        let pma_utf8 = CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(match_kind)
+            .build(["", "你好"])
+            .unwrap();
+        let matches = to_match_triples(pma_utf8.leftmost_find_iter_experimental("你"));
+        assert_eq!(matches, &[(0, 0, 0), (0, 3, 3)]);
+    }
+}
+
+#[test]
+fn test_experimental_regression_interleaved_fail_links() {
+    let patterns = [
+        "da", "dbacbc", "a", "bbdadd", "d", "dbc", "dbacbd", "bad", "cbac", "cc", "ddacad", "b",
+    ];
+    let haystack = "abbccdbdadbaacbcaacccbdbcbbcccdddbcabdbdbcbdbaaaaaabbddbaccabbddabbcabacaccabbccaddbbaadbbdadbcacbbcbcdabbaccdddbcacaccdccdacbbccbacaddbbcbbaacccacaacadcccbcccbbcdccaaacbcbcddddbabccbbbabbbdbdccdddcabdadbaaacadbdccadbbbdbbadcbaabaddaabddabcbbcbaadbbcdcdadadccccaadaabdddbacbbcdbbdcaabcbbcaaddbddcccbcccaddbdbbbaccdcabcccdbbdddddacbddacaddadcbdaabacdcabababbdbbadaaabbddcbadbbaaaabcccdcdadccddcabcdabbdbaacbaccabaccbbbaacbcdaadacbdbbddcdcacdcacdbbbdbbdddbacbdcccadabccbacaaadbccacbcccdbaacbcaabdabcbbbcdbccdcaadaadbbaddbaaddbcdbbabdbbbdabdabdbdcccccbbcadabaaddbdaadaaaacdddccddcbddcdbaaababdaaddacccbccddadadcdbdabdddccadcccccdcdbccbaabbabdacdabaccdbbbdccbcaaaabdcdacdbbbaadaacadaccbadcdcaddacbacbccbadccbbacbddcbbcbbbddccaabaacbbdccdadaddabdcbbcdcdadddaacacbbcddadbcbcdddcbaabcababbacdcdabbccacbddcbccdcbbcbacdcdaccba";
+
+    let pma_legacy = CharwiseDoubleArrayAhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostLongest)
+        .build::<_, _, usize>(patterns)
+        .unwrap();
+    let pma_experimental = CharwiseDoubleArrayAhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostLongestExperimental)
+        .build::<_, _, usize>(patterns)
+        .unwrap();
+
+    let expected: Vec<_> = pma_legacy.leftmost_find_iter(haystack).collect();
+    let actual: Vec<_> = pma_experimental
+        .leftmost_find_iter_experimental(haystack)
+        .collect();
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn test_experimental_parent_and_candidate_matches() {
+    // Verifies that when an intermediate state on a long pattern branch (e.g. "xybacelong")
+    // experiences candidate failure on transition 'e' (where suffix candidate "bac" breaks),
+    // ancestor matches ("xy") and broken candidate matches ("b", "a") are correctly
+    // spliced and preserved when matching text that diverges (e.g. "xybacex").
+    let patterns = ["xy", "b", "a", "bacd", "xybacelong"];
+    let haystack = "xybacex";
+
+    let pma_legacy = CharwiseDoubleArrayAhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostLongest)
+        .build::<_, _, usize>(patterns)
+        .unwrap();
+    let pma_experimental = CharwiseDoubleArrayAhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostLongestExperimental)
+        .build::<_, _, usize>(patterns)
+        .unwrap();
+
+    let expected: Vec<_> = pma_legacy.leftmost_find_iter(haystack).collect();
+    let actual: Vec<_> = pma_experimental
+        .leftmost_find_iter_experimental(haystack)
+        .collect();
+    assert_eq!(expected, actual);
+}
