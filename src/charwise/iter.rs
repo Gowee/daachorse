@@ -700,7 +700,7 @@ pub struct LeftmostFindIteratorExperimental<'a, P, V> {
     pub(crate) pos: usize,
     pub(crate) state_id: u32,
     // Buffer storing multi-match chains to be emitted in chronological order.
-    pub(crate) buf: alloc::vec::Vec<Match<V>>,
+    pub(crate) buf: Vec<Match<V>>,
     pub(crate) gate: PrefilterGate,
     pub(crate) epsilon_emit_pos: Option<NonZeroU32>,
     pub(crate) epsilon_cursor: usize,
@@ -711,8 +711,8 @@ where
     P: AsRef<str>,
     V: Copy,
 {
-    const FAIL_STATE_MASK: u32 = 0x7FFF_FFFF;
-    const FAIL_HAS_EMIT_BIT: u32 = 0x8000_0000;
+    pub(crate) const FAIL_STATE_MASK: u32 = 0x7FFF_FFFF;
+    pub(crate) const FAIL_HAS_EMIT_BIT: u32 = 0x8000_0000;
 
     /// Returns the target failure state index with bit 31 (`FAIL_HAS_EMIT_BIT`) masked out.
     #[inline(always)]
@@ -740,7 +740,7 @@ where
             haystack,
             pos,
             state_id: ROOT_STATE_IDX,
-            buf: alloc::vec::Vec::new(),
+            buf: Vec::new(),
             gate: PrefilterGate::new(),
             epsilon_emit_pos: pma.states[usize::from_u32(ROOT_STATE_IDX)].output_pos(),
             epsilon_cursor: 0,
@@ -809,7 +809,7 @@ where
                         // pattern with a single-match emit (gap = 0, pred = None).
                         // The leaf match ends at pos; the next search begins with c at pos from ROOT.
                         // SAFETY: Every leaf state has a valid `output_pos` pointing to an emit.
-                        // `states` contains ROOT_STATE_IDX and `code` is a mapped alphabet code.
+                        // This invariant is guaranteed by construction and enforced in safe `deserialize()`.
                         let ep = unsafe { state.output_pos().unwrap_unchecked() };
                         let emit = unsafe { emits.get_unchecked(usize::from_u32(ep.get()) - 1) };
                         self.state_id = unsafe { Self::step_root(states, code) };
@@ -921,7 +921,7 @@ where
         emits: &[crate::Emit<V>],
         head_pos: NonZeroU32,
         mut anchor: usize,
-        buf: &mut alloc::vec::Vec<Match<V>>,
+        buf: &mut Vec<Match<V>>,
     ) -> Match<V> {
         let mut curr_ep = head_pos;
         loop {
@@ -951,7 +951,7 @@ where
     unsafe fn drain_fail_chain(
         states: &[State],
         emits: &[crate::Emit<V>],
-        buf: &mut alloc::vec::Vec<Match<V>>,
+        buf: &mut Vec<Match<V>>,
         mut state_id: u32,
         pos: usize,
     ) -> (u32, Option<Match<V>>) {
@@ -999,6 +999,10 @@ where
 
         let bytes = self.haystack.as_ref().as_bytes();
         let target = self.buf.last().map_or(bytes.len(), Match::start);
+        // `deserialize()` for now does not validate match lengths or state depths to avoid
+        // expensive trie traversal (malformed automata may return inaccurate ranges).
+        // If a malformed emit causes `Match::start()` to wrap, clamping prevents OOB decoding.
+        let target = target.min(bytes.len());
         // SAFETY: `ep` is verified during automaton construction to point to a valid emit node for the empty pattern.
         let epsilon = unsafe { self.pma.emits.get_unchecked(usize::from_u32(ep.get()) - 1) };
 
@@ -1037,6 +1041,11 @@ where
         None
     }
 }
+
+pub(crate) const FAIL_STATE_MASK: u32 =
+    LeftmostFindIteratorExperimental::<&str, ()>::FAIL_STATE_MASK;
+pub(crate) const FAIL_HAS_EMIT_BIT: u32 =
+    LeftmostFindIteratorExperimental::<&str, ()>::FAIL_HAS_EMIT_BIT;
 
 /// Stepper created by [`CharwiseDoubleArrayAhoCorasick::find_stepper()`].
 #[derive(Clone)]

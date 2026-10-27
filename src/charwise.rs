@@ -14,7 +14,7 @@ use crate::charwise::iter::{
     CharWithEndOffsetIterator, FindIterator, FindOverlappingIterator,
     FindOverlappingNoSuffixIterator, FindOverlappingNoSuffixSliceIterator,
     FindOverlappingSliceIterator, FindOverlappingStepper, FindSliceIterator, FindStepper,
-    LeftmostFindIterator, LeftmostFindIteratorExperimental, PatternIterator,
+    LeftmostFindIterator, LeftmostFindIteratorExperimental, PatternIterator, FAIL_STATE_MASK,
 };
 use crate::charwise::mapper::CodeMapper;
 use crate::errors::{DaachorseError, Result};
@@ -1181,19 +1181,37 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
         } else {
             pma.outputs.len()
         };
-        for state in &pma.states {
+        for (i, state) in pma.states.iter().enumerate() {
             if let Some(base) = state.base() {
                 if usize::from_u32(base.get()) >= states_len {
                     return Err(DaachorseError::invalid_automaton());
                 }
             };
             let fail_id = if pma.match_kind.is_experimental() {
-                state.fail() & 0x7FFF_FFFF
+                state.fail() & FAIL_STATE_MASK
             } else {
                 state.fail()
             };
             if usize::from_u32(fail_id) >= states_len {
                 return Err(DaachorseError::invalid_automaton());
+            }
+            let is_allocated =
+                i == usize::from_u32(ROOT_STATE_IDX) || state.check() != DEAD_STATE_IDX;
+            if pma.match_kind.is_experimental() && is_allocated {
+                // In experimental leftmost matching, failure links of allocated states must point
+                // to ROOT or another allocated state (never to unallocated/dead slots).
+                if fail_id != ROOT_STATE_IDX
+                    && pma.states[usize::from_u32(fail_id)].check() == DEAD_STATE_IDX
+                {
+                    return Err(DaachorseError::invalid_automaton());
+                }
+                if state.check() != DEAD_STATE_IDX
+                    && state.base().is_none()
+                    && state.output_pos().is_none()
+                {
+                    // Every allocated leaf state must have an output.
+                    return Err(DaachorseError::invalid_automaton());
+                }
             }
             if let Some(output_pos) = state.output_pos() {
                 if usize::from_u32(output_pos.get() - 1) >= pool_len {
@@ -1856,5 +1874,53 @@ mod tests {
         bytes[44..48].copy_from_slice(&1u32.to_le_bytes());
         let pma = CharwiseDoubleArrayAhoCorasick::<u32>::deserialize(&bytes);
         assert!(pma.is_ok());
+    }
+
+    #[test]
+    fn test_deserialize_leaf_without_output_experimental() {
+        let pma: CharwiseDoubleArrayAhoCorasick<u32> = CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostLongestExperimental)
+            .build(["ab"])
+            .unwrap();
+        let mut bytes = pma.serialize();
+        let num_states = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let mut leaf_found = false;
+        for idx in 1..num_states {
+            let off = 4 + usize::try_from(idx).unwrap() * 16;
+            let base = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let check = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            let output_pos = u32::from_le_bytes(bytes[off + 12..off + 16].try_into().unwrap());
+            if base == 0 && check != 0 && output_pos != 0 {
+                bytes[off + 12..off + 16].copy_from_slice(&0u32.to_le_bytes());
+                leaf_found = true;
+                break;
+            }
+        }
+        assert!(leaf_found);
+        assert!(CharwiseDoubleArrayAhoCorasick::<u32>::deserialize(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_deserialize_fail_to_unallocated_state_experimental() {
+        let pma: CharwiseDoubleArrayAhoCorasick<u32> = CharwiseDoubleArrayAhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostLongestExperimental)
+            .build(["ab", "c"])
+            .unwrap();
+        let mut bytes = pma.serialize();
+        let num_states = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let mut patched = false;
+        for idx in 1..num_states {
+            let off = 4 + usize::try_from(idx).unwrap() * 16;
+            let base = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let check = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            if check == 0 && base != 0 {
+                // Patch state 'a' fail target to 1 (DEAD_STATE_IDX)
+                bytes[off + 8..off + 12].copy_from_slice(&1u32.to_le_bytes());
+                patched = true;
+                break;
+            }
+        }
+        assert!(patched);
+        assert!(CharwiseDoubleArrayAhoCorasick::<u32>::deserialize(&bytes).is_err());
     }
 }

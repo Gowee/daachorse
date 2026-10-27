@@ -5,6 +5,7 @@ use core::num::NonZeroU32;
 use alloc::vec::Vec;
 
 use crate::build_helper::{Profile, SiblingGroup};
+use crate::charwise::iter::FAIL_STATE_MASK;
 use crate::edge_map::EdgeMap;
 use crate::errors::{DaachorseError, Result};
 use crate::utils::FromU32;
@@ -103,8 +104,8 @@ where
             if let Some(next_state_id) = self.child_id(state_id, c) {
                 state_id = next_state_id;
             } else if let Ok(next_state_id) = u32::try_from(self.states.len()) {
-                if self.match_kind.is_experimental() && next_state_id > 0x7FFF_FFFF {
-                    return Err(DaachorseError::automaton_scale("state_id", 0x7FFF_FFFF));
+                if self.match_kind.is_experimental() && next_state_id > FAIL_STATE_MASK {
+                    return Err(DaachorseError::automaton_scale("state_id", FAIL_STATE_MASK));
                 }
                 self.states[usize::from_u32(state_id)]
                     .edges

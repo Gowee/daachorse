@@ -2,6 +2,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::build_helper::{BuildHelper, Profile};
+use crate::charwise::iter::{FAIL_HAS_EMIT_BIT, FAIL_STATE_MASK};
 use crate::charwise::{CharwiseDoubleArrayAhoCorasick, CodeMapper, MatchKind, State};
 use crate::errors::{DaachorseError, Result};
 use crate::nfa_builder::NfaBuilder;
@@ -354,9 +355,12 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
         let groups = nfa.sibling_groups(profile, |c| self.mapper.get(c).unwrap());
         let helper = BuildHelper::new(&groups, nfa.states.len(), block_len, false)?;
 
-        // Bit 31 of `fail` is used to flag whether the failure chain has emits, limiting states to 0x7FFF_FFFF.
-        if self.match_kind.is_experimental() && helper.num_elements() > 0x7FFF_FFFF {
-            return Err(DaachorseError::automaton_scale("states.len()", 0x7FFF_FFFF));
+        // Bit 31 of `fail` is used to flag whether the failure chain has emits, limiting states to FAIL_STATE_MASK.
+        if self.match_kind.is_experimental() && helper.num_elements() > FAIL_STATE_MASK {
+            return Err(DaachorseError::automaton_scale(
+                "states.len()",
+                FAIL_STATE_MASK,
+            ));
         }
 
         self.states
@@ -403,7 +407,7 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
                     | MatchKind::LeftmostFirstExperimental
                         if s.fail_has_emit.get() =>
                     {
-                        0x8000_0000
+                        FAIL_HAS_EMIT_BIT
                     }
                     _ => 0,
                 };
