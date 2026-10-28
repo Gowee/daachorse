@@ -11,6 +11,19 @@ use crate::prefilter::{Prefilter, PrefilterGate};
 use crate::utils::FromU32;
 use crate::{Match, ROOT_STATE_IDX};
 
+/// Returns the length of the UTF-8 character starting with `b`, or `None` if `b` is an invalid
+/// or continuation leading byte.
+#[inline(always)]
+const fn utf8_char_len_from_first_byte(b: u8) -> Option<usize> {
+    match b {
+        0x00..=0x7F => Some(1),
+        0xC2..=0xDF => Some(2),
+        0xE0..=0xEF => Some(3),
+        0xF0..=0xF4 => Some(4),
+        _ => None,
+    }
+}
+
 /// Decodes the character starting at byte position `pos`.
 ///
 /// # Safety
@@ -711,21 +724,6 @@ where
     P: AsRef<str>,
     V: Copy,
 {
-    pub(crate) const FAIL_STATE_MASK: u32 = 0x7FFF_FFFF;
-    pub(crate) const FAIL_HAS_EMIT_BIT: u32 = 0x8000_0000;
-
-    /// Returns the target failure state index with bit 31 (`FAIL_HAS_EMIT_BIT`) masked out.
-    #[inline(always)]
-    const fn fail_id(state: &State) -> u32 {
-        state.fail() & Self::FAIL_STATE_MASK
-    }
-
-    /// Returns `true` if this state or any state along its failure chain has a match emit.
-    #[inline(always)]
-    const fn fail_has_emit(state: &State) -> bool {
-        (state.fail() & Self::FAIL_HAS_EMIT_BIT) != 0
-    }
-
     pub(crate) fn new(pma: &'a CharwiseDoubleArrayAhoCorasick<V>, haystack: P) -> Self {
         // Invariant: if root has no base, the trie has 0 character edges (either empty pattern set
         // or only ""). Setting pos = len skips the character scanning engine entirely while preserving
@@ -822,10 +820,10 @@ where
                         // Break from the inner transition loop so the outer loop advances to the next character.
                         break;
                     }
-                    state_id = Self::fail_id(state);
+                    state_id = state.leftmost_experimental_fail();
                     if let Some(ep) = state.output_pos() {
                         // Mismatch occurred at `state`. Emit committed matches (`ep`) that precede
-                        // the pending suffix `fail_id(state)`.
+                        // the pending suffix `state.leftmost_experimental_fail()`.
                         // SAFETY: `ep` is a valid emit index from `state.output_pos()`, and `pos >= pattern_length`.
                         let m = unsafe { Self::extract_emits(emits, ep, pos, &mut self.buf) };
                         if state_id == ROOT_STATE_IDX {
@@ -911,11 +909,13 @@ where
     /// Extracts committed matches along the predecessor chain in chronological order.
     ///
     /// The earliest match is returned directly; any subsequent matches are pushed into `buf`.
+    /// `anchor` is the byte offset ending the matched path so far (the start offset of the
+    /// mismatched character). An invalid `anchor` or corrupt automaton causes subtraction to wrap,
+    /// producing an out-of-bounds offset in [`Match`].
     ///
     /// # Safety
     ///
-    /// - `head_pos` and all reachable `pred` indices must be valid 1-based indices into `emits`.
-    /// - `anchor` must be greater than or equal to the total span length of the chain.
+    /// `head_pos` and all reachable `pred` indices must be valid 1-based indices into `emits`.
     #[inline(always)]
     unsafe fn extract_emits(
         emits: &[crate::Emit<V>],
@@ -958,10 +958,10 @@ where
         while state_id != ROOT_STATE_IDX {
             // SAFETY: caller guarantees state_id is a valid state index in states.
             let state = unsafe { states.get_unchecked(usize::from_u32(state_id)) };
-            if !Self::fail_has_emit(state) {
+            if !state.leftmost_experimental_has_emit() {
                 break;
             }
-            state_id = Self::fail_id(state);
+            state_id = state.leftmost_experimental_fail();
             if let Some(ep) = state.output_pos() {
                 // SAFETY: caller guarantees states and emits invariants are preserved.
                 let m = unsafe { Self::extract_emits(emits, ep, pos, buf) };
@@ -1013,39 +1013,38 @@ where
         // Emit zero-length matches at character boundaries prior to the start of the next non-empty match:
         if self.epsilon_cursor < target {
             let cursor = self.epsilon_cursor;
-            // SAFETY: `self.epsilon_cursor < target <= bytes.len()`, and cursor sits on a valid UTF-8 character boundary.
-            let (_, char_len) = unsafe { decode_char_unchecked(bytes, self.epsilon_cursor) };
-            self.epsilon_cursor += char_len;
+            // SAFETY: `cursor < target <= bytes.len()`.
+            // Advances even for an invalid cursor resulting from a malformed automaton.
+            self.epsilon_cursor +=
+                utf8_char_len_from_first_byte(unsafe { *bytes.get_unchecked(cursor) }).unwrap_or(1);
             return Some(epsilon.to_match(cursor));
         }
 
         // Emit the non-empty match and advance cursor past its end:
         if let Some(m) = self.buf.pop() {
-            self.epsilon_cursor = if m.end() < bytes.len() {
-                // SAFETY: guarded by `m.end() < bytes.len()`, and match boundaries in UTF-8 automata sit on character boundaries.
-                let (_, char_len) = unsafe { decode_char_unchecked(bytes, m.end()) };
-                m.end() + char_len
+            if m.end() < bytes.len() {
+                // SAFETY: guarded by `m.end() < bytes.len()`.
+                self.epsilon_cursor = m.end()
+                    + utf8_char_len_from_first_byte(unsafe { *bytes.get_unchecked(m.end()) })
+                        .unwrap_or(1);
             } else {
-                usize::MAX
-            };
+                self.epsilon_emit_pos.take();
+            }
             return Some(m);
         }
 
-        // Emit trailing zero-length match at the very end of the text (EOF):
-        if self.epsilon_cursor <= bytes.len() {
-            self.epsilon_cursor = usize::MAX;
+        // No more non-empty matches and cursor >= bytes.len(). Epsilon matching is complete.
+        self.epsilon_emit_pos.take();
+
+        // Trailing zero-length match at EOF when the cursor lands exactly on the text boundary.
+        if self.epsilon_cursor == bytes.len() {
             return Some(epsilon.to_match(bytes.len()));
         }
 
-        self.epsilon_emit_pos = None;
+        // Cursor is past EOF due to a malformed automaton.
         None
     }
 }
-
-pub(crate) const FAIL_STATE_MASK: u32 =
-    LeftmostFindIteratorExperimental::<&str, ()>::FAIL_STATE_MASK;
-pub(crate) const FAIL_HAS_EMIT_BIT: u32 =
-    LeftmostFindIteratorExperimental::<&str, ()>::FAIL_HAS_EMIT_BIT;
 
 /// Stepper created by [`CharwiseDoubleArrayAhoCorasick::find_stepper()`].
 #[derive(Clone)]
@@ -1285,7 +1284,7 @@ where
             // The output list of a state contains patterns ending at that state, followed by
             // shorter patterns registered for its suffixes, which must be skipped.
             if let Some(output_pos) = self.output_pos.take() {
-                if self.pma.match_kind.is_experimental() {
+                if self.pma.match_kind.is_leftmost_experimental() {
                     let Some(emit) = self.pma.emits.get(usize::from_u32(output_pos.get() - 1))
                     else {
                         // Reached only by malformed automata. Stops iteration permanently.

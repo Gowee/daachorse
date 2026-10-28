@@ -546,7 +546,7 @@ impl MatchKind {
         self == Self::LeftmostFirst || self == Self::LeftmostFirstExperimental
     }
 
-    pub(crate) fn is_experimental(self) -> bool {
+    pub(crate) fn is_leftmost_experimental(self) -> bool {
         self == Self::LeftmostLongestExperimental || self == Self::LeftmostFirstExperimental
     }
 }

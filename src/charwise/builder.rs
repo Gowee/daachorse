@@ -2,8 +2,10 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::build_helper::{BuildHelper, Profile};
-use crate::charwise::iter::{FAIL_HAS_EMIT_BIT, FAIL_STATE_MASK};
-use crate::charwise::{CharwiseDoubleArrayAhoCorasick, CodeMapper, MatchKind, State};
+use crate::charwise::{
+    CharwiseDoubleArrayAhoCorasick, CodeMapper, MatchKind, State,
+    LEFTMOST_EXPERIMENTAL_MAX_NUM_STATES,
+};
 use crate::errors::{DaachorseError, Result};
 use crate::nfa_builder::NfaBuilder;
 use crate::nfa_builder::DEAD_STATE_ID;
@@ -355,11 +357,13 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
         let groups = nfa.sibling_groups(profile, |c| self.mapper.get(c).unwrap());
         let helper = BuildHelper::new(&groups, nfa.states.len(), block_len, false)?;
 
-        // Bit 31 of `fail` is used to flag whether the failure chain has emits, limiting states to FAIL_STATE_MASK.
-        if self.match_kind.is_experimental() && helper.num_elements() > FAIL_STATE_MASK {
+        // Bit 31 of `fail` is used to flag whether the failure chain has emits, limiting states to LEFTMOST_EXPERIMENTAL_MAX_NUM_STATES.
+        if self.match_kind.is_leftmost_experimental()
+            && helper.num_elements() > LEFTMOST_EXPERIMENTAL_MAX_NUM_STATES
+        {
             return Err(DaachorseError::automaton_scale(
                 "states.len()",
-                FAIL_STATE_MASK,
+                LEFTMOST_EXPERIMENTAL_MAX_NUM_STATES,
             ));
         }
 
@@ -402,16 +406,12 @@ impl CharwiseDoubleArrayAhoCorasickBuilder {
             } else {
                 let fail_idx = state_id_map[usize::from_u32(fail_id)];
                 debug_assert_ne!(fail_idx, DEAD_STATE_IDX);
-                let fail_flag = match self.match_kind {
-                    MatchKind::LeftmostLongestExperimental
-                    | MatchKind::LeftmostFirstExperimental
-                        if s.fail_has_emit.get() =>
-                    {
-                        FAIL_HAS_EMIT_BIT
-                    }
-                    _ => 0,
-                };
-                self.states[idx].set_fail(fail_idx | fail_flag);
+                if self.match_kind.is_leftmost_experimental() {
+                    self.states[idx]
+                        .set_leftmost_experimental_fail(fail_idx, s.fail_has_emit.get());
+                } else {
+                    self.states[idx].set_fail(fail_idx);
+                }
             }
         }
     }
