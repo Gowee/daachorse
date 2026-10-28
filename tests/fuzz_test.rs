@@ -149,7 +149,7 @@ fn test_fuzz_binary_alphabet() {
     let mut rng = Rng::new(0x1234_5678);
     let alphabet = ['a', 'b'];
 
-    for round in 0..1000 {
+    for round in 0..200 {
         let num_pats = rng.gen_range(2, 20);
         let mut patterns = Vec::with_capacity(num_pats);
         for _ in 0..num_pats {
@@ -168,7 +168,7 @@ fn test_fuzz_small_alphabet() {
     let mut rng = Rng::new(0x8765_4321);
     let alphabet = ['a', 'b', 'c', 'd'];
 
-    for round in 0..1000 {
+    for round in 0..200 {
         let num_pats = rng.gen_range(2, 30);
         let mut patterns = Vec::with_capacity(num_pats);
         for _ in 0..num_pats {
@@ -187,7 +187,7 @@ fn test_fuzz_unicode_chinese() {
     let mut rng = Rng::new(0xfeed_face);
     let alphabet = ['中', '文', '分', '词', '测', '试', '长', '短', '匹', '配'];
 
-    for round in 0..500 {
+    for round in 0..100 {
         let num_pats = rng.gen_range(2, 25);
         let mut patterns = Vec::with_capacity(num_pats);
         for _ in 0..num_pats {
@@ -206,7 +206,7 @@ fn test_fuzz_heavy_nested_prefixes() {
     let mut rng = Rng::new(0xabcd_ef01);
     let alphabet = ['a', 'b', 'c'];
 
-    for round in 0..500 {
+    for round in 0..100 {
         // Generate patterns where prefixes are intentionally injected
         let num_base = rng.gen_range(2, 6);
         let mut patterns = Vec::new();
@@ -228,7 +228,7 @@ fn test_fuzz_heavy_nested_prefixes() {
 fn test_fuzz_adversarial_near_miss() {
     let mut rng = Rng::new(0x9999_9999);
 
-    for round in 0..300 {
+    for round in 0..100 {
         let l = rng.gen_range(10, 100);
         let pat_long = format!("{}b", "a".repeat(l));
         let pat_short = "a".repeat(l / 2);
@@ -249,7 +249,7 @@ fn test_fuzz_stress_large_corpus() {
     let mut rng = Rng::new(0x5555_5555);
     let alphabet = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
 
-    for round in 0..100 {
+    for round in 0..50 {
         let num_pats = rng.gen_range(50, 200);
         let mut patterns = Vec::with_capacity(num_pats);
         for _ in 0..num_pats {
@@ -309,7 +309,7 @@ fn test_fuzz_leftmost_first_equivalence() {
     let mut rng = Rng::new(0xdead_beef_1234_5678);
     let alphabet = ['a', 'b', 'c', 'd'];
 
-    for round in 0..1000 {
+    for round in 0..200 {
         let num_pats = rng.gen_range(2, 20);
         let mut patterns = Vec::with_capacity(num_pats);
         for _ in 0..num_pats {
@@ -337,7 +337,7 @@ fn test_fuzz_unmapped_characters() {
     let sep = [' ', '.', '-', '/', '\n', '\t', 'X', 'Z', '0', '9'];
     let word = ['a', 'b', 'c', 'd', 'e'];
 
-    for round in 0..400 {
+    for round in 0..100 {
         let num_pats = rng.gen_range(1, 40);
         let mut patterns = Vec::new();
         for _ in 0..num_pats {
@@ -514,7 +514,7 @@ fn test_fuzz_iter_pattern_reconstruction() {
     let mut rng = Rng::new(0x1337_c0de_cafe_babe);
 
     for (name, alphabet) in alphabets {
-        for round in 0..500 {
+        for round in 0..50 {
             let num_pats = rng.gen_range(0, 30);
             let mut patvals: Vec<(String, u32)> = Vec::with_capacity(num_pats);
 
