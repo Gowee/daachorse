@@ -707,19 +707,18 @@ where
 /// [`CharwiseDoubleArrayAhoCorasick::leftmost_find_iter_experimental()`].
 ///
 /// Matches are evaluated in a single forward pass in worst-case linear time `O(N)`.
-pub struct LeftmostFindIteratorExperimental<'a, P, V> {
+/// Core scanning engine for experimental leftmost matching that advances across the haystack.
+pub struct LeftmostScannerExperimental<'a, P, V> {
     pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
     pub(crate) haystack: P,
     pub(crate) pos: usize,
     pub(crate) state_id: u32,
-    // Buffer storing multi-match chains to be emitted in chronological order.
-    pub(crate) buf: Vec<Match<V>>,
     pub(crate) gate: PrefilterGate,
     pub(crate) epsilon_emit_pos: Option<NonZeroU32>,
     pub(crate) epsilon_cursor: usize,
 }
 
-impl<'a, P, V> LeftmostFindIteratorExperimental<'a, P, V>
+impl<'a, P, V> LeftmostScannerExperimental<'a, P, V>
 where
     P: AsRef<str>,
     V: Copy,
@@ -738,16 +737,93 @@ where
             haystack,
             pos,
             state_id: ROOT_STATE_IDX,
-            buf: Vec::new(),
             gate: PrefilterGate::new(),
             epsilon_emit_pos: pma.states[usize::from_u32(ROOT_STATE_IDX)].output_pos(),
             epsilon_cursor: 0,
         }
     }
 
+    /// Advances the scan across the haystack, returning the next match if found.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - A mutable scratch buffer used to hold trailing matches when a mismatch or
+    ///   drain transition yields a chain of multiple predecessor matches.
+    ///
+    /// # Invariant
+    ///
+    /// The caller must pass the same `buf` across subsequent calls on the same haystack so that
+    /// any buffered matches from previous multi-match transitions can be drained in chronological
+    /// order before scanning continues.
+    #[inline(always)]
+    pub fn scan_with(&mut self, buf: &mut Vec<Match<V>>) -> Option<Match<V>> {
+        // When the empty pattern "" is absent, yield any buffered matches or scan forward.
+        let Some(ep) = self.epsilon_emit_pos else {
+            if let Some(m) = buf.pop() {
+                return Some(m);
+            }
+            return self.scan(buf);
+        };
+
+        // When "" is present, interleave zero-length matches at character boundaries
+        // not spanned by non-empty matches.
+        if buf.is_empty() {
+            if let Some(m) = self.scan(buf) {
+                buf.push(m);
+            }
+        }
+
+        let bytes = self.haystack.as_ref().as_bytes();
+        let target = buf.last().map_or(bytes.len(), Match::start);
+        // `deserialize()` for now does not validate match lengths or state depths to avoid
+        // expensive trie traversal (malformed automata may return inaccurate ranges).
+        // If a malformed emit causes `Match::start()` to wrap, clamping prevents OOB decoding.
+        let target = target.min(bytes.len());
+        // SAFETY: `ep` is verified during automaton construction to point to a valid emit node for the empty pattern.
+        let epsilon = unsafe { self.pma.emits.get_unchecked(usize::from_u32(ep.get()) - 1) };
+
+        debug_assert_eq!(epsilon.length, 0);
+        debug_assert_eq!(epsilon.gap, 0);
+        debug_assert!(epsilon.pred.is_none());
+
+        // Emit zero-length matches at character boundaries prior to the start of the next non-empty match:
+        if self.epsilon_cursor < target {
+            let cursor = self.epsilon_cursor;
+            // SAFETY: `cursor < target <= bytes.len()`.
+            // Advances even for an invalid cursor resulting from a malformed automaton.
+            self.epsilon_cursor +=
+                utf8_char_len_from_first_byte(unsafe { *bytes.get_unchecked(cursor) }).unwrap_or(1);
+            return Some(epsilon.to_match(cursor));
+        }
+
+        // Emit the non-empty match and advance cursor past its end:
+        if let Some(m) = buf.pop() {
+            if m.end() < bytes.len() {
+                // SAFETY: guarded by `m.end() < bytes.len()`.
+                self.epsilon_cursor = m.end()
+                    + utf8_char_len_from_first_byte(unsafe { *bytes.get_unchecked(m.end()) })
+                        .unwrap_or(1);
+            } else {
+                self.epsilon_emit_pos.take();
+            }
+            return Some(m);
+        }
+
+        // No more non-empty matches and cursor >= bytes.len(). Epsilon matching is complete.
+        self.epsilon_emit_pos.take();
+
+        // Trailing zero-length match at EOF when the cursor lands exactly on the text boundary.
+        if self.epsilon_cursor == bytes.len() {
+            return Some(epsilon.to_match(bytes.len()));
+        }
+
+        // Cursor is past EOF due to a malformed automaton.
+        None
+    }
+
     /// Core scanning engine that advances the automaton forward until a match is found or EOF is reached.
     #[inline(always)]
-    fn scan_impl<const FILTERED: bool>(&mut self) -> Option<Match<V>> {
+    fn scan_impl<const FILTERED: bool>(&mut self, buf: &mut Vec<Match<V>>) -> Option<Match<V>> {
         let haystack = self.haystack.as_ref();
         let bytes = haystack.as_bytes();
 
@@ -825,7 +901,7 @@ where
                         // Mismatch occurred at `state`. Emit committed matches (`ep`) that precede
                         // the pending suffix `state.leftmost_experimental_fail()`.
                         // SAFETY: `ep` is a valid emit index from `state.output_pos()`, and `pos >= pattern_length`.
-                        let m = unsafe { Self::extract_emits(emits, ep, pos, &mut self.buf) };
+                        let m = unsafe { Self::extract_emits(emits, ep, pos, buf) };
                         if state_id == ROOT_STATE_IDX {
                             // Pending suffix reached ROOT. Step `ROOT` on `code` and advance past `c`.
                             // SAFETY: `states` has ROOT_STATE_IDX and `code` is in alphabet.
@@ -844,9 +920,8 @@ where
                 // Character `c` is not in the alphabet. Drain any pending matches along the failure chain.
                 if state_id != ROOT_STATE_IDX {
                     // SAFETY: `state_id` is a valid state index, and pos sits on a valid character boundary.
-                    let (next_state_id, m) = unsafe {
-                        Self::drain_fail_chain(states, emits, &mut self.buf, state_id, pos)
-                    };
+                    let (next_state_id, m) =
+                        unsafe { Self::drain_fail_chain(states, emits, buf, state_id, pos) };
                     if let Some(m) = m {
                         // Match found along the failure chain. Retain `pos` so further matches
                         // along the chain can be drained on subsequent calls.
@@ -865,18 +940,18 @@ where
         // Text boundary reached (EOF). Drain any remaining matches along the failure chain.
         // SAFETY: `state_id` is a valid state index, and pos sits on a valid character boundary.
         let (next_state_id, m) =
-            unsafe { Self::drain_fail_chain(states, emits, &mut self.buf, state_id, pos) };
+            unsafe { Self::drain_fail_chain(states, emits, buf, state_id, pos) };
         self.pos = pos;
         self.state_id = next_state_id;
         m
     }
 
     #[inline(always)]
-    fn scan(&mut self) -> Option<Match<V>> {
+    fn scan(&mut self, buf: &mut Vec<Match<V>>) -> Option<Match<V>> {
         if self.pma.prefilter.is_some() && self.gate.is_enabled() {
-            self.scan_impl::<true>()
+            self.scan_impl::<true>(buf)
         } else {
-            self.scan_impl::<false>()
+            self.scan_impl::<false>(buf)
         }
     }
 
@@ -972,6 +1047,105 @@ where
     }
 }
 
+/// An iterator of non-overlapping leftmost matches that borrows an external match buffer.
+pub struct LeftmostFindBorrowedIterator<'a, 'b, P, V> {
+    pub(crate) scanner: LeftmostScannerExperimental<'a, P, V>,
+    pub(crate) buf: &'b mut Vec<Match<V>>,
+}
+
+impl<'a, 'b, P, V> Iterator for LeftmostFindBorrowedIterator<'a, 'b, P, V>
+where
+    P: AsRef<str>,
+    V: Copy,
+{
+    type Item = Match<V>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.scanner.scan_with(self.buf)
+    }
+}
+
+/// A reusable finder for non-overlapping leftmost matches that amortizes buffer allocation.
+pub struct LeftmostFinderExperimental<'a, V> {
+    pub(crate) pma: &'a CharwiseDoubleArrayAhoCorasick<V>,
+    pub(crate) buf: Vec<Match<V>>,
+}
+
+impl<'a, V: Copy> LeftmostFinderExperimental<'a, V> {
+    /// Creates a new leftmost finder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the automaton was not constructed with [`MatchKind::LeftmostLongestExperimental`]
+    /// or [`MatchKind::LeftmostFirstExperimental`].
+    pub fn new(pma: &'a CharwiseDoubleArrayAhoCorasick<V>) -> Self {
+        assert!(
+            pma.match_kind.is_leftmost_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        Self {
+            pma,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Creates a new leftmost finder with the specified initial buffer capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the automaton was not constructed with [`MatchKind::LeftmostLongestExperimental`]
+    /// or [`MatchKind::LeftmostFirstExperimental`].
+    pub fn with_capacity(pma: &'a CharwiseDoubleArrayAhoCorasick<V>, capacity: usize) -> Self {
+        assert!(
+            pma.match_kind.is_leftmost_experimental(),
+            "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
+        );
+        Self {
+            pma,
+            buf: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Returns an iterator of non-overlapping leftmost matches in the given haystack, reusing
+    /// the finder's internal buffer across iterations.
+    #[inline(always)]
+    pub fn find_iter<'b, P>(&'b mut self, haystack: P) -> LeftmostFindBorrowedIterator<'a, 'b, P, V>
+    where
+        P: AsRef<str>,
+    {
+        self.buf.clear();
+        LeftmostFindBorrowedIterator {
+            scanner: LeftmostScannerExperimental::new(self.pma, haystack),
+            buf: &mut self.buf,
+        }
+    }
+
+    /// Returns a reference to the underlying automaton.
+    pub fn pma(&self) -> &'a CharwiseDoubleArrayAhoCorasick<V> {
+        self.pma
+    }
+}
+
+/// An iterator of non-overlapping leftmost matches in the input text with an owned buffer.
+pub struct LeftmostFindIteratorExperimental<'a, P, V> {
+    pub(crate) scanner: LeftmostScannerExperimental<'a, P, V>,
+    pub(crate) buf: Vec<Match<V>>,
+}
+
+impl<'a, P, V> LeftmostFindIteratorExperimental<'a, P, V>
+where
+    P: AsRef<str>,
+    V: Copy,
+{
+    pub(crate) fn new(pma: &'a CharwiseDoubleArrayAhoCorasick<V>, haystack: P) -> Self {
+        Self {
+            scanner: LeftmostScannerExperimental::new(pma, haystack),
+            buf: Vec::new(),
+        }
+    }
+}
+
 impl<P, V> Iterator for LeftmostFindIteratorExperimental<'_, P, V>
 where
     P: AsRef<str>,
@@ -981,68 +1155,7 @@ where
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        // When the empty pattern "" is absent, yield any buffered matches or scan forward.
-        let Some(ep) = self.epsilon_emit_pos else {
-            if let Some(m) = self.buf.pop() {
-                return Some(m);
-            }
-            return self.scan();
-        };
-
-        // When "" is present, interleave zero-length matches at character boundaries
-        // not spanned by non-empty matches.
-        if self.buf.is_empty() {
-            if let Some(m) = self.scan() {
-                self.buf.push(m);
-            }
-        }
-
-        let bytes = self.haystack.as_ref().as_bytes();
-        let target = self.buf.last().map_or(bytes.len(), Match::start);
-        // `deserialize()` for now does not validate match lengths or state depths to avoid
-        // expensive trie traversal (malformed automata may return inaccurate ranges).
-        // If a malformed emit causes `Match::start()` to wrap, clamping prevents OOB decoding.
-        let target = target.min(bytes.len());
-        // SAFETY: `ep` is verified during automaton construction to point to a valid emit node for the empty pattern.
-        let epsilon = unsafe { self.pma.emits.get_unchecked(usize::from_u32(ep.get()) - 1) };
-
-        debug_assert_eq!(epsilon.length, 0);
-        debug_assert_eq!(epsilon.gap, 0);
-        debug_assert!(epsilon.pred.is_none());
-
-        // Emit zero-length matches at character boundaries prior to the start of the next non-empty match:
-        if self.epsilon_cursor < target {
-            let cursor = self.epsilon_cursor;
-            // SAFETY: `cursor < target <= bytes.len()`.
-            // Advances even for an invalid cursor resulting from a malformed automaton.
-            self.epsilon_cursor +=
-                utf8_char_len_from_first_byte(unsafe { *bytes.get_unchecked(cursor) }).unwrap_or(1);
-            return Some(epsilon.to_match(cursor));
-        }
-
-        // Emit the non-empty match and advance cursor past its end:
-        if let Some(m) = self.buf.pop() {
-            if m.end() < bytes.len() {
-                // SAFETY: guarded by `m.end() < bytes.len()`.
-                self.epsilon_cursor = m.end()
-                    + utf8_char_len_from_first_byte(unsafe { *bytes.get_unchecked(m.end()) })
-                        .unwrap_or(1);
-            } else {
-                self.epsilon_emit_pos.take();
-            }
-            return Some(m);
-        }
-
-        // No more non-empty matches and cursor >= bytes.len(). Epsilon matching is complete.
-        self.epsilon_emit_pos.take();
-
-        // Trailing zero-length match at EOF when the cursor lands exactly on the text boundary.
-        if self.epsilon_cursor == bytes.len() {
-            return Some(epsilon.to_match(bytes.len()));
-        }
-
-        // Cursor is past EOF due to a malformed automaton.
-        None
+        self.scanner.scan_with(&mut self.buf)
     }
 }
 

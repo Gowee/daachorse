@@ -14,7 +14,11 @@ use crate::charwise::iter::{
     CharWithEndOffsetIterator, FindIterator, FindOverlappingIterator,
     FindOverlappingNoSuffixIterator, FindOverlappingNoSuffixSliceIterator,
     FindOverlappingSliceIterator, FindOverlappingStepper, FindSliceIterator, FindStepper,
-    LeftmostFindIterator, LeftmostFindIteratorExperimental, PatternIterator,
+    LeftmostFindIterator, PatternIterator,
+};
+pub use crate::charwise::iter::{
+    LeftmostFindBorrowedIterator, LeftmostFindIteratorExperimental, LeftmostFinderExperimental,
+    LeftmostScannerExperimental,
 };
 use crate::charwise::mapper::CodeMapper;
 use crate::errors::{DaachorseError, Result};
@@ -636,6 +640,40 @@ impl<V> CharwiseDoubleArrayAhoCorasick<V> {
             "Error: match_kind must be leftmost_longest_experimental or leftmost_first_experimental."
         );
         LeftmostFindIteratorExperimental::new(self, haystack)
+    }
+
+    /// Returns a reusable finder for non-overlapping leftmost matches that amortizes buffer
+    /// allocation across queries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the automaton was not constructed with [`MatchKind::LeftmostLongestExperimental`]
+    /// or [`MatchKind::LeftmostFirstExperimental`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use daachorse::{CharwiseDoubleArrayAhoCorasickBuilder, MatchKind};
+    ///
+    /// let patterns = vec!["ab", "abcd"];
+    /// let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
+    ///     .match_kind(MatchKind::LeftmostLongestExperimental)
+    ///     .build(&patterns)
+    ///     .unwrap();
+    ///
+    /// let mut finder = pma.leftmost_experimental_finder();
+    /// let mut it = finder.find_iter("abcd");
+    ///
+    /// let m = it.next().unwrap();
+    /// assert_eq!((0, 4, 1), (m.start(), m.end(), m.value()));
+    ///
+    /// assert_eq!(None, it.next());
+    /// ```
+    pub fn leftmost_experimental_finder(&self) -> LeftmostFinderExperimental<'_, V>
+    where
+        V: Copy,
+    {
+        LeftmostFinderExperimental::new(self)
     }
 
     /// Returns a stepper of non-overlapping matches that consumes characters one by one.

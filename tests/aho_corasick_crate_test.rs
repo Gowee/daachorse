@@ -812,3 +812,27 @@ fn test_experimental_parent_and_candidate_matches() {
         .collect();
     assert_eq!(expected, actual);
 }
+
+#[test]
+fn test_leftmost_experimental_finder_buffer_reuse() {
+    let patterns = ["xy", "b", "a", "bacd", "xybacelong"];
+    let haystacks = [
+        "xybacex",
+        "no match here",
+        "b",
+        "xybacelong",
+        "xy and b and a",
+    ];
+
+    let pma = CharwiseDoubleArrayAhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostLongestExperimental)
+        .build::<_, _, usize>(patterns)
+        .unwrap();
+
+    let mut finder = pma.leftmost_experimental_finder();
+    for h in haystacks {
+        let expected: Vec<_> = pma.leftmost_find_iter_experimental(h).collect();
+        let actual: Vec<_> = finder.find_iter(h).collect();
+        assert_eq!(expected, actual, "Mismatch on haystack: {h}");
+    }
+}
